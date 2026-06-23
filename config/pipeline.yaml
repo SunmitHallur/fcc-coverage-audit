@@ -9,14 +9,27 @@ source:
   backend: fcc            # "fcc" | "redshift" | "fixture"
 
   fcc:
+    # Public (no-auth) catalog API used by the website itself. Requires browser
+    # Referer/Origin headers or it returns 403.
     base_url: "https://broadbandmap.fcc.gov/nbm/map/api"
-    # FCC filters requests by User-Agent; a non-browser UA is required to avoid
-    # being silently dropped (observed behavior on the public API).
-    user_agent: "fcc-coverage-audit/0.1 (research pipeline)"
-    request_timeout_s: 120
+    # Authenticated download endpoint. Files require a FREE FCC API token:
+    #   1. Create an account: https://broadbandmap.fcc.gov  (Sign In -> Create account)
+    #   2. Log in -> click your username (top-right) -> "Manage API Access" -> Generate
+    #   3. Put the username (email) + token in env vars FCC_API_USERNAME / FCC_API_TOKEN
+    #      (PowerShell:  $env:FCC_API_USERNAME="you@x.com"; $env:FCC_API_TOKEN="<token>")
+    download_url_template: "https://broadbandmap.fcc.gov/api/public/map/downloads/downloadFile/{data_type}/{file_id}/{file_type}"
+    auth:
+      username: "${FCC_API_USERNAME}"
+      hash_value: "${FCC_API_TOKEN}"
+    # Browser-like headers required by the public catalog endpoint.
+    user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    referer: "https://broadbandmap.fcc.gov/data-download/nationwide-data"
+    origin: "https://broadbandmap.fcc.gov"
+    file_format: 2          # download format: 1 = ESRI Shapefile, 2 = GeoPackage
+    request_timeout_s: 180
     max_retries: 5
-    # Polite rate limit; the public API throttles aggressive clients.
-    min_seconds_between_requests: 2.0
+    # FCC public data API allows ~10 requests/minute; stay under it.
+    min_seconds_between_requests: 6.5
 
   redshift:
     # Filled in once access is granted (read from env / secrets, not committed).
@@ -41,32 +54,19 @@ source:
 # What to analyze (first build: Big-4, 5G-NR only, both speed tiers).
 # ---------------------------------------------------------------------------
 analysis:
-  # Each technology lists its FCC speed tiers (mindown/minup in Mbps). Each
-  # (technology, tier) is analyzed as its own unit, because the FCC selects per
-  # service type (e.g. "5G 7/1"). Comment out technologies/tiers to narrow scope.
-  technologies:
-    "5G-NR":
-      code: 400
-      tiers:
-        "7_1":  { mindown: 7.0,  minup: 1.0 }
-        "35_3": { mindown: 35.0, minup: 3.0 }
-    "4G-LTE":
-      code: 83
-      tiers:
-        "5_1":  { mindown: 5.0,  minup: 1.0 }
-    "3G":
-      code: 300
-      tiers:
-        "200_50": { mindown: 0.2, minup: 0.05 }
+  # Each service is one FCC mobile dataset, identified by its catalog
+  # `technology_code_desc`. Each is its own analysis unit because the FCC selects
+  # per service type (e.g. "5G 7/1"). The FCC ships each 5G speed tier as a
+  # SEPARATE file. `label` is what appears in the outputs. Comment out any you
+  # don't need to cut download volume (3G is being retired).
+  services:
+    - { label: "5G-NR 7/1",  desc: "5G-NR (7/1 Mbps)" }
+    - { label: "5G-NR 35/3", desc: "5G-NR (35/3 Mbps)" }
+    - { label: "4G LTE",     desc: "4G LTE" }
+    - { label: "3G",         desc: "3G" }
 
-  # Environments are combined (union) per tech/tier by default. Set
-  # combine_environments: false and fill environment_codes to analyze separately.
-  environments: ["mobile", "stationary"]
-  combine_environments: true
-  environment_codes: { mobile: [1], stationary: [2] }   # 'environmnt' attribute values (verify against data)
-
-  # "all" auto-discovers every provider in the catalog for the vintage; or give
-  # an explicit list of {id, name}. The Big-4 ids are kept here for reference.
+  # "all" auto-discovers every mobile provider in the catalog for the vintage;
+  # or give an explicit list of {id, name}. Big-4 ids kept here for reference.
   providers: all
   known_providers:
     - { id: 130077, name: "AT&T" }
@@ -74,11 +74,15 @@ analysis:
     - { id: 131425, name: "Verizon" }
     - { id: 130235, name: "UScellular" }
 
-  # Vintages to compare. Leave current/prior null to auto-pick the two most
-  # recent published filings from the FCC API.
+  # FCC mobile coverage files are per state. "all" pulls every state/territory;
+  # or scope a first run with a FIPS list, e.g. ["48"] for Texas only.
+  states: all
+
+  # Vintages to compare, given as the FCC `filing_subtype` label. Leave null to
+  # auto-pick the two most recent published filings.
   vintages:
-    current: null                  # e.g. "2025-12-31"
-    prior: null                    # e.g. "2025-06-30"
+    current: null                  # e.g. "December 31, 2025"
+    prior: null                    # e.g. "June 30, 2025"
 
 # ---------------------------------------------------------------------------
 # Geography / indexing
@@ -159,8 +163,8 @@ scoring:
 # the FCC's own selected / not-selected decisions once real data is available.
 # ---------------------------------------------------------------------------
 benchmark:
-  vintages: { current: "2025-12-31", prior: "2025-06-30" }   # D25 vs J25
-  speed_tier: "7_1"
+  vintages: { current: "December 31, 2025", prior: "June 30, 2025" }   # D25 vs J25
+  service_label: "5G-NR 7/1"
   # Optional per-county provider_id: when set, the check looks at whether THAT
   # provider was flagged in the county; when null, any provider counts.
   # All labeled examples below are for Verizon (provider_id 131425), 5G 7/1 Mbps.

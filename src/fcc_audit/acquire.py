@@ -33,7 +33,8 @@ import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
+from urllib.parse import quote
 
 import requests
 
@@ -41,12 +42,14 @@ from .config import Config, Provider
 
 log = logging.getLogger(__name__)
 
-# FCC BDC mobile technology codes. 5G-NR is 400; included here so we can filter
-# the catalog by technology regardless of how file names are spelled.
+# FCC BDC mobile technology codes (verified against the live catalog):
+#   300 = 3G, 400 = 4G LTE, 500 = 5G-NR. 5G ships as separate speed-tier files,
+# distinguished by `technology_code_desc` ("5G-NR (7/1 Mbps)" / "(35/3 Mbps)").
+# We select files by `technology_code_desc`, so these are informational.
 TECHNOLOGY_CODES: dict[str, int] = {
     "3G": 300,
-    "4G-LTE": 83,
-    "5G-NR": 400,
+    "4G-LTE": 400,
+    "5G-NR": 500,
 }
 
 
@@ -94,23 +97,55 @@ class DataSource(ABC):
 # ---------------------------------------------------------------------------
 # FCC direct-download backend (works today)
 # ---------------------------------------------------------------------------
+_RAW_COVERAGE_TYPE = "Mobile Broadband Raw Coverage"
+
+
+def safe_service_name(name: str) -> str:
+    """Filesystem-safe token for a service label/desc (no spaces/slashes/parens)."""
+    return (
+        name.replace("/", "-").replace(" ", "").replace("(", "").replace(")", "")
+    )
+
+
 class FccDownloadSource(DataSource):
+    """Pulls per-(provider, service, state) mobile coverage from the FCC NBM.
+
+    Two-stage API (verified against the live service):
+      * Public catalog (browser Referer/Origin headers, no auth):
+        ``/published/filing`` -> releases; ``/national_map_process/
+        nbm_get_data_download/{process_uuid}`` -> file rows.
+      * Authenticated download (FREE FCC API token via username + hash_value
+        headers): ``downloadFile/{data_type}/{id}/{file_type}``.
+
+    Mobile coverage ships per state x provider x service (5G tiers are separate
+    files), so a national layer for one (provider, service) is the union of its
+    per-state files, merged here into one local file.
+    """
+
     def __init__(self, cfg: Config):
         self.cfg = cfg
         fcc = cfg.fcc
         self.base_url: str = fcc["base_url"].rstrip("/")
-        self.timeout: int = int(fcc.get("request_timeout_s", 120))
+        self.download_tmpl: str = fcc["download_url_template"]
+        self.timeout: int = int(fcc.get("request_timeout_s", 180))
         self.max_retries: int = int(fcc.get("max_retries", 5))
-        self.min_interval: float = float(fcc.get("min_seconds_between_requests", 2.0))
+        self.min_interval: float = float(fcc.get("min_seconds_between_requests", 6.5))
+        self.file_format: int = int(fcc.get("file_format", 2))  # 1=shp, 2=gpkg
         self.raw_dir = cfg.path("raw")
         self._last_request = 0.0
+        self._catalog_cache: dict[str, list[dict[str, Any]]] = {}
+
+        auth = fcc.get("auth", {})
+        self.username = auth.get("username") or ""
+        self.hash_value = auth.get("hash_value") or ""
+
         self.session = requests.Session()
-        self.session.headers.update(
-            {
-                "user-agent": fcc.get("user_agent", "fcc-coverage-audit/0.1"),
-                "accept": "application/json",
-            }
-        )
+        self.session.headers.update({
+            "user-agent": fcc.get("user_agent", "Mozilla/5.0"),
+            "accept": "application/json, text/plain, */*",
+            "referer": fcc.get("referer", "https://broadbandmap.fcc.gov/data-download/nationwide-data"),
+            "origin": fcc.get("origin", "https://broadbandmap.fcc.gov"),
+        })
 
     # -- low level --
     def _throttle(self) -> None:
@@ -119,118 +154,156 @@ class FccDownloadSource(DataSource):
             time.sleep(self.min_interval - elapsed)
         self._last_request = time.monotonic()
 
-    def _get(self, url: str, *, stream: bool = False) -> requests.Response:
+    def _get(self, url: str, *, stream: bool = False, headers: dict | None = None) -> requests.Response:
         last_exc: Exception | None = None
         for attempt in range(1, self.max_retries + 1):
             self._throttle()
             try:
-                resp = self.session.get(url, timeout=self.timeout, stream=stream)
+                resp = self.session.get(url, timeout=self.timeout, stream=stream, headers=headers)
+                if resp.status_code in (401, 403):
+                    # Auth/permission errors won't fix themselves on retry.
+                    raise RuntimeError(
+                        f"HTTP {resp.status_code} for {url}. "
+                        + ("Set FCC_API_USERNAME / FCC_API_TOKEN (see README -> FCC API token)."
+                           if resp.status_code == 401 else
+                           "Catalog blocked - check Referer/Origin headers / network egress.")
+                    )
                 resp.raise_for_status()
                 return resp
+            except RuntimeError:
+                raise
             except requests.RequestException as exc:  # network / 5xx
                 last_exc = exc
                 backoff = min(60, 2 ** attempt)
-                log.warning(
-                    "GET %s failed (attempt %d/%d): %s - retrying in %ss",
-                    url, attempt, self.max_retries, exc, backoff,
-                )
+                log.warning("GET %s failed (attempt %d/%d): %s - retry in %ss",
+                            url, attempt, self.max_retries, exc, backoff)
                 time.sleep(backoff)
         raise RuntimeError(f"GET {url} failed after {self.max_retries} attempts") from last_exc
 
     # -- catalog --
     def _filings(self) -> list[dict[str, Any]]:
-        data = self._get(f"{self.base_url}/published/filing").json().get("data", [])
-        # Mobile broadband filings only.
-        return [
-            f for f in data
-            if "mobile" in str(f.get("filing_type", "")).lower()
-            or "mobile" in str(f.get("filing_subtype", "")).lower()
-        ] or data
+        return self._get(f"{self.base_url}/published/filing").json().get("data", [])
 
     def list_vintages(self) -> list[str]:
         seen: list[str] = []
         for f in self._filings():
-            v = f.get("as_of_date") or f.get("filing_subtype")
-            if v and v not in seen:
+            v = f.get("filing_subtype") or f.get("as_of_date")
+            if v and str(v) not in seen:
                 seen.append(str(v))
-        return seen
+        # The API does not return filings newest-first; sort by parsed date desc
+        # so resolve_vintages() picks the true current vs prior.
+        from datetime import datetime
+
+        def _key(label: str) -> tuple[int, str]:
+            for fmt in ("%B %d, %Y", "%Y-%m-%d"):
+                try:
+                    return (int(datetime.strptime(label, fmt).timestamp()), label)
+                except ValueError:
+                    continue
+            return (0, label)
+
+        return sorted(seen, key=_key, reverse=True)
+
+    def _process_uuid(self, vintage: str) -> str:
+        for f in self._filings():
+            if str(f.get("filing_subtype")) == vintage or str(f.get("as_of_date")) == vintage:
+                return f["process_uuid"]
+        raise RuntimeError(
+            f"No published filing for vintage {vintage!r}. Available: {self.list_vintages()}"
+        )
 
     def _catalog_for_vintage(self, vintage: str) -> list[dict[str, Any]]:
-        process_uuid = None
-        for f in self._filings():
-            if str(f.get("as_of_date")) == vintage or str(f.get("filing_subtype")) == vintage:
-                process_uuid = f.get("process_uuid")
-                break
-        if not process_uuid:
-            raise RuntimeError(f"No published filing found for vintage {vintage!r}")
-        url = f"{self.base_url}/national_map_process/nbm_get_data_download/{process_uuid}"
-        return self._get(url).json().get("data", [])
-
-    @staticmethod
-    def _is_mobile(row: dict[str, Any]) -> bool:
-        return "mobile" in str(row.get("data_type", "")).lower()
+        if vintage not in self._catalog_cache:
+            uuid = self._process_uuid(vintage)
+            url = f"{self.base_url}/national_map_process/nbm_get_data_download/{uuid}"
+            self._catalog_cache[vintage] = self._get(url).json().get("data", [])
+        return self._catalog_cache[vintage]
 
     def list_providers(self, vintage: str) -> list[Provider]:
-        rows = self._catalog_for_vintage(vintage)
         seen: dict[int, str] = {}
-        for r in rows:
-            if not self._is_mobile(r):
+        known = {p.id: p.name for p in self.cfg.known_providers}
+        for r in self._catalog_for_vintage(vintage):
+            if r.get("data_type") != _RAW_COVERAGE_TYPE:
                 continue
             pid = r.get("provider_id")
             if pid in (None, "", "null"):
                 continue
             pid = int(pid)
-            name = r.get("provider_name") or r.get("brand_name") or str(pid)
-            seen.setdefault(pid, str(name))
+            seen.setdefault(pid, known.get(pid, str(pid)))
         return [Provider(id=pid, name=name) for pid, name in sorted(seen.items())]
 
-    def _match_row(
-        self, rows: Iterable[dict[str, Any]], provider_id: int, technology: str
-    ) -> dict[str, Any] | None:
-        tech_code = TECHNOLOGY_CODES.get(technology)
-        candidates = []
-        for r in rows:
-            if not self._is_mobile(r):
+    def _rows_for(self, vintage: str, provider_id: int, service_desc: str) -> list[dict[str, Any]]:
+        states = self.cfg.states
+        rows = []
+        for r in self._catalog_for_vintage(vintage):
+            if r.get("data_type") != _RAW_COVERAGE_TYPE:
                 continue
             if int(r.get("provider_id") or -1) != provider_id:
                 continue
-            rc = r.get("technology_code")
-            if tech_code is not None and rc is not None and int(rc) != tech_code:
-                # also allow a filename match in case codes differ across vintages
-                if technology.replace("-", "").lower() not in str(r.get("file_name", "")).replace("-", "").lower():
-                    continue
-            candidates.append(r)
-        # Prefer GeoPackage > Shapefile when multiple file types exist.
-        candidates.sort(key=lambda r: 0 if "gpkg" in str(r.get("file_type", "")).lower() else 1)
-        return candidates[0] if candidates else None
+            if str(r.get("technology_code_desc")) != service_desc:
+                continue
+            if str(r.get("download_available", "Yes")).lower() == "no":
+                continue
+            if states != "all" and str(r.get("state_fips")) not in states:
+                continue
+            rows.append(r)
+        return rows
 
-    def fetch(self, provider_id: int, technology: str, vintage: str) -> CoverageFile:
-        out_dir = self.raw_dir / vintage / str(provider_id)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        rows = self._catalog_for_vintage(vintage)
-        row = self._match_row(rows, provider_id, technology)
-        if not row:
-            raise RuntimeError(
-                f"No mobile {technology} catalog file for provider {provider_id} "
-                f"in vintage {vintage}. Catalog had {len(rows)} rows."
-            )
-        file_id = row["file_id"]
-        file_type = row["file_type"]
-        data_type = row["data_type"]
-        fname = row.get("file_name", f"{file_id}.{file_type}")
-        dest = out_dir / f"{technology}_{fname}"
+    def _download_one(self, row: dict[str, Any], dest: Path) -> Path:
         if dest.exists() and dest.stat().st_size > 0:
-            log.info("cached %s", dest.name)
-            return CoverageFile(provider_id, technology, vintage, dest)
-
-        url = f"{self.base_url}/downloads/downloadFile/{data_type}/{file_id}/{file_type}"
-        log.info("downloading %s -> %s", url, dest.name)
-        resp = self._get(url, stream=True)
-        with open(dest, "wb") as fh:
+            return dest
+        url = self.download_tmpl.format(
+            data_type=quote(str(row["data_type"]), safe=""),
+            file_id=row["id"],
+            file_type=self.file_format,
+        )
+        headers = {"username": self.username, "hash_value": self.hash_value,
+                   "accept": "application/octet-stream, */*"}
+        resp = self._get(url, stream=True, headers=headers)
+        tmp = dest.with_suffix(dest.suffix + ".part")
+        with open(tmp, "wb") as fh:
             for chunk in resp.iter_content(chunk_size=1 << 20):
                 if chunk:
                     fh.write(chunk)
-        return CoverageFile(provider_id, technology, vintage, dest)
+        tmp.rename(dest)
+        return dest
+
+    def fetch(self, provider_id: int, technology: str, vintage: str) -> CoverageFile:
+        """`technology` here is the service *desc* (e.g. '5G-NR (7/1 Mbps)').
+        Downloads every per-state file for this provider+service and merges them
+        into one local file."""
+        import geopandas as gpd
+        import pandas as pd
+
+        rows = self._rows_for(vintage, provider_id, technology)
+        if not rows:
+            raise FileNotFoundError(
+                f"No '{technology}' raw-coverage files for provider {provider_id} "
+                f"in vintage {vintage} (states={self.cfg.states})."
+            )
+        out_dir = self.raw_dir / vintage / str(provider_id)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        safe = safe_service_name(technology)
+        merged = out_dir / f"{safe}_merged.gpkg"
+        if merged.exists() and merged.stat().st_size > 0:
+            return CoverageFile(provider_id, technology, vintage, merged)
+
+        ext = ".gpkg" if self.file_format == 2 else ".zip"
+        parts = []
+        for r in rows:
+            st = str(r.get("state_fips"))
+            dest = out_dir / f"{safe}_{st}{ext}"
+            log.info("  download %s state %s (id=%s)", technology, st, r["id"])
+            self._download_one(r, dest)
+            try:
+                parts.append(gpd.read_file(dest))
+            except Exception as exc:  # noqa: BLE001 - skip a bad/empty state file
+                log.warning("  could not read %s: %s", dest.name, exc)
+        if not parts:
+            raise RuntimeError(f"Downloaded 0 readable files for provider {provider_id} {technology}")
+        gdf = gpd.GeoDataFrame(pd.concat(parts, ignore_index=True), crs=parts[0].crs)
+        gdf.to_file(merged, driver="GPKG")
+        return CoverageFile(provider_id, technology, vintage, merged)
 
 
 # ---------------------------------------------------------------------------
@@ -288,7 +361,7 @@ class RedshiftSource(DataSource):
 
         out_dir = self.raw_dir / vintage / str(provider_id)
         out_dir.mkdir(parents=True, exist_ok=True)
-        dest = out_dir / f"{technology}.gpkg"
+        dest = out_dir / f"{safe_service_name(technology)}.gpkg"
         query = self.rs["coverage_query"].format(
             vintage=vintage, provider_id=provider_id, tech=technology
         )
@@ -322,7 +395,7 @@ class FixtureSource(DataSource):
         return [Provider(id=i, name=known.get(i, str(i))) for i in ids]
 
     def fetch(self, provider_id, technology, vintage) -> CoverageFile:
-        path = self.dir / vintage / f"{provider_id}_{technology}.geojson"
+        path = self.dir / vintage / f"{provider_id}_{safe_service_name(technology)}.geojson"
         if not path.exists():
             raise FileNotFoundError(
                 f"Fixture not found: {path}. Generate it with "

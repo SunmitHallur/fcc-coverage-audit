@@ -27,37 +27,23 @@ def setup_logging(verbose: bool) -> None:
     )
 
 
-def _fetch_tech_files(source: DataSource, cfg: Config, provider: Provider, vintage: str) -> dict:
-    """Fetch one coverage file per technology for a provider+vintage."""
-    log = logging.getLogger(__name__)
-    files: dict[str, object] = {}
-    for tech in cfg.technologies:
-        try:
-            files[tech] = source.fetch(provider.id, tech, vintage)
-        except (FileNotFoundError, RuntimeError) as exc:
-            log.warning("skip %s %s @ %s: %s", provider.name, tech, vintage, exc)
-    return files
-
-
 def _analyze_unit(
-    cfg, provider, tech, tier_label, tier_spec, env_label, env_codes,
-    cur_file, pri_file, counties, county_area_km2,
+    cfg, provider, service_label, cur_file, pri_file, counties, county_area_km2,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Run change/site/attribute/scoring features for one (provider, tech, tier,
-    env-group) analysis unit. Returns (features, current_sites)."""
+    """Run change/site/attribute/scoring for one (provider, service) unit."""
     log = logging.getLogger(__name__)
     county_res = int(cfg.geography["county_h3_resolution"])
     site_res = int(cfg.geography["site_h3_resolution"])
 
-    cur8 = normalize.normalize_layer(cfg, cur_file, counties, county_res, tier_label, tier_spec, env_label, env_codes)
-    pri8 = normalize.normalize_layer(cfg, pri_file, counties, county_res, tier_label, tier_spec, env_label, env_codes)
+    cur8 = normalize.normalize_layer(cfg, cur_file, counties, county_res, service_label)
+    pri8 = normalize.normalize_layer(cfg, pri_file, counties, county_res, service_label)
     if cur8.empty and pri8.empty:
         return pd.DataFrame(), pd.DataFrame()
     change = changedetect.hex_change(pri8, cur8)
     cc = changedetect.county_change(change, county_res, county_area_km2)
 
-    cur9 = normalize.normalize_layer(cfg, cur_file, counties, site_res, tier_label, tier_spec, env_label, env_codes)
-    pri9 = normalize.normalize_layer(cfg, pri_file, counties, site_res, tier_label, tier_spec, env_label, env_codes)
+    cur9 = normalize.normalize_layer(cfg, cur_file, counties, site_res, service_label)
+    pri9 = normalize.normalize_layer(cfg, pri_file, counties, site_res, service_label)
     prior_sites = towers.infer_sites(pri9, cfg, label_prefix="P")
     current_sites = towers.infer_sites(cur9, cfg, label_prefix="C")
     current_sites = attribute.match_sites(
@@ -73,7 +59,7 @@ def _analyze_unit(
     feats = score.build_features(cc, attr, bsnap)
     tag = {
         "provider_id": provider.id, "provider_name": provider.name,
-        "technology": tech, "speed_tier": tier_label, "environment": env_label,
+        "technology": service_label,
     }
     if not feats.empty:
         for k, v in tag.items():
@@ -83,9 +69,8 @@ def _analyze_unit(
         for k, v in tag.items():
             current_sites[k] = v
     log.info(
-        "  %s %s/%s/%s: %d counties changed, %d current sites",
-        provider.name, tech, tier_label, env_label,
-        0 if feats.empty else len(feats), len(current_sites),
+        "  %s %s: %d counties changed, %d current sites",
+        provider.name, service_label, 0 if feats.empty else len(feats), len(current_sites),
     )
     return feats, current_sites
 
@@ -103,35 +88,32 @@ def process_provider(
     log = logging.getLogger(__name__)
     log.info("=== %s (id=%s) ===", provider.name, provider.id)
 
-    cur_files = _fetch_tech_files(source, cfg, provider, current)
-    pri_files = _fetch_tech_files(source, cfg, provider, prior)
-
     feats_parts, sites_parts = [], []
-    env_groups = cfg.environment_groups()
-    for tech, tier_label, tier_spec in cfg.analysis_units():
-        cur_file = cur_files.get(tech)
-        pri_file = pri_files.get(tech)
-        if cur_file is None or pri_file is None:
+    for svc in cfg.services:
+        label, desc = svc["label"], svc["desc"]
+        try:
+            cur_file = source.fetch(provider.id, desc, current)
+            pri_file = source.fetch(provider.id, desc, prior)
+        except (FileNotFoundError, RuntimeError) as exc:
+            log.warning("skip %s %s: %s", provider.name, label, exc)
             continue
-        for env_label, env_codes in env_groups:
-            feats, sites = _analyze_unit(
-                cfg, provider, tech, tier_label, tier_spec, env_label, env_codes,
-                cur_file, pri_file, counties, county_area_km2,
-            )
-            if not feats.empty:
-                feats_parts.append(feats)
-            if not sites.empty:
-                sites_parts.append(sites)
 
-    if cleanup_raw:
-        # Free disk between providers: the compact interim hex parquet is kept,
-        # so only the large raw source files are removed.
-        import os
-        for f in (*cur_files.values(), *pri_files.values()):
-            try:
-                os.remove(f.local_path)
-            except OSError:
-                pass
+        feats, sites = _analyze_unit(
+            cfg, provider, label, cur_file, pri_file, counties, county_area_km2,
+        )
+        if not feats.empty:
+            feats_parts.append(feats)
+        if not sites.empty:
+            sites_parts.append(sites)
+
+        if cleanup_raw:
+            # Free disk between units: keep the compact interim parquet, drop raw.
+            import os
+            for f in (cur_file, pri_file):
+                try:
+                    os.remove(f.local_path)
+                except OSError:
+                    pass
 
     feats = pd.concat(feats_parts, ignore_index=True) if feats_parts else pd.DataFrame()
     sites = pd.concat(sites_parts, ignore_index=True) if sites_parts else pd.DataFrame()
@@ -185,7 +167,7 @@ def cmd_run(cfg: Config, args) -> int:
         "current": current,
         "prior": prior,
         "providers": ", ".join(p.name for p in providers),
-        "technologies": ", ".join(f"{t}/{tier}" for t, tier, _ in cfg.analysis_units()),
+        "technologies": ", ".join(s["label"] for s in cfg.services),
     }
     paths = report.write_outputs(
         scored, sites, counties, cfg.path("outputs"), dashboard_dir, meta
@@ -219,23 +201,23 @@ def cmd_download(cfg: Config, args) -> int:
         args.current or cfg.vintage_current, args.prior or cfg.vintage_prior
     )
     providers = _resolve_providers(cfg, source, current)
-    techs = list(cfg.technologies.keys())
+    services = cfg.services
     total_bytes = 0
     n_files = n_skipped = 0
-    log.info("downloading %d providers x %d techs x 2 vintages", len(providers), len(techs))
+    log.info("downloading %d providers x %d services x 2 vintages", len(providers), len(services))
     for provider in providers:
         for vintage in (current, prior):
-            for tech in techs:
+            for svc in services:
                 try:
-                    cov = source.fetch(provider.id, tech, vintage)
+                    cov = source.fetch(provider.id, svc["desc"], vintage)
                 except (FileNotFoundError, RuntimeError) as exc:
-                    log.warning("skip %s %s @ %s: %s", provider.name, tech, vintage, exc)
+                    log.warning("skip %s %s @ %s: %s", provider.name, svc["label"], vintage, exc)
                     n_skipped += 1
                     continue
                 size = cov.local_path.stat().st_size if cov.local_path.exists() else 0
                 total_bytes += size
                 n_files += 1
-                log.info("ok %s %s @ %s (%.1f MB)", provider.name, tech, vintage, size / 1e6)
+                log.info("ok %s %s @ %s (%.1f MB)", provider.name, svc["label"], vintage, size / 1e6)
     print(f"\nDownloaded/cached {n_files} files ({total_bytes/1e9:.2f} GB), "
           f"{n_skipped} unavailable. Raw data under {cfg.path('raw')}")
     print("Now run offline:  python -m fcc_audit.cli run")
@@ -282,14 +264,11 @@ def cmd_benchmark(cfg: Config, args) -> int:
 
     scored = scored.copy()
     scored["county_geoid"] = scored["county_geoid"].astype(str)
-    # Scope the comparison to the benchmark's service (e.g. 5G-NR 7/1), so flags
-    # from other technologies/tiers don't count as matches.
-    bench_tech = bench.get("technology", "5G-NR")
-    bench_tier = bench.get("speed_tier")
-    if "technology" in scored and bench_tech:
-        scored = scored[scored["technology"] == bench_tech]
-    if "speed_tier" in scored and bench_tier:
-        scored = scored[scored["speed_tier"] == bench_tier]
+    # Scope the comparison to the benchmark's service (e.g. "5G-NR 7/1"), so
+    # flags from other services don't count as matches.
+    bench_service = bench.get("service_label", "5G-NR 7/1")
+    if "technology" in scored and bench_service:
+        scored = scored[scored["technology"] == bench_service]
     flagged = scored[scored["flag_for_review"]]
     flagged_any = set(flagged["county_geoid"])
     flagged_by_provider = set(zip(flagged["county_geoid"], flagged["provider_id"]))

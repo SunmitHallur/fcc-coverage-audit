@@ -79,34 +79,17 @@ class Config:
         return [Provider(**x) for x in self.raw["analysis"].get("known_providers", [])]
 
     @property
-    def technologies(self) -> dict:
-        """Map technology name -> {code, tiers: {label: {mindown, minup}}}."""
-        return self.raw["analysis"]["technologies"]
-
-    def analysis_units(self):
-        """Yield (technology, tier_label, tier_spec) for every tech/tier to run."""
-        for tech, spec in self.technologies.items():
-            for tier_label, tier_spec in spec.get("tiers", {}).items():
-                yield tech, tier_label, tier_spec
+    def services(self) -> list[dict]:
+        """List of {label, desc} mobile services to analyze (one file each)."""
+        return self.raw["analysis"]["services"]
 
     @property
-    def combine_environments(self) -> bool:
-        return bool(self.raw["analysis"].get("combine_environments", True))
-
-    @property
-    def environments(self) -> list[str]:
-        return self.raw["analysis"].get("environments", [])
-
-    @property
-    def environment_codes(self) -> dict:
-        return self.raw["analysis"].get("environment_codes", {})
-
-    def environment_groups(self) -> list[tuple[str, list[int] | None]]:
-        """Return (label, codes) groups to iterate. When combining, a single
-        group with codes=None (no environment filtering)."""
-        if self.combine_environments:
-            return [("all", None)]
-        return [(env, self.environment_codes.get(env)) for env in self.environments]
+    def states(self):
+        """'all' or a list of state FIPS strings to scope the run."""
+        s = self.raw["analysis"].get("states", "all")
+        if isinstance(s, str) and s.lower() == "all":
+            return "all"
+        return [str(x).zfill(2) for x in s]
 
     @property
     def vintage_current(self) -> str | None:

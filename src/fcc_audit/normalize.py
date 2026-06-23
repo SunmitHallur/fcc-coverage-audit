@@ -20,7 +20,7 @@ import geopandas as gpd
 import h3
 import pandas as pd
 
-from .acquire import CoverageFile
+from .acquire import CoverageFile, safe_service_name as safe
 from .config import Config
 
 log = logging.getLogger(__name__)
@@ -29,43 +29,6 @@ log = logging.getLogger(__name__)
 _SIGNAL_COLUMNS = ["minsignal", "min_signal", "signal", "sig_strength", "signalstr"]
 # Some vintages encode signal as an ordinal band code rather than dBm.
 _BAND_CODE_TO_DBM = {1: -105.0, 2: -95.0, 3: -85.0}
-# Attribute names for speed tier and environment (case-insensitive lookup).
-_MINDOWN_COLUMNS = ["mindown", "min_down", "min_dl"]
-_MINUP_COLUMNS = ["minup", "min_up", "min_ul"]
-_ENV_COLUMNS = ["environmnt", "environment", "env"]
-
-
-def _find_col(gdf: gpd.GeoDataFrame, candidates: list[str]) -> str | None:
-    lower = {c.lower(): c for c in gdf.columns}
-    for cand in candidates:
-        if cand in lower:
-            return lower[cand]
-    return None
-
-
-def filter_by_tier(gdf: gpd.GeoDataFrame, tier_spec: dict) -> gpd.GeoDataFrame:
-    """Keep polygons matching this speed tier (mindown/minup). No-op if the file
-    has no speed columns (already a single-tier file)."""
-    import numpy as np
-
-    md = _find_col(gdf, _MINDOWN_COLUMNS)
-    mu = _find_col(gdf, _MINUP_COLUMNS)
-    if md is None or mu is None:
-        return gdf
-    keep = np.isclose(gdf[md].astype(float), float(tier_spec["mindown"]), atol=0.06) & \
-        np.isclose(gdf[mu].astype(float), float(tier_spec["minup"]), atol=0.06)
-    return gdf[keep]
-
-
-def filter_by_environment(gdf: gpd.GeoDataFrame, env_codes: list[int] | None) -> gpd.GeoDataFrame:
-    """Keep polygons whose environment is in env_codes. No-op when env_codes is
-    None (combined) or the file has no environment column."""
-    if not env_codes:
-        return gdf
-    col = _find_col(gdf, _ENV_COLUMNS)
-    if col is None:
-        return gdf
-    return gdf[gdf[col].isin(env_codes)]
 
 
 def load_coverage_gdf(path: Path) -> gpd.GeoDataFrame:
@@ -229,33 +192,29 @@ def normalize_layer(
     cov: CoverageFile,
     counties: gpd.GeoDataFrame,
     resolution: int,
-    tier_label: str,
-    tier_spec: dict,
-    env_label: str = "all",
-    env_codes: list[int] | None = None,
+    service_label: str,
 ) -> pd.DataFrame:
-    """Normalize one (provider, tech, tier, env-group) layer to county-tagged
-    hexes, filtering the source file by speed tier and environment. Cached."""
+    """Normalize one (provider, service) coverage file to county-tagged hexes.
+
+    Each FCC mobile file is already a single technology/speed tier, so no tier
+    filtering is needed. If the file has a signal column it's kept (strongest per
+    hex); otherwise coverage is treated as a flat band. Cached to parquet.
+    """
     cache = (
         cfg.path("interim")
-        / f"hex_{cov.vintage}_{cov.provider_id}_{cov.technology}"
-        f"_{tier_label}_{env_label}_r{resolution}.parquet"
+        / f"hex_{cov.vintage}_{cov.provider_id}_{safe(service_label)}_r{resolution}.parquet"
     )
     if cache.exists():
         return pd.read_parquet(cache)
 
     gdf = load_coverage_gdf(cov.local_path)
-    gdf = filter_by_tier(gdf, tier_spec)
-    gdf = filter_by_environment(gdf, env_codes)
     signal_col = detect_signal_column(gdf)
     if signal_col is None:
-        log.warning("no signal column found in %s; using flat band", cov.local_path.name)
+        log.warning("no signal column in %s; treating coverage as flat band", cov.local_path.name)
     hex_df = coverage_to_hex(gdf, resolution, signal_col)
     hex_df = assign_counties(hex_df, counties)
     hex_df["provider_id"] = cov.provider_id
-    hex_df["technology"] = cov.technology
-    hex_df["speed_tier"] = tier_label
-    hex_df["environment"] = env_label
+    hex_df["technology"] = service_label
     hex_df["vintage"] = cov.vintage
     hex_df.to_parquet(cache, index=False)
     return hex_df

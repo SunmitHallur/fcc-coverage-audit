@@ -28,8 +28,8 @@ def _finite_or_none(value: Any, ndigits: int = 3) -> float | None:
 log = logging.getLogger(__name__)
 
 _CSV_COLUMNS = [
-    "rank", "provider_name", "provider_id", "technology", "speed_tier",
-    "environment", "county_geoid", "county_name",
+    "rank", "provider_name", "provider_id", "technology",
+    "county_geoid", "county_name",
     "state_fips", "priority_score", "flag_for_review", "flag_reason",
     "added_km2", "added_frac_of_county", "pct_increase", "blanket_fillin",
     "same_site_growth_share", "new_site_share", "unattributed_share",
@@ -76,7 +76,7 @@ def write_summary_md(scored: pd.DataFrame, path: Path, meta: dict[str, Any]) -> 
         "|-----:|----------|---------|--------|:-----:|:--------:|-----|",
     ]
     for i, (_, r) in enumerate(flagged.head(25).iterrows(), start=1):
-        svc = f"{r.get('technology', '')} {r.get('speed_tier', '')}".strip()
+        svc = str(r.get('technology', '')).strip()
         lines.append(
             f"| {i} | {r.get('provider_name', r.get('provider_id'))} "
             f"| {svc} | {r.get('county_name', '')} | {r.get('state_fips', '')} "
@@ -119,7 +119,6 @@ def build_dashboard_payload(
                 "name": r.get("county_name", ""),
                 "provider": r.get("provider_name", str(r.get("provider_id"))),
                 "technology": r.get("technology", ""),
-                "speed_tier": r.get("speed_tier", ""),
                 "lat": latlng[0],
                 "lng": latlng[1],
                 "priority": _finite_or_none(r["priority_score"]),

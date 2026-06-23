@@ -20,6 +20,7 @@ from shapely.geometry import box
 from shapely.ops import transform
 from pyproj import Transformer
 
+from .acquire import safe_service_name
 from .config import Config
 
 log = logging.getLogger(__name__)
@@ -63,11 +64,9 @@ def _circle(lat: float, lng: float, radius_m: float):
     return transform(lambda x, y, z=None: _INV.transform(x, y), buf)
 
 
-# Synthetic speed tiers + environments stamped onto every ring, mirroring the
-# real BDC attributes (mindown/minup in Mbps, environmnt code) so the normalize
-# filters exercise the same code path as live data.
-_FIX_TIERS = [("7_1", 7.0, 1.0), ("35_3", 35.0, 3.0)]
-_FIX_ENVS = [1, 2]  # 1=mobile (in-vehicle), 2=stationary
+# The single synthetic service the fixtures emulate (5G 7/1), matching a real
+# FCC per-(provider, service) coverage file.
+_FIX_SERVICE = "5G-NR (7/1 Mbps)"
 
 
 def _tower_rings(lat: float, lng: float, outer_km: float):
@@ -76,15 +75,7 @@ def _tower_rings(lat: float, lng: float, outer_km: float):
     for frac, dbm in _BANDS:
         ring = _circle(lat, lng, outer_km * 1000.0 * frac)
         geom = ring if prev is None else ring.difference(prev)
-        for tier_label, mindown, minup in _FIX_TIERS:
-            for env in _FIX_ENVS:
-                feats.append({
-                    "geometry": geom,
-                    "minsignal": dbm,
-                    "mindown": mindown,
-                    "minup": minup,
-                    "environmnt": env,
-                })
+        feats.append({"geometry": geom, "minsignal": dbm})
         prev = ring
     return feats
 
@@ -118,8 +109,8 @@ def make_fixtures(cfg: Config) -> None:
             for (lat, lng, r_km) in towers:
                 feats.extend(_tower_rings(lat, lng, r_km))
             gdf = gpd.GeoDataFrame(feats, crs="EPSG:4326")
-            # One file per (provider, technology); tiers/envs live as attributes.
-            out = vdir / f"{provider_id}_5G-NR.geojson"
+            # One file per (provider, service), matching the real FCC layout.
+            out = vdir / f"{provider_id}_{safe_service_name(_FIX_SERVICE)}.geojson"
             gdf.to_file(out, driver="GeoJSON")
         log.info("wrote fixture vintage %s (%s)", vintage_key, vintage_date)
 

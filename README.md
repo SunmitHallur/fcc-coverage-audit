@@ -69,12 +69,35 @@ Expected result: **T-Mobile / Charlie County is the #1 flagged** county
 ("100% of growth claimed from existing sites; coverage up 643%"), while AT&T's
 genuine new-tower build in the same county is **not** flagged.
 
-### 2. Run on real FCC data
+### 2. Get a free FCC API token (required for downloads)
+
+The FCC catalog is public, but **downloading the coverage files requires a free
+FCC API token**. One-time setup:
+
+1. Create an account at https://broadbandmap.fcc.gov (Sign In → Create account).
+2. Log in, click your **username** (top-right) → **Manage API Access** → **Generate**. Copy the token.
+3. Set two environment variables before running (use the same email + token):
+
+```powershell
+# Windows PowerShell
+$env:FCC_API_USERNAME = "you@example.com"
+$env:FCC_API_TOKEN    = "<your-44-char-token>"
+```
+```bash
+# macOS/Linux
+export FCC_API_USERNAME="you@example.com"
+export FCC_API_TOKEN="<your-44-char-token>"
+```
+
+The launchers (`run.bat`/`run.sh`) and CLI read these automatically. Without
+them, downloads return `401 Unauthorized` (the catalog/`list-vintages` still work).
+
+### 3. Run on real FCC data
 
 **Downloading is fully automated — you never fetch files by hand.** The default
-backend (`source.backend: fcc`) pulls coverage straight from the National
-Broadband Map API. With `providers: all` it first discovers every mobile provider
-in the catalog for the vintage, then fetches one file per `(provider, technology)`.
+backend (`source.backend: fcc`) pulls coverage from the National Broadband Map.
+With `providers: all` it discovers every mobile provider, and for each
+`(provider, service)` it downloads the per-state coverage files and merges them.
 
 **Easiest (one command, handles venv + install + run):**
 
@@ -89,43 +112,59 @@ can also pass through any subcommand, e.g. `./run.sh download` or
 **Or drive the CLI directly:**
 
 ```bash
-python -m fcc_audit.cli list-vintages          # see available 6-month vintages
+python -m fcc_audit.cli list-vintages          # available vintages (no token needed)
 python -m fcc_audit.cli download                 # PRE-FETCH all raw files only (resumable)
-python -m fcc_audit.cli run                      # download + analyze, ALL providers/techs
+python -m fcc_audit.cli run                      # download + analyze, ALL providers/services
 python -m fcc_audit.cli run --cleanup-raw        # delete each raw download after use
-python -m fcc_audit.cli run --current 2025-12-31 --prior 2025-06-30
+python -m fcc_audit.cli run --current "December 31, 2025" --prior "June 30, 2025"
 ```
 
-`download` and `run` are both resumable — already-downloaded raw files and
-already-built interim parquet are cached and skipped, so an interrupted run just
-picks up where it left off. Use `download` if you want to stage all the raw data
-in one pass (e.g. onto an external drive) and analyze later offline; use plain
-`run` to stream-download-and-process (best with `--cleanup-raw` to bound disk).
+Vintages are the FCC `filing_subtype` labels (e.g. `"December 31, 2025"`), not
+ISO dates. `download` and `run` are both resumable — already-downloaded files and
+interim parquet are cached and skipped, so an interrupted run picks up where it
+left off.
+
+### Start small — validate before the national run
+
+Real mobile coverage is **per state × provider × service**, downloaded at the
+FCC's ~10-requests/minute limit, so a full national, all-provider run is an
+**overnight (many-hour) job**. Confirm everything works on a small scope first by
+editing `config/pipeline.yaml`:
+
+```yaml
+analysis:
+  services:
+    - { label: "5G-NR 7/1", desc: "5G-NR (7/1 Mbps)" }   # one service
+  providers:
+    - { id: 131425, name: "Verizon" }                     # one provider
+  states: ["48"]                                           # Texas only
+```
+
+Then `python -m fcc_audit.cli run`. Once that produces a sane `selected_counties_*.csv`,
+widen `services`/`providers`/`states` (or set them back to `all`) for the full run.
 
 > Note: the FCC public API filters requests by User-Agent and rate-limits
 > aggressive clients; both are handled in config (`source.fcc`).
 
-#### Data volume — read this before a national run
+#### Data volume & time — read this before a national run
 
-Downloading **every provider × every technology × 2 vintages nationwide** is
-large — realistically **0.5–1 TB of raw shapefiles**, which usually will not fit
-a laptop. Options, in order of preference:
+Mobile coverage is per state × provider × service, so a full national run is
+**thousands of file downloads at ~10/minute → many hours / overnight**, and
+**0.5–1 TB** of raw files cumulatively. Options, in order of preference:
 
 1. **Redshift (best).** Once your AWS access lands, query server-side and never
-   download the raw geometry to the laptop (see below). This is the right path
-   for "all data".
+   download the raw geometry (see below). The right path for "all data".
 2. **`--cleanup-raw` + scope down.** The pipeline keeps only a compact per-layer
-   hex parquet (`data/interim/`) and deletes the big raw file after each provider
-   when you pass `--cleanup-raw`, so peak disk ≈ one provider's download, not all
-   of them. Combine with narrowing scope in config (e.g. comment out `3G`, which
-   is being retired, and run `4G-LTE` + `5G-NR` only).
-3. **Run per-state / per-provider in batches.** Process a subset, archive the
-   outputs, then move on. The interim parquet cache makes re-runs cheap.
+   hex parquet (`data/interim/`) and deletes the big raw files after each service
+   when you pass `--cleanup-raw`, so peak disk stays small. Combine with dropping
+   `3G` (being retired) and unneeded states/providers in config.
+3. **Run per-state / per-provider in batches.** The interim parquet cache makes
+   re-runs cheap and the download is resumable.
 
 If you only care about the FCC's current funding focus, keep it to **5G-NR**
-(both tiers) + **4G-LTE**; that is a fraction of the full volume.
+(both tiers) + **4G LTE**; that is a fraction of the full volume.
 
-### 3. View results
+### 4. View results
 
 ```bash
 # Ranked priority list + summary
@@ -161,14 +200,13 @@ Everything is in [`config/pipeline.yaml`](config/pipeline.yaml): providers,
 technologies/speed tiers, vintages, H3 resolutions, the signal threshold and
 match radius for site inference, reconciliation thresholds, and scoring weights.
 
-**Scope (providers & technologies).** `analysis.providers: all` auto-discovers
-every mobile provider; or replace it with an explicit list of `{id, name}` to
-narrow. `analysis.technologies` maps each technology to its FCC speed tiers
-(`mindown`/`minup` in Mbps); comment out a technology or tier to drop it. The
-normalize stage filters each downloaded file by tier (mindown/minup) and, when
-`combine_environments: false`, by environment (`environmnt`). Verify the
-`environment_codes` against a real file the first time — code meanings can vary
-by vintage; the default (combined) path does not depend on them.
+**Scope.** `analysis.providers: all` auto-discovers every mobile provider (or use
+an explicit `{id, name}` list). `analysis.services` lists the FCC mobile datasets
+to analyze, each identified by its catalog `desc` (`technology_code_desc`) — the
+FCC ships each 5G speed tier as a separate file, so `5G-NR (7/1 Mbps)` and
+`5G-NR (35/3 Mbps)` are distinct services. `analysis.states` is `all` or a FIPS
+list (e.g. `["48"]` for Texas) to scope a run. Drop services/providers/states to
+cut download volume and time.
 
 ### Switching to Redshift later
 
@@ -238,6 +276,9 @@ shifts (Menard, TX), matching the FCC's choices.
   raw downloads.** Use Redshift, `--cleanup-raw`, narrowed scope, or per-state
   batches (see "Data volume" above). Start with one state/provider to validate
   before a full national run.
-- Speed-tier filtering assumes the BDC `mindown`/`minup` attributes are present;
-  if a vintage names them differently, add the alias in `normalize._MINDOWN_COLUMNS`
-  / `_MINUP_COLUMNS`.
+- The in-file signal column is auto-detected (`normalize._SIGNAL_COLUMNS`); if a
+  vintage names it differently, add the alias there. If a file has no signal
+  column, coverage is treated as a flat band (tower inference still works from
+  coverage geometry).
+- Downloads require a free FCC API token (`FCC_API_USERNAME`/`FCC_API_TOKEN`); the
+  public catalog (`list-vintages`, provider discovery) needs no token.

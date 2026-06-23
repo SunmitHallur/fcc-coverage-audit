@@ -106,13 +106,13 @@
           .setLngLat([c.lng, c.lat])
           .setPopup(new maplibregl.Popup({ offset:12 }).setHTML(
             `<b>${c.name}</b> &mdash; ${c.provider}`
-            + ((c.technology||c.speed_tier)?`<br><span style="color:#357">${c.technology||''} ${c.speed_tier||''}</span>`:'')
+            + (c.technology?`<br><span style="color:#357">${c.technology}</span>`:'')
             + `<br>Priority: <b>${(c.priority||0).toFixed(3)}</b>${c.flag?' <span style="color:#c00">FLAGGED</span>':''}`
             + `<br>Same-site growth: ${(c.same_site_growth_share*100||0).toFixed(0)}%`
             + (c.pct_increase!=null?`<br>Coverage change: ${(c.pct_increase*100).toFixed(0)}%`:'')
             + `<br><span style="color:#555">${c.reason||''}</span>`))
           .addTo(map);
-        markers[c.geoid + c.provider + (c.technology||'') + (c.speed_tier||'')] = m;
+        markers[c.geoid + c.provider + (c.technology||'')] = m;
       });
 
       sites.forEach(s => {
@@ -131,12 +131,12 @@
         const row = document.createElement('div');
         row.className = 'row';
         row.innerHTML =
-          `<div class="top"><span class="name">${c.name} <span style="color:#8b98a5;font-weight:400">${c.provider}${(c.technology||c.speed_tier)?' · '+(c.technology||'')+' '+(c.speed_tier||''):''}</span>${c.flag?'<span class="pill flag">FLAG</span>':''}</span>`
+          `<div class="top"><span class="name">${c.name} <span style="color:#8b98a5;font-weight:400">${c.provider}${c.technology?' · '+c.technology:''}</span>${c.flag?'<span class="pill flag">FLAG</span>':''}</span>`
           + `<span class="score">${(c.priority||0).toFixed(3)}</span></div>`
           + `<div class="reason">${c.reason||''}</div>`;
         row.onclick = () => {
           map.flyTo({ center:[c.lng, c.lat], zoom:9 });
-          const m = markers[c.geoid + c.provider + (c.technology||'') + (c.speed_tier||'')];
+          const m = markers[c.geoid + c.provider + (c.technology||'')];
           if (m) m.togglePopup();
         };
         list.appendChild(row);
