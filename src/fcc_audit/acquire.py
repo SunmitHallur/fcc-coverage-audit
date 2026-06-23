@@ -17,11 +17,13 @@ FCC API contract (reverse-engineered from the public Data Download portal):
 * ``GET {base}/published/filing`` -> ``{"data": [ {process_uuid, filing_type,
   filing_subtype, as_of_date, ...}, ... ]}`` - the list of published releases.
 * ``GET {base}/national_map_process/nbm_get_data_download/{process_uuid}`` ->
-  ``{"data": [ {file_id, file_name, file_type, data_type, data_category,
+  ``{"data": [ {id, file_name, file_type, data_type, data_category,
   technology_code, state_fips, provider_id, ...}, ... ]}`` - the file catalog
   for one release.
-* ``GET {base}/downloads/downloadFile/{data_type}/{file_id}/{file_type}`` ->
-  the binary (zipped shapefile / gpkg) for one catalog row.
+* ``GET {base}/getNBMDataDownloadFile/{file_id}/{file_type}`` -> a ZIP holding
+  the shapefile (file_type=1) or GeoPackage (file_type=2) for one catalog row.
+  This is the exact endpoint the website's own "Download" buttons hit; it needs
+  NO API token, just the browser Referer/Origin headers below.
 
 The FCC silently drops requests without a non-default User-Agent, so every
 request sets one from config.
@@ -34,7 +36,6 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
 
 import requests
 
@@ -110,12 +111,12 @@ def safe_service_name(name: str) -> str:
 class FccDownloadSource(DataSource):
     """Pulls per-(provider, service, state) mobile coverage from the FCC NBM.
 
-    Two-stage API (verified against the live service):
-      * Public catalog (browser Referer/Origin headers, no auth):
-        ``/published/filing`` -> releases; ``/national_map_process/
-        nbm_get_data_download/{process_uuid}`` -> file rows.
-      * Authenticated download (FREE FCC API token via username + hash_value
-        headers): ``downloadFile/{data_type}/{id}/{file_type}``.
+    Two-stage API (verified against the live service), both public / no token:
+      * Public catalog (browser Referer/Origin headers): ``/published/filing``
+        -> releases; ``/national_map_process/nbm_get_data_download/{process_uuid}``
+        -> file rows.
+      * Public download: ``/getNBMDataDownloadFile/{id}/{file_type}`` -> a ZIP
+        with the shapefile / GeoPackage. Same endpoint the website buttons use.
 
     Mobile coverage ships per state x provider x service (5G tiers are separate
     files), so a national layer for one (provider, service) is the union of its
@@ -134,10 +135,6 @@ class FccDownloadSource(DataSource):
         self.raw_dir = cfg.path("raw")
         self._last_request = 0.0
         self._catalog_cache: dict[str, list[dict[str, Any]]] = {}
-
-        auth = fcc.get("auth", {})
-        self.username = auth.get("username") or ""
-        self.hash_value = auth.get("hash_value") or ""
 
         self.session = requests.Session()
         self.session.headers.update({
@@ -161,12 +158,14 @@ class FccDownloadSource(DataSource):
             try:
                 resp = self.session.get(url, timeout=self.timeout, stream=stream, headers=headers)
                 if resp.status_code in (401, 403):
-                    # Auth/permission errors won't fix themselves on retry.
+                    # Permission errors won't fix themselves on retry. The FCC
+                    # endpoints need no token, only the browser Referer/Origin
+                    # headers (set from config) and open egress to fcc.gov.
                     raise RuntimeError(
-                        f"HTTP {resp.status_code} for {url}. "
-                        + ("Set FCC_API_USERNAME / FCC_API_TOKEN (see README -> FCC API token)."
-                           if resp.status_code == 401 else
-                           "Catalog blocked - check Referer/Origin headers / network egress.")
+                        f"HTTP {resp.status_code} for {url}. The FCC blocked this "
+                        "request - check that fcc.user_agent / referer / origin are "
+                        "set in config/pipeline.yaml and that your network allows "
+                        "broadbandmap.fcc.gov."
                     )
                 resp.raise_for_status()
                 return resp
@@ -250,16 +249,15 @@ class FccDownloadSource(DataSource):
         return rows
 
     def _download_one(self, row: dict[str, Any], dest: Path) -> Path:
+        """Download one catalog row to ``dest`` (a .zip). No token required."""
         if dest.exists() and dest.stat().st_size > 0:
             return dest
         url = self.download_tmpl.format(
-            data_type=quote(str(row["data_type"]), safe=""),
             file_id=row["id"],
             file_type=self.file_format,
         )
-        headers = {"username": self.username, "hash_value": self.hash_value,
-                   "accept": "application/octet-stream, */*"}
-        resp = self._get(url, stream=True, headers=headers)
+        resp = self._get(url, stream=True,
+                          headers={"accept": "application/zip, application/octet-stream, */*"})
         tmp = dest.with_suffix(dest.suffix + ".part")
         with open(tmp, "wb") as fh:
             for chunk in resp.iter_content(chunk_size=1 << 20):
@@ -268,10 +266,28 @@ class FccDownloadSource(DataSource):
         tmp.rename(dest)
         return dest
 
+    @staticmethod
+    def _read_coverage_zip(zip_path: Path):
+        """Read the shapefile / GeoPackage held inside an FCC coverage ZIP.
+
+        The download endpoint always returns a ZIP; GDAL reads its contents
+        in-place via the /vsizip/ virtual filesystem (no extraction needed)."""
+        import zipfile
+
+        import geopandas as gpd
+
+        with zipfile.ZipFile(zip_path) as zf:
+            names = zf.namelist()
+        inner = ([n for n in names if n.lower().endswith(".gpkg")]
+                 or [n for n in names if n.lower().endswith(".shp")])
+        if not inner:
+            raise RuntimeError(f"No .gpkg/.shp inside {zip_path.name} (has {names[:5]})")
+        return gpd.read_file(f"/vsizip/{zip_path.resolve()}/{inner[0]}")
+
     def fetch(self, provider_id: int, technology: str, vintage: str) -> CoverageFile:
         """`technology` here is the service *desc* (e.g. '5G-NR (7/1 Mbps)').
-        Downloads every per-state file for this provider+service and merges them
-        into one local file."""
+        Downloads every per-state ZIP for this provider+service and merges them
+        into one local GeoPackage."""
         import geopandas as gpd
         import pandas as pd
 
@@ -288,15 +304,14 @@ class FccDownloadSource(DataSource):
         if merged.exists() and merged.stat().st_size > 0:
             return CoverageFile(provider_id, technology, vintage, merged)
 
-        ext = ".gpkg" if self.file_format == 2 else ".zip"
         parts = []
         for r in rows:
             st = str(r.get("state_fips"))
-            dest = out_dir / f"{safe}_{st}{ext}"
+            dest = out_dir / f"{safe}_{st}.zip"
             log.info("  download %s state %s (id=%s)", technology, st, r["id"])
             self._download_one(r, dest)
             try:
-                parts.append(gpd.read_file(dest))
+                parts.append(self._read_coverage_zip(dest))
             except Exception as exc:  # noqa: BLE001 - skip a bad/empty state file
                 log.warning("  could not read %s: %s", dest.name, exc)
         if not parts:

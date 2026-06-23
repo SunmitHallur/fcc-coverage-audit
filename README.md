@@ -69,39 +69,16 @@ Expected result: **T-Mobile / Charlie County is the #1 flagged** county
 ("100% of growth claimed from existing sites; coverage up 643%"), while AT&T's
 genuine new-tower build in the same county is **not** flagged.
 
-### 2. Get a free FCC API token (required for downloads)
+### 2. No API key needed
 
-The FCC catalog is public, but **downloading the coverage files requires a free
-FCC API token**. One-time setup:
+Downloads use the **same public endpoint the broadbandmap.fcc.gov "Download"
+buttons call** (`/nbm/map/api/getNBMDataDownloadFile/...`), so **no account or
+API token is required** — just open network access to `broadbandmap.fcc.gov`.
+The pipeline sends the browser-like `User-Agent` / `Referer` / `Origin` headers
+(configured in `config/pipeline.yaml`) that the FCC server expects.
 
-1. Create an account at https://broadbandmap.fcc.gov (Sign In → Create account).
-2. Log in, click your **username** (top-right) → **Manage API Access** → **Generate**. Copy the token.
-3. Set two environment variables before running (use the same email + token):
-
-```powershell
-# Windows PowerShell
-$env:FCC_API_USERNAME = "you@example.com"
-$env:FCC_API_TOKEN    = "<your-44-char-token>"
-```
-```bash
-# macOS/Linux
-export FCC_API_USERNAME="you@example.com"
-export FCC_API_TOKEN="<your-44-char-token>"
-```
-
-The launchers (`run.bat`/`run.sh`) and CLI read these automatically. Without
-them, downloads return `401 Unauthorized` (the catalog/`list-vintages` still work).
-
-**Sharing with a team (private repo):** never commit a token — it's tied to your
-personal FCC account. Instead, each person copies `.env.example` to `.env`
-(git-ignored) and pastes in *their own* email + token:
-
-```bash
-cp .env.example .env     # Windows: copy .env.example .env
-```
-
-The pipeline auto-loads `.env` on startup, so everyone shares the code but keeps
-their own credentials local. (`$env:`/`export` variables still override `.env`.)
+> If you previously pasted an FCC token anywhere (env vars or `pipeline.yaml`),
+> you can remove it — it is no longer used.
 
 ### 3. Run on real FCC data
 
@@ -123,7 +100,7 @@ can also pass through any subcommand, e.g. `./run.sh download` or
 **Or drive the CLI directly:**
 
 ```bash
-python -m fcc_audit.cli list-vintages          # available vintages (no token needed)
+python -m fcc_audit.cli list-vintages          # available vintages
 python -m fcc_audit.cli download                 # PRE-FETCH all raw files only (resumable)
 python -m fcc_audit.cli run                      # download + analyze, ALL providers/services
 python -m fcc_audit.cli run --cleanup-raw        # delete each raw download after use
@@ -291,5 +268,6 @@ shifts (Menard, TX), matching the FCC's choices.
   vintage names it differently, add the alias there. If a file has no signal
   column, coverage is treated as a flat band (tower inference still works from
   coverage geometry).
-- Downloads require a free FCC API token (`FCC_API_USERNAME`/`FCC_API_TOKEN`); the
-  public catalog (`list-vintages`, provider discovery) needs no token.
+- No FCC API token is needed: the pipeline downloads via the same public endpoint
+  the website's own "Download" buttons use. It only needs network access to
+  `broadbandmap.fcc.gov` and the browser-like headers set in `pipeline.yaml`.

@@ -9,21 +9,16 @@ source:
   backend: fcc            # "fcc" | "redshift" | "fixture"
 
   fcc:
-    # Public (no-auth) catalog API used by the website itself. Requires browser
-    # Referer/Origin headers or it returns 403.
+    # Public (no-auth) catalog + download API used by the website itself. Requires
+    # browser Referer/Origin headers or it returns 403. NO API TOKEN NEEDED - this
+    # is the exact same endpoint the "Download" buttons on broadbandmap.fcc.gov call.
     base_url: "https://broadbandmap.fcc.gov/nbm/map/api"
-    # Authenticated download endpoint. Files require a FREE FCC API token:
-    #   1. Create an account: https://broadbandmap.fcc.gov  (Sign In -> Create account)
-    #   2. Log in -> click your username (top-right) -> "Manage API Access" -> Generate
-    #   3. Put the username (email) + token in env vars FCC_API_USERNAME / FCC_API_TOKEN
-    #      (PowerShell:  $env:FCC_API_USERNAME="you@x.com"; $env:FCC_API_TOKEN="<token>")
-    download_url_template: "https://broadbandmap.fcc.gov/api/public/map/downloads/downloadFile/{data_type}/{file_id}/{file_type}"
-    auth:
-      username: "${FCC_API_USERNAME}"
-      hash_value: "${FCC_API_TOKEN}"
-    # Browser-like headers required by the public catalog endpoint.
+    # Download endpoint: /getNBMDataDownloadFile/{file_id}/{file_type}. Returns a
+    # ZIP containing the shapefile (file_type=1) or GeoPackage (file_type=2).
+    download_url_template: "https://broadbandmap.fcc.gov/nbm/map/api/getNBMDataDownloadFile/{file_id}/{file_type}"
+    # Browser-like headers required by the public catalog/download endpoints.
     user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-    referer: "https://broadbandmap.fcc.gov/data-download/nationwide-data"
+    referer: "https://broadbandmap.fcc.gov/data-download/data-by-provider"
     origin: "https://broadbandmap.fcc.gov"
     file_format: 2          # download format: 1 = ESRI Shapefile, 2 = GeoPackage
     request_timeout_s: 180
