@@ -139,9 +139,28 @@ def find_project_root(start: Path | None = None) -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def _load_dotenv(root: Path) -> None:
+    """Load KEY=VALUE lines from a local, untracked .env into os.environ.
+
+    Lets each user keep their own FCC API token out of the repo. Existing
+    environment variables win, so explicit `$env:`/export still overrides .env.
+    """
+    env_path = root / ".env"
+    if not env_path.exists():
+        return
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key, val = key.strip(), val.strip().strip('"').strip("'")
+        os.environ.setdefault(key, val)
+
+
 def load_config(path: str | Path | None = None) -> Config:
     """Load and parse the pipeline configuration."""
     root = find_project_root()
+    _load_dotenv(root)
     cfg_path = Path(path) if path else root / "config" / "pipeline.yaml"
     with open(cfg_path, "r", encoding="utf-8") as fh:
         raw = yaml.safe_load(fh)

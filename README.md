@@ -92,6 +92,17 @@ export FCC_API_TOKEN="<your-44-char-token>"
 The launchers (`run.bat`/`run.sh`) and CLI read these automatically. Without
 them, downloads return `401 Unauthorized` (the catalog/`list-vintages` still work).
 
+**Sharing with a team (private repo):** never commit a token — it's tied to your
+personal FCC account. Instead, each person copies `.env.example` to `.env`
+(git-ignored) and pastes in *their own* email + token:
+
+```bash
+cp .env.example .env     # Windows: copy .env.example .env
+```
+
+The pipeline auto-loads `.env` on startup, so everyone shares the code but keeps
+their own credentials local. (`$env:`/`export` variables still override `.env`.)
+
 ### 3. Run on real FCC data
 
 **Downloading is fully automated — you never fetch files by hand.** The default
