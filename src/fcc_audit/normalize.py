@@ -204,6 +204,88 @@ def assign_counties(hex_df: pd.DataFrame, counties: gpd.GeoDataFrame) -> pd.Data
     )
 
 
+def _derive_parent_hexes(
+    fine_df: pd.DataFrame, fine_res: int, parent_res: int
+) -> pd.DataFrame:
+    """Derive a coarse-resolution hex table from a finer one, EXACTLY matching a
+    direct polyfill at ``parent_res``.
+
+    H3 polyfill selects a cell iff the cell's *center* lies in the polygon. A
+    coarse cell's center coincides with its "center child" at any finer
+    resolution, so a coarse cell would be selected by a direct polyfill iff its
+    center-child fine cell was selected here. Keeping exactly those parents (with
+    their center-child's signal) reproduces the direct-polyfill result cell-for-
+    cell and signal-for-signal -- just without re-polyfilling the source polygons.
+    """
+    if fine_df.empty:
+        return pd.DataFrame(columns=["h3", "signal_dbm"])
+    out_h3: list[str] = []
+    out_sig: list[float] = []
+    for cell, sig in zip(fine_df["h3"], fine_df["signal_dbm"]):
+        parent = h3.cell_to_parent(cell, parent_res)
+        if h3.cell_to_center_child(parent, fine_res) == cell:
+            out_h3.append(parent)
+            out_sig.append(sig)
+    return pd.DataFrame({"h3": out_h3, "signal_dbm": out_sig})
+
+
+def normalize_layers(
+    cfg: Config,
+    cov: CoverageFile,
+    counties: gpd.GeoDataFrame,
+    county_res: int,
+    site_res: int,
+    service_label: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Normalize one (provider, service) file into BOTH resolutions in one pass.
+
+    Polyfilling polygons to H3 is the pipeline's most expensive step. Instead of
+    indexing the source twice (once per resolution), we polyfill once at the finer
+    ``site_res`` and derive the coarser ``county_res`` table by rolling each fine
+    cell up to its H3 parent (strongest signal wins). County tags are still
+    assigned per resolution via centroid point-in-polygon, so semantics are
+    unchanged. Each resolution caches to parquet for instant resumes.
+
+    Returns ``(county_res_df, site_res_df)``.
+    """
+    safe_svc = safe(service_label)
+    cache_c = cfg.path("interim") / f"hex_{cov.vintage}_{cov.provider_id}_{safe_svc}_r{county_res}.parquet"
+    cache_s = cfg.path("interim") / f"hex_{cov.vintage}_{cov.provider_id}_{safe_svc}_r{site_res}.parquet"
+    if cache_c.exists() and cache_s.exists():
+        return pd.read_parquet(cache_c), pd.read_parquet(cache_s)
+
+    # Parent rollup requires site_res to be strictly finer than county_res.
+    # Otherwise fall back to indexing each resolution independently.
+    if site_res <= county_res:
+        return (
+            normalize_layer(cfg, cov, counties, county_res, service_label),
+            normalize_layer(cfg, cov, counties, site_res, service_label),
+        )
+
+    gdf = load_coverage_gdf(cov.local_path)
+    signal_col = detect_signal_column(gdf)
+    if signal_col is None:
+        log.warning("no signal column in %s; treating coverage as flat band", cov.local_path.name)
+    log.info(
+        "  normalize %s provider %s %s: H3-indexing %s polygons (r%d, deriving r%d)",
+        cov.vintage, cov.provider_id, service_label, f"{len(gdf):,}", site_res, county_res,
+    )
+    fine = coverage_to_hex(gdf, site_res, signal_col)
+    coarse = _derive_parent_hexes(fine, site_res, county_res)
+
+    def _finish(hex_df: pd.DataFrame, cache: Path) -> pd.DataFrame:
+        out = assign_counties(hex_df, counties)
+        out["provider_id"] = cov.provider_id
+        out["technology"] = service_label
+        out["vintage"] = cov.vintage
+        out.to_parquet(cache, index=False)
+        return out
+
+    site_df = _finish(fine, cache_s)
+    county_df = _finish(coarse, cache_c)
+    return county_df, site_df
+
+
 def normalize_layer(
     cfg: Config,
     cov: CoverageFile,

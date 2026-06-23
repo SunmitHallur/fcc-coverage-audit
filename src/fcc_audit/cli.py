@@ -35,15 +35,19 @@ def _analyze_unit(
     county_res = int(cfg.geography["county_h3_resolution"])
     site_res = int(cfg.geography["site_h3_resolution"])
 
-    cur8 = normalize.normalize_layer(cfg, cur_file, counties, county_res, service_label)
-    pri8 = normalize.normalize_layer(cfg, pri_file, counties, county_res, service_label)
+    # One polyfill pass per vintage yields both resolutions (county_res is
+    # derived from site_res via H3 parents), instead of four separate passes.
+    cur8, cur9 = normalize.normalize_layers(
+        cfg, cur_file, counties, county_res, site_res, service_label
+    )
+    pri8, pri9 = normalize.normalize_layers(
+        cfg, pri_file, counties, county_res, site_res, service_label
+    )
     if cur8.empty and pri8.empty:
         return pd.DataFrame(), pd.DataFrame()
     change = changedetect.hex_change(pri8, cur8)
     cc = changedetect.county_change(change, county_res, county_area_km2)
 
-    cur9 = normalize.normalize_layer(cfg, cur_file, counties, site_res, service_label)
-    pri9 = normalize.normalize_layer(cfg, pri_file, counties, site_res, service_label)
     prior_sites = towers.infer_sites(pri9, cfg, label_prefix="P")
     current_sites = towers.infer_sites(cur9, cfg, label_prefix="C")
     current_sites = attribute.match_sites(
