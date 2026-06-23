@@ -1,0 +1,195 @@
+# FCC 5G Coverage-Change Audit Pipeline configuration
+# Everything the pipeline needs to run a single comparison (prior vintage vs current).
+
+# ---------------------------------------------------------------------------
+# Data source backend. Switch between FCC direct download (works today) and
+# Redshift (enable once your AWS access is granted). Nothing downstream changes.
+# ---------------------------------------------------------------------------
+source:
+  backend: fcc            # "fcc" | "redshift" | "fixture"
+
+  fcc:
+    base_url: "https://broadbandmap.fcc.gov/nbm/map/api"
+    # FCC filters requests by User-Agent; a non-browser UA is required to avoid
+    # being silently dropped (observed behavior on the public API).
+    user_agent: "fcc-coverage-audit/0.1 (research pipeline)"
+    request_timeout_s: 120
+    max_retries: 5
+    # Polite rate limit; the public API throttles aggressive clients.
+    min_seconds_between_requests: 2.0
+
+  redshift:
+    # Filled in once access is granted (read from env / secrets, not committed).
+    host: "${REDSHIFT_HOST}"
+    port: 5439
+    database: "${REDSHIFT_DB}"
+    user: "${REDSHIFT_USER}"
+    password: "${REDSHIFT_PASSWORD}"
+    # SQL template must return columns: provider_id, geometry (WKT, EPSG:4326),
+    # technology, speed_tier, environment. {vintage} {provider_id} {tech} are bound.
+    coverage_query: >-
+      SELECT provider_id, geometry_wkt, technology, speed_tier, environment
+      FROM bdc.mobile_coverage
+      WHERE as_of_date = '{vintage}' AND provider_id = {provider_id}
+        AND technology = '{tech}'
+
+  fixture:
+    # Synthetic offline data for development / CI. See fcc_audit/fixtures.py
+    dir: "data/fixtures"
+
+# ---------------------------------------------------------------------------
+# What to analyze (first build: Big-4, 5G-NR only, both speed tiers).
+# ---------------------------------------------------------------------------
+analysis:
+  # Each technology lists its FCC speed tiers (mindown/minup in Mbps). Each
+  # (technology, tier) is analyzed as its own unit, because the FCC selects per
+  # service type (e.g. "5G 7/1"). Comment out technologies/tiers to narrow scope.
+  technologies:
+    "5G-NR":
+      code: 400
+      tiers:
+        "7_1":  { mindown: 7.0,  minup: 1.0 }
+        "35_3": { mindown: 35.0, minup: 3.0 }
+    "4G-LTE":
+      code: 83
+      tiers:
+        "5_1":  { mindown: 5.0,  minup: 1.0 }
+    "3G":
+      code: 300
+      tiers:
+        "200_50": { mindown: 0.2, minup: 0.05 }
+
+  # Environments are combined (union) per tech/tier by default. Set
+  # combine_environments: false and fill environment_codes to analyze separately.
+  environments: ["mobile", "stationary"]
+  combine_environments: true
+  environment_codes: { mobile: [1], stationary: [2] }   # 'environmnt' attribute values (verify against data)
+
+  # "all" auto-discovers every provider in the catalog for the vintage; or give
+  # an explicit list of {id, name}. The Big-4 ids are kept here for reference.
+  providers: all
+  known_providers:
+    - { id: 130077, name: "AT&T" }
+    - { id: 130403, name: "T-Mobile" }
+    - { id: 131425, name: "Verizon" }
+    - { id: 130235, name: "UScellular" }
+
+  # Vintages to compare. Leave current/prior null to auto-pick the two most
+  # recent published filings from the FCC API.
+  vintages:
+    current: null                  # e.g. "2025-12-31"
+    prior: null                    # e.g. "2025-06-30"
+
+# ---------------------------------------------------------------------------
+# Geography / indexing
+# ---------------------------------------------------------------------------
+geography:
+  equal_area_crs: "EPSG:5070"      # USA Contiguous Albers (for area / distance math)
+  county_h3_resolution: 8          # matches FCC mobile-audit hex geography (~0.7 km^2)
+  site_h3_resolution: 9            # finer res for tower-cluster inference
+  # TIGER/Line county boundaries. Auto-downloaded if absent.
+  counties_url: "https://www2.census.gov/geo/tiger/TIGER2024/COUNTY/tl_2024_us_county.zip"
+
+# ---------------------------------------------------------------------------
+# Tower / site inference (HDBSCAN over high-signal hexes)
+# ---------------------------------------------------------------------------
+towers:
+  # Only hexes at/above this modeled signal band seed a candidate site.
+  # FCC signal bands are typically -85 / -95 / -105 dBm (higher = stronger).
+  # A site is inferred per CONTIGUOUS blob of such hexes (H3 adjacency), so one
+  # tower yields one site regardless of footprint size.
+  min_signal_band_dbm: -95
+  min_site_hexes: 5                # ignore tiny specks below this many hexes
+  # Two inferred sites within this distance (meters) across vintages are
+  # treated as the same physical site (matched), else "new".
+  site_match_radius_m: 2000
+
+# ---------------------------------------------------------------------------
+# Reconciliation (vector vs rendered tile) + CV fallback
+# ---------------------------------------------------------------------------
+reconcile:
+  enabled: true
+  tile_zoom: 12
+  # If vector-vs-tile coverage IoU drops below this in a tile, fall back to
+  # computer-vision segmentation of the rendered green map for that tile.
+  min_agreement_iou: 0.80
+  # Tile endpoint template (provider/tech/tier layer). Filled per provider.
+  tile_url_template: "https://broadbandmap.fcc.gov/nbm/map/api/tile/{layer}/{z}/{x}/{y}.png"
+  # A newly-covered hex within this distance of the county boundary counts as
+  # "boundary snapping" (see scoring.boundary_snap_share).
+  boundary_snap_threshold_m: 1500
+
+# ---------------------------------------------------------------------------
+# Gaming-risk scoring / prioritization
+# ---------------------------------------------------------------------------
+scoring:
+  # A county-provider is "flagged" if its anomaly percentile is at/above this.
+  flag_percentile: 0.90
+  # Increases larger than this fraction of prior coverage attributed to the
+  # SAME existing sites (not new towers) are inherently suspicious.
+  suspicious_same_site_growth: 0.50
+  # Magnitude gate (learned from FCC examples): a county must add at least this
+  # much in-county 5G coverage to be eligible for flagging. Prevents flagging
+  # near-empty counties (e.g. Edmunds, SD) or non-area-increasing signal shifts
+  # (e.g. Menard, TX). Set higher for nationwide runs; ~10 works for pilots.
+  min_added_km2_to_flag: 10.0
+  # Weight of each risk feature in the composite priority score.
+  # Positive = raises suspicion; negative = lowers it. Features not listed are
+  # ignored. Weights encode the FCC-verified selection patterns (see
+  # docs/validation_benchmark.md): PRIMARY = in-county coverage AREA increase
+  # (absolute + relative); SECONDARY = rural blanket fill-in, growth not backed
+  # by new towers, and boundary snapping.
+  feature_weights:
+    # --- PRIMARY: magnitude of in-county 5G coverage-area increase ---
+    added_frac_of_county: 0.28          # added covered area / county area (absolute, normalized)
+    coverage_increase_magnitude: 0.20   # relative jump (D25/J25), capped
+    # --- SECONDARY: implausibility / gaming signals ---
+    blanket_fillin: 0.14                # low baseline -> near-complete fill (P5, rural)
+    same_site_growth_share: 0.16        # growth claimed from EXISTING towers (P6)
+    unattributed_share: 0.10            # coverage far from any inferred tower / flat polygons (P6)
+    boundary_snap_share: 0.08           # new coverage hugging the county boundary
+    # --- legitimacy (reduces suspicion) ---
+    new_site_share: -0.10               # growth from genuine new towers
+    # signal_jump_implausibility: 0.0   # available; off (Menard-type degradation ignored)
+    # historical_volatility: 0.10       # enable once >2 vintages are processed
+
+# ---------------------------------------------------------------------------
+# Ground-truth benchmark (from FCC J25 vs D25 5G 7/1 Mbps example slides).
+# Used by `python -m fcc_audit.cli benchmark` to check the pipeline reproduces
+# the FCC's own selected / not-selected decisions once real data is available.
+# ---------------------------------------------------------------------------
+benchmark:
+  vintages: { current: "2025-12-31", prior: "2025-06-30" }   # D25 vs J25
+  speed_tier: "7_1"
+  # Optional per-county provider_id: when set, the check looks at whether THAT
+  # provider was flagged in the county; when null, any provider counts.
+  # All labeled examples below are for Verizon (provider_id 131425), 5G 7/1 Mbps.
+  counties:
+    # --- original example slides ---
+    - { geoid: "28109", name: "Pearl River County, MS", provider_id: 131425, expected_selected: true }
+    - { geoid: "25017", name: "Middlesex County, MA",    provider_id: 131425, expected_selected: true }
+    - { geoid: "46045", name: "Edmunds County, SD",      provider_id: 131425, expected_selected: false }
+    - { geoid: "48327", name: "Menard County, TX",       provider_id: 131425, expected_selected: false }
+
+    # --- additional Verizon 7/1 5G examples ---
+    - { geoid: "36049", name: "Lewis County, NY",        provider_id: 131425, expected_selected: true }
+    - { geoid: "36105", name: "Sullivan County, NY",     provider_id: 131425, expected_selected: true }
+    - { geoid: "48307", name: "Mills County, TX",        provider_id: 131425, expected_selected: true }
+    - { geoid: "48411", name: "San Saba County, TX",     provider_id: 131425, expected_selected: true }
+    - { geoid: "48277", name: "Lamar County, TX",        provider_id: 131425, expected_selected: true }
+    - { geoid: "48501", name: "Yoakum County, TX",       provider_id: 131425, expected_selected: true }
+    - { geoid: "48363", name: "Palo Pinto County, TX",   provider_id: 131425, expected_selected: true }
+    - { geoid: "40053", name: "Grant County, OK",        provider_id: 131425, expected_selected: true }
+    - { geoid: "16071", name: "Oneida County, ID",       provider_id: 131425, expected_selected: true }
+    - { geoid: "08025", name: "Crowley County, CO",      provider_id: 131425, expected_selected: false }
+    - { geoid: "08105", name: "Rio Grande County, CO",   provider_id: 131425, expected_selected: false }
+    - { geoid: "08021", name: "Conejos County, CO",      provider_id: 131425, expected_selected: false }
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+paths:
+  raw: "data/raw"
+  interim: "data/interim"
+  processed: "data/processed"
+  outputs: "data/outputs"

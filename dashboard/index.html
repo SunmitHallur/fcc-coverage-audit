@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FCC 5G Coverage-Change Audit</title>
+  <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
+  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+  <style>
+    :root { --bg:#0f1419; --panel:#171e26; --ink:#e6edf3; --muted:#8b98a5; --flag:#ff5c5c; }
+    * { box-sizing: border-box; }
+    html, body { margin:0; height:100%; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background:var(--bg); color:var(--ink); }
+    #app { display:flex; height:100vh; }
+    #side { width:360px; min-width:360px; background:var(--panel); overflow-y:auto; border-right:1px solid #222c37; }
+    #map { flex:1; }
+    header { padding:16px; border-bottom:1px solid #222c37; }
+    header h1 { font-size:16px; margin:0 0 4px; }
+    header p { margin:0; color:var(--muted); font-size:12px; }
+    .stat { display:flex; gap:12px; padding:12px 16px; }
+    .stat div { flex:1; background:#0f1620; border:1px solid #222c37; border-radius:8px; padding:10px; }
+    .stat b { font-size:20px; display:block; }
+    .stat span { color:var(--muted); font-size:11px; }
+    .list-h { padding:10px 16px; color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.05em; }
+    .row { padding:10px 16px; border-top:1px solid #222c37; cursor:pointer; }
+    .row:hover { background:#1d2731; }
+    .row .top { display:flex; justify-content:space-between; align-items:baseline; }
+    .row .name { font-weight:600; font-size:13px; }
+    .row .score { font-variant-numeric:tabular-nums; font-size:12px; color:var(--muted); }
+    .row .reason { color:var(--muted); font-size:11px; margin-top:3px; }
+    .pill { display:inline-block; font-size:10px; padding:1px 6px; border-radius:10px; margin-left:6px; }
+    .pill.flag { background:rgba(255,92,92,.15); color:var(--flag); border:1px solid rgba(255,92,92,.4); }
+    .legend { position:absolute; bottom:16px; right:16px; background:rgba(23,30,38,.92); padding:10px 12px; border-radius:8px; font-size:12px; }
+    .legend div { display:flex; align-items:center; gap:8px; margin:3px 0; }
+    .dot { width:11px; height:11px; border-radius:50%; display:inline-block; }
+    .err { padding:16px; color:var(--flag); font-size:13px; }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div id="side">
+      <header>
+        <h1>FCC 5G Coverage-Change Audit</h1>
+        <p>Provider &times; county priorities for manual review</p>
+      </header>
+      <div class="stat">
+        <div><b id="n-counties">0</b><span>counties scored</span></div>
+        <div><b id="n-flagged" style="color:var(--flag)">0</b><span>flagged</span></div>
+        <div><b id="n-sites">0</b><span>inferred sites</span></div>
+      </div>
+      <div class="list-h">Top priorities</div>
+      <div id="list"></div>
+    </div>
+    <div id="map">
+      <div class="legend">
+        <div><span class="dot" style="background:#ff5c5c"></span> Flagged county</div>
+        <div><span class="dot" style="background:#f0a500"></span> County (scored)</div>
+        <div><span class="dot" style="background:#39d353"></span> New tower (inferred)</div>
+        <div><span class="dot" style="background:#f78c3c"></span> Expanded tower</div>
+        <div><span class="dot" style="background:#8b98a5"></span> Stable tower</div>
+      </div>
+    </div>
+  </div>
+  <script>
+    const SITE_COLORS = { new_site:'#39d353', expanded_site:'#f78c3c', stable_site:'#8b98a5', site:'#8b98a5' };
+
+    const map = new maplibregl.Map({
+      container: 'map',
+      style: {
+        version: 8,
+        sources: { osm: { type:'raster', tiles:['https://tile.openstreetmap.org/{z}/{x}/{y}.png'], tileSize:256, attribution:'\u00a9 OpenStreetMap' } },
+        layers: [{ id:'osm', type:'raster', source:'osm' }]
+      },
+      center: [-98.5, 39.0], zoom: 4
+    });
+
+    function priorityColor(p, flag) { return flag ? '#ff5c5c' : '#f0a500'; }
+
+    async function load() {
+      let data;
+      try {
+        const res = await fetch('./data.json', { cache:'no-store' });
+        data = await res.json();
+      } catch (e) {
+        document.getElementById('list').innerHTML =
+          '<div class="err">Could not load data.json. Run the dashboard from a local server:<br><br>'
+          + '<code>cd dashboard &amp;&amp; python3 -m http.server 8000</code><br><br>then open http://localhost:8000</div>';
+        return;
+      }
+      render(data);
+    }
+
+    function render(data) {
+      const counties = data.counties || [];
+      const sites = data.sites || [];
+      const flagged = counties.filter(c => c.flag);
+      document.getElementById('n-counties').textContent = counties.length;
+      document.getElementById('n-flagged').textContent = flagged.length;
+      document.getElementById('n-sites').textContent = sites.length;
+
+      const markers = {};
+      counties.forEach(c => {
+        const el = document.createElement('div');
+        const size = 8 + 18 * (c.priority || 0);
+        el.style.cssText = `width:${size}px;height:${size}px;border-radius:50%;background:${priorityColor(c.priority,c.flag)};opacity:.8;border:1px solid #0008;cursor:pointer`;
+        const m = new maplibregl.Marker({ element: el })
+          .setLngLat([c.lng, c.lat])
+          .setPopup(new maplibregl.Popup({ offset:12 }).setHTML(
+            `<b>${c.name}</b> &mdash; ${c.provider}`
+            + ((c.technology||c.speed_tier)?`<br><span style="color:#357">${c.technology||''} ${c.speed_tier||''}</span>`:'')
+            + `<br>Priority: <b>${(c.priority||0).toFixed(3)}</b>${c.flag?' <span style="color:#c00">FLAGGED</span>':''}`
+            + `<br>Same-site growth: ${(c.same_site_growth_share*100||0).toFixed(0)}%`
+            + (c.pct_increase!=null?`<br>Coverage change: ${(c.pct_increase*100).toFixed(0)}%`:'')
+            + `<br><span style="color:#555">${c.reason||''}</span>`))
+          .addTo(map);
+        markers[c.geoid + c.provider + (c.technology||'') + (c.speed_tier||'')] = m;
+      });
+
+      sites.forEach(s => {
+        const el = document.createElement('div');
+        el.style.cssText = `width:7px;height:7px;border-radius:50%;background:${SITE_COLORS[s.site_class]||'#8b98a5'};border:1px solid #0006`;
+        new maplibregl.Marker({ element: el })
+          .setLngLat([s.lng, s.lat])
+          .setPopup(new maplibregl.Popup({ offset:8 }).setHTML(
+            `<b>${s.provider}</b><br>${s.site_class.replace('_',' ')}<br>${s.n_hexes} hexes`))
+          .addTo(map);
+      });
+
+      const list = document.getElementById('list');
+      list.innerHTML = '';
+      counties.slice().sort((a,b)=>b.priority-a.priority).slice(0,40).forEach(c => {
+        const row = document.createElement('div');
+        row.className = 'row';
+        row.innerHTML =
+          `<div class="top"><span class="name">${c.name} <span style="color:#8b98a5;font-weight:400">${c.provider}${(c.technology||c.speed_tier)?' · '+(c.technology||'')+' '+(c.speed_tier||''):''}</span>${c.flag?'<span class="pill flag">FLAG</span>':''}</span>`
+          + `<span class="score">${(c.priority||0).toFixed(3)}</span></div>`
+          + `<div class="reason">${c.reason||''}</div>`;
+        row.onclick = () => {
+          map.flyTo({ center:[c.lng, c.lat], zoom:9 });
+          const m = markers[c.geoid + c.provider + (c.technology||'') + (c.speed_tier||'')];
+          if (m) m.togglePopup();
+        };
+        list.appendChild(row);
+      });
+
+      if (counties.length) {
+        const b = new maplibregl.LngLatBounds();
+        counties.forEach(c => b.extend([c.lng, c.lat]));
+        map.fitBounds(b, { padding:60, maxZoom:10 });
+      }
+    }
+
+    map.on('load', load);
+  </script>
+</body>
+</html>

@@ -1,0 +1,37 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Data (never commit / never email - can be tens of GB)
+data/raw/
+data/interim/
+data/processed/
+data/outputs/
+*.zip
+*.shp
+*.dbf
+*.shx
+*.prj
+*.cpg
+*.gpkg
+*.duckdb
+*.parquet
+
+# Keep small fixtures and the directory structure
+!data/fixtures/
+!**/.gitkeep
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Secrets (Redshift creds, FCC API token)
+.env
+*.env.local
+secrets.yaml
