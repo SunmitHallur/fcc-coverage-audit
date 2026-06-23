@@ -84,8 +84,8 @@ The pipeline sends the browser-like `User-Agent` / `Referer` / `Origin` headers
 
 **Downloading is fully automated — you never fetch files by hand.** The default
 backend (`source.backend: fcc`) pulls coverage from the National Broadband Map.
-With `providers: all` it discovers every mobile provider, and for each
-`(provider, service)` it downloads the per-state coverage files and merges them.
+With `providers` set to the Big 4 (AT&T, T-Mobile, Verizon, UScellular) by default,
+the pipeline analyzes each `(provider, service)` across the configured states.
 
 **Easiest (one command, handles venv + install + run):**
 
@@ -95,15 +95,17 @@ With `providers: all` it discovers every mobile provider, and for each
 
 With no arguments the launcher does a full national run with `--cleanup-raw`. You
 can also pass through any subcommand, e.g. `./run.sh download` or
-`run.bat run --current 2025-12-31 --prior 2025-06-30`.
+`run.bat run --states 01,02 --cleanup-raw`.
 
 **Or drive the CLI directly:**
 
 ```bash
 python -m fcc_audit.cli list-vintages          # available vintages
 python -m fcc_audit.cli download                 # PRE-FETCH all raw files only (resumable)
-python -m fcc_audit.cli run                      # download + analyze, ALL providers/services
-python -m fcc_audit.cli run --cleanup-raw        # delete each raw download after use
+python -m fcc_audit.cli run                      # download + analyze, Big 4 + all services
+python -m fcc_audit.cli run --states 01,02 --cleanup-raw   # one state batch
+python -m fcc_audit.cli run --states 01,02 --cleanup-raw --build-web  # batch + web bundle
+python -m fcc_audit.cli build-web                # rebuild web bundle from accumulated batches
 python -m fcc_audit.cli run --current "December 31, 2025" --prior "June 30, 2025"
 ```
 
@@ -128,8 +130,42 @@ analysis:
   states: ["48"]                                           # Texas only
 ```
 
-Then `python -m fcc_audit.cli run`. Once that produces a sane `selected_counties_*.csv`,
-widen `services`/`providers`/`states` (or set them back to `all`) for the full run.
+Then `python -m fcc_audit.cli run --states 48`. Once that produces a sane `selected_counties_*.csv`,
+widen `services`/`states` for the full run.
+
+Or use the batch helper (processes + rebuilds the web bundle in one step):
+
+```bash
+./process_batch.sh "01,02"          # macOS/Linux
+process_batch.bat 01,02             # Windows
+```
+
+### Incremental processing → live website
+
+Process data in manageable batches, push the web bundle, and Vercel redeploys:
+
+```bash
+# 1. Process a batch (downloads, analyzes, saves parquet, rebuilds web bundle)
+./process_batch.sh "01,02,04,05"
+
+# 2. Commit the updated web bundle (small — a few MB)
+git add web/public/data
+git commit -m "Add batch results for states 01,02,04,05"
+git push
+
+# 3. Repeat with the next states. Each batch accumulates in data/processed/scored/
+#    and build-web merges everything into web/public/data/records.json.
+```
+
+**What goes in git vs what doesn't:**
+
+| In git (small) | Not in git (huge) |
+|---|---|
+| Code, config, `web/public/data/` bundle | Raw FCC downloads (`data/raw/`) |
+| Simplified county boundaries in the bundle | Interim hex parquet (`data/interim/`) |
+| | Batch scored parquet (`data/processed/`) |
+
+Anyone can regenerate raw data with `python -m fcc_audit.cli download` — no API token needed.
 
 > Note: the FCC public API filters requests by User-Agent and rate-limits
 > aggressive clients; both are handled in config (`source.fcc`).
@@ -159,10 +195,33 @@ If you only care about the FCC's current funding focus, keep it to **5G-NR**
 open data/outputs/priority_ranking_*.csv
 open data/outputs/summary_*.md
 
-# Interactive map (must be served, not opened via file://)
-cd dashboard && python3 -m http.server 8000
+# Interactive web app (production — county choropleth + plain-language explanations)
+cd web && python3 -m http.server 8000
 # then open http://localhost:8000
+
+# Legacy dashboard (point markers)
+cd dashboard && python3 -m http.server 8000
 ```
+
+### 5. Deploy to Vercel
+
+The `web/` folder is a static site ready for Vercel:
+
+1. Push this repo to GitHub (or your FCC private repo).
+2. Go to [vercel.com](https://vercel.com) → **Add New Project** → import the repo.
+3. Set **Root Directory** to `web` and deploy. No build command needed.
+4. Every `git push` that updates `web/public/data/` auto-redeploys the site.
+
+Or deploy from CLI:
+
+```bash
+cd web && npx vercel --prod
+```
+
+The site loads `public/data/counties.geojson` (county boundaries) and
+`public/data/records.json` (provider × service × county metrics + explanations).
+Select a provider from the dropdown to see coverage-change shading and flagged
+counties highlighted in red.
 
 ---
 
@@ -171,10 +230,11 @@ cd dashboard && python3 -m http.server 8000
 | File | What it is |
 |------|------------|
 | `data/outputs/selected_counties_<cur>_vs_<prior>.csv` | **The automated selection list** - only the flagged provider/county pairs, ranked. This is the deliverable that replaces the manual consultant selection. |
-| `data/outputs/priority_ranking_<cur>_vs_<prior>.csv` | One row per provider x county (all, not just flagged), ranked by priority, with the risk features and a plain-language flag reason. |
+| `data/outputs/priority_ranking_<cur>_vs_<prior>.csv` | One row per provider x county (all, not just flagged), ranked by priority, with risk features and plain-language explanation. |
 | `data/outputs/summary_<cur>_vs_<prior>.md` | Human-readable top-25 review list. |
-| `data/outputs/dashboard_data_<...>.json` + `dashboard/data.json` | Map payload. |
-| `dashboard/index.html` | MapLibre app: flagged counties + inferred new/expanded towers. |
+| `web/public/data/` | **Static web bundle** for Vercel: county GeoJSON, records JSON, meta, tower files. |
+| `web/index.html` | Production MapLibre app: county choropleth, provider/service filters, flagged highlights, click-to-explain detail panel. |
+| `dashboard/index.html` | Legacy point-marker dashboard. |
 
 **Key flag signal:** `same_site_growth_share` - the fraction of new coverage
 attributed to *existing* sites. High values mean a provider is claiming big
@@ -188,13 +248,11 @@ Everything is in [`config/pipeline.yaml`](config/pipeline.yaml): providers,
 technologies/speed tiers, vintages, H3 resolutions, the signal threshold and
 match radius for site inference, reconciliation thresholds, and scoring weights.
 
-**Scope.** `analysis.providers: all` auto-discovers every mobile provider (or use
-an explicit `{id, name}` list). `analysis.services` lists the FCC mobile datasets
-to analyze, each identified by its catalog `desc` (`technology_code_desc`) — the
-FCC ships each 5G speed tier as a separate file, so `5G-NR (7/1 Mbps)` and
-`5G-NR (35/3 Mbps)` are distinct services. `analysis.states` is `all` or a FIPS
-list (e.g. `["48"]` for Texas) to scope a run. Drop services/providers/states to
-cut download volume and time.
+**Scope.** Default config targets the **Big 4** providers. Set `analysis.providers: all`
+to auto-discover every mobile provider from the catalog. `analysis.services` lists the
+FCC mobile datasets to analyze, each identified by its catalog `desc`
+(`technology_code_desc`). Use `--states 01,02` on the CLI to scope a batch without
+editing the YAML, or set `analysis.states` to a FIPS list (e.g. `["48"]` for Texas).
 
 ### Switching to Redshift later
 

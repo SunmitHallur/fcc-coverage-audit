@@ -85,3 +85,25 @@ def test_dashboard_json_is_valid(scored):
     payload = build_dashboard_payload(scored, pd.DataFrame(), counties)
     # allow_nan=False raises if any inf/nan leaked through.
     json.dumps(payload, allow_nan=False)
+
+
+def test_plain_language_explanation(scored):
+    from fcc_audit.explain import explain_row
+
+    row = scored.iloc[0]
+    expl = explain_row(row)
+    assert "headline" in expl and len(expl["headline"]) > 10
+    assert isinstance(expl["bullets"], list) and len(expl["bullets"]) >= 1
+    assert "recommendation" in expl
+    assert expl["severity"] in ("Critical", "High", "Moderate", "Low")
+
+
+def test_web_bundle_build(scored):
+    import json
+    from fcc_audit.report import build_web_records, build_web_meta
+
+    records = build_web_records(scored)
+    assert records  # provider -> service -> geoid
+    meta = build_web_meta(scored, {"current": "a", "prior": "b"})
+    assert meta["total_records"] == len(scored)
+    json.dumps(records, allow_nan=False)

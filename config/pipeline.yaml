@@ -60,9 +60,12 @@ analysis:
     - { label: "4G LTE",     desc: "4G LTE" }
     - { label: "3G",         desc: "3G" }
 
-  # "all" auto-discovers every mobile provider in the catalog for the vintage;
-  # or give an explicit list of {id, name}. Big-4 ids kept here for reference.
-  providers: all
+  # Big 4 mobile providers (explicit list for reproducible national runs).
+  providers:
+    - { id: 130077, name: "AT&T" }
+    - { id: 130403, name: "T-Mobile" }
+    - { id: 131425, name: "Verizon" }
+    - { id: 130235, name: "UScellular" }
   known_providers:
     - { id: 130077, name: "AT&T" }
     - { id: 130403, name: "T-Mobile" }

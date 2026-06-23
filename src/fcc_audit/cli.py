@@ -4,17 +4,19 @@ Usage:
     python -m fcc_audit.cli make-fixtures        # generate offline synthetic data
     python -m fcc_audit.cli list-vintages        # list available FCC vintages
     python -m fcc_audit.cli run                   # full pipeline (auto vintages)
-    python -m fcc_audit.cli run --current 2025-12-31 --prior 2025-06-30
+    python -m fcc_audit.cli run --states 01,02 --cleanup-raw
+    python -m fcc_audit.cli build-web             # assemble static web bundle
 """
 from __future__ import annotations
 
 import argparse
 import logging
 import sys
+from typing import Any
 
 import pandas as pd
 
-from . import attribute, changedetect, normalize, report, score, towers
+from . import attribute, changedetect, explain, normalize, report, score, towers
 from .acquire import DataSource, get_source
 from .config import Config, Provider, load_config
 
@@ -27,6 +29,11 @@ def setup_logging(verbose: bool) -> None:
     )
 
 
+def _states_list(cfg: Config) -> list[str]:
+    s = cfg.states
+    return [] if s == "all" else list(s)
+
+
 def _analyze_unit(
     cfg, provider, service_label, cur_file, pri_file, counties, county_area_km2,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -35,8 +42,6 @@ def _analyze_unit(
     county_res = int(cfg.geography["county_h3_resolution"])
     site_res = int(cfg.geography["site_h3_resolution"])
 
-    # One polyfill pass per vintage yields both resolutions (county_res is
-    # derived from site_res via H3 parents), instead of four separate passes.
     cur8, cur9 = normalize.normalize_layers(
         cfg, cur_file, counties, county_res, site_res, service_label
     )
@@ -111,7 +116,6 @@ def process_provider(
             sites_parts.append(sites)
 
         if cleanup_raw:
-            # Free disk between units: keep the compact interim parquet, drop raw.
             import os
             for f in (cur_file, pri_file):
                 try:
@@ -133,19 +137,46 @@ def _resolve_providers(cfg: Config, source: DataSource, vintage: str) -> list[Pr
     return cfg.providers
 
 
+def _save_batch_results(
+    cfg: Config,
+    scored: pd.DataFrame,
+    sites: pd.DataFrame,
+    meta: dict[str, Any],
+) -> None:
+    """Persist scored rows (and optional sites) for incremental web bundle builds."""
+    states = _states_list(cfg)
+    scored_dir = cfg.path("processed") / "scored"
+    sites_dir = cfg.path("processed") / "sites"
+
+    if not scored.empty and "technology" in scored.columns:
+        for svc in scored["technology"].unique():
+            svc_rows = scored[scored["technology"] == svc]
+            report.save_batch_scored(svc_rows, scored_dir, service_label=str(svc), states=states, meta=meta)
+
+    if not sites.empty:
+        sites_dir.mkdir(parents=True, exist_ok=True)
+        states_key = "-".join(sorted(states)) if states else "all"
+        sites_path = sites_dir / f"sites_{states_key}.parquet"
+        batch_sites = sites.copy()
+        batch_sites["batch_ts"] = meta.get("generated_at", "")
+        batch_sites.to_parquet(sites_path, index=False)
+
+
 def cmd_run(cfg: Config, args) -> int:
     log = logging.getLogger(__name__)
+    if getattr(args, "states", None):
+        cfg.set_states(args.states)
+
     source = get_source(cfg)
     current, prior = source.resolve_vintages(
         args.current or cfg.vintage_current, args.prior or cfg.vintage_prior
     )
-    log.info("comparing current=%s vs prior=%s", current, prior)
+    log.info("comparing current=%s vs prior=%s (states=%s)", current, prior, cfg.states)
 
     counties = normalize.load_counties(cfg)
     county_area_km2 = normalize.county_areas_km2(counties, cfg.geography["equal_area_crs"])
 
     providers = _resolve_providers(cfg, source, current)
-    # Never delete fixture source files (they are inputs, not throwaway downloads).
     cleanup_raw = bool(getattr(args, "cleanup_raw", False)) and cfg.raw["source"]["backend"] != "fixture"
     all_feats, all_sites = [], []
     for provider in providers:
@@ -163,26 +194,90 @@ def cmd_run(cfg: Config, args) -> int:
 
     features = pd.concat(all_feats, ignore_index=True)
     scored = score.score(features, cfg)
+    scored = explain.add_explanations(scored)
     sites = pd.concat(all_sites, ignore_index=True) if all_sites else pd.DataFrame()
 
-    dashboard_dir = cfg.project_root / "dashboard"
-    dashboard_dir.mkdir(exist_ok=True)
+    states_label = ",".join(_states_list(cfg)) if _states_list(cfg) else "all"
     meta = {
         "current": current,
         "prior": prior,
         "providers": ", ".join(p.name for p in providers),
         "technologies": ", ".join(s["label"] for s in cfg.services),
+        "states_processed": states_label,
     }
+    _save_batch_results(cfg, scored, sites, meta)
+
+    dashboard_dir = cfg.project_root / "dashboard"
+    dashboard_dir.mkdir(exist_ok=True)
     paths = report.write_outputs(
         scored, sites, counties, cfg.path("outputs"), dashboard_dir, meta
     )
+
+    if getattr(args, "build_web", False):
+        web_dir = cfg.project_root / "web"
+        web_paths = report.write_web_bundle(scored, sites, counties, web_dir, meta)
+        paths.update({f"web_{k}": v for k, v in web_paths.items()})
+
     flagged = int(scored["flag_for_review"].sum())
     log.info("DONE: %d provider-county rows, %d flagged", len(scored), flagged)
     print("\nOutputs:")
     for k, v in paths.items():
         print(f"  {k}: {v}")
     print(f"\nFlagged for review: {flagged}/{len(scored)}")
-    print(f"Open the dashboard: {dashboard_dir / 'index.html'}")
+    print(f"Open the dashboard: {cfg.project_root / 'web' / 'index.html'}")
+    return 0
+
+
+def cmd_build_web(cfg: Config, args) -> int:
+    """Assemble the static web bundle from accumulated batch parquet files."""
+    log = logging.getLogger(__name__)
+    scored_dir = cfg.path("processed") / "scored"
+    sites_dir = cfg.path("processed") / "sites"
+    scored = report.load_accumulated_scored(scored_dir)
+
+    if scored.empty:
+        log.error("no accumulated scored data in %s — run batches first", scored_dir)
+        return 1
+
+    scored = explain.add_explanations(scored)
+
+    # Merge all site batches (dedupe on lat/lng/provider/service).
+    sites = pd.DataFrame()
+    if sites_dir.exists():
+        site_parts = [pd.read_parquet(p) for p in sorted(sites_dir.glob("sites_*.parquet"))]
+        if site_parts:
+            sites = pd.concat(site_parts, ignore_index=True)
+            dedup_cols = [c for c in ["lat", "lng", "provider_id", "technology"] if c in sites.columns]
+            if dedup_cols:
+                sites = sites.drop_duplicates(subset=dedup_cols, keep="last")
+
+    # Infer vintages from batch metadata or config.
+    current = scored["batch_current"].dropna().iloc[-1] if "batch_current" in scored.columns else cfg.vintage_current
+    prior = scored["batch_prior"].dropna().iloc[-1] if "batch_prior" in scored.columns else cfg.vintage_prior
+    states_processed = "all"
+    if "batch_states" in scored.columns:
+        states_processed = ",".join(sorted(set(scored["batch_states"].dropna().unique())))
+
+    meta = {
+        "current": current,
+        "prior": prior,
+        "providers": ", ".join(
+            scored.drop_duplicates("provider_id")["provider_name"].astype(str).tolist()
+        ),
+        "technologies": ", ".join(sorted(scored["technology"].unique())),
+        "states_processed": states_processed,
+    }
+
+    counties = normalize.load_counties(cfg)
+    web_dir = cfg.project_root / "web"
+    paths = report.write_web_bundle(scored, sites, counties, web_dir, meta)
+    flagged = int(scored["flag_for_review"].sum()) if "flag_for_review" in scored.columns else 0
+    log.info("web bundle ready: %d records, %d flagged", len(scored), flagged)
+    print("\nWeb bundle:")
+    for k, v in paths.items():
+        print(f"  {k}: {v}")
+    print(f"\nDeploy: push to git -> Vercel auto-deploys web/")
+    print(f"Preview locally: cd web && python -m http.server 8000")
     return 0
 
 
@@ -194,12 +289,11 @@ def cmd_list_vintages(cfg: Config, args) -> int:
 
 
 def cmd_download(cfg: Config, args) -> int:
-    """Pre-stage raw coverage files from the FCC API without running analysis.
-
-    Useful to pull everything in one pass (e.g. onto an external drive) before a
-    later offline `run`. Already-downloaded files are skipped, so it's resumable.
-    """
+    """Pre-stage raw coverage files from the FCC API without running analysis."""
     log = logging.getLogger(__name__)
+    if getattr(args, "states", None):
+        cfg.set_states(args.states)
+
     source = get_source(cfg)
     current, prior = source.resolve_vintages(
         args.current or cfg.vintage_current, args.prior or cfg.vintage_prior
@@ -208,7 +302,8 @@ def cmd_download(cfg: Config, args) -> int:
     services = cfg.services
     total_bytes = 0
     n_files = n_skipped = 0
-    log.info("downloading %d providers x %d services x 2 vintages", len(providers), len(services))
+    log.info("downloading %d providers x %d services x 2 vintages (states=%s)",
+             len(providers), len(services), cfg.states)
     for provider in providers:
         for vintage in (current, prior):
             for svc in services:
@@ -237,11 +332,7 @@ def cmd_make_fixtures(cfg: Config, args) -> int:
 
 
 def cmd_benchmark(cfg: Config, args) -> int:
-    """Check the pipeline reproduces the FCC's selected/not-selected examples.
-
-    Runs the comparison for the benchmark vintages, then for each labeled county
-    compares whether ANY provider was flagged there against the FCC's decision.
-    """
+    """Check the pipeline reproduces the FCC's selected/not-selected examples."""
     log = logging.getLogger(__name__)
     bench = cfg.raw.get("benchmark")
     if not bench:
@@ -268,8 +359,6 @@ def cmd_benchmark(cfg: Config, args) -> int:
 
     scored = scored.copy()
     scored["county_geoid"] = scored["county_geoid"].astype(str)
-    # Scope the comparison to the benchmark's service (e.g. "5G-NR 7/1"), so
-    # flags from other services don't count as matches.
     bench_service = bench.get("service_label", "5G-NR 7/1")
     if "technology" in scored and bench_service:
         scored = scored[scored["technology"] == bench_service]
@@ -320,8 +409,16 @@ def main(argv: list[str] | None = None) -> int:
     p_run.add_argument("--current", default=None)
     p_run.add_argument("--prior", default=None)
     p_run.add_argument(
+        "--states", default=None,
+        help='comma-separated state FIPS codes to scope this batch (e.g. "01,02,48")',
+    )
+    p_run.add_argument(
         "--cleanup-raw", action="store_true",
         help="delete each provider's raw download after processing (bounds disk use)",
+    )
+    p_run.add_argument(
+        "--build-web", action="store_true",
+        help="also rebuild the static web bundle after this batch",
     )
     p_run.set_defaults(func=cmd_run)
 
@@ -334,7 +431,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_dl.add_argument("--current", default=None)
     p_dl.add_argument("--prior", default=None)
+    p_dl.add_argument("--states", default=None, help="comma-separated state FIPS codes")
     p_dl.set_defaults(func=cmd_download)
+
+    sub.add_parser("build-web", help="assemble static web bundle from accumulated batches").set_defaults(
+        func=cmd_build_web
+    )
     sub.add_parser("make-fixtures", help="generate synthetic offline data").set_defaults(
         func=cmd_make_fixtures
     )

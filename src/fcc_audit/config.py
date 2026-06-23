@@ -91,6 +91,27 @@ class Config:
             return "all"
         return [str(x).zfill(2) for x in s]
 
+    def set_states(self, states: str | list[str] | None) -> None:
+        """Override analysis.states at runtime (e.g. from --states CLI flag)."""
+        if states is None:
+            return
+        if isinstance(states, str):
+            if states.lower() == "all":
+                self.raw["analysis"]["states"] = "all"
+            else:
+                self.raw["analysis"]["states"] = [
+                    s.strip().zfill(2) for s in states.split(",") if s.strip()
+                ]
+        else:
+            self.raw["analysis"]["states"] = [str(s).zfill(2) for s in states]
+
+    def set_providers_big4(self) -> None:
+        """Restrict to the Big 4 known providers."""
+        self.raw["analysis"]["providers"] = [
+            {"id": p.id, "name": p.name} for p in self.known_providers
+            if p.id in (130077, 130403, 131425, 130235)
+        ]
+
     @property
     def vintage_current(self) -> str | None:
         return self.raw["analysis"]["vintages"]["current"]

@@ -1,0 +1,14 @@
+{
+  "version": 2,
+  "name": "fcc-coverage-audit",
+  "public": true,
+  "cleanUrls": true,
+  "headers": [
+    {
+      "source": "/public/data/(.*)",
+      "headers": [
+        { "key": "Cache-Control", "value": "public, max-age=3600" }
+      ]
+    }
+  ]
+}

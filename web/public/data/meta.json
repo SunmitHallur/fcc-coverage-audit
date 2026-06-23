@@ -1,0 +1,29 @@
+{
+  "generated_at": "2026-06-23T22:55:29.181894+00:00",
+  "current_vintage": "2025-12-31",
+  "prior_vintage": "2025-06-30",
+  "providers": [
+    {
+      "id": 130077,
+      "name": "AT&T"
+    },
+    {
+      "id": 130235,
+      "name": "UScellular"
+    },
+    {
+      "id": 130403,
+      "name": "T-Mobile"
+    },
+    {
+      "id": 131425,
+      "name": "Verizon"
+    }
+  ],
+  "services": [
+    "5G-NR 7/1"
+  ],
+  "total_records": 7,
+  "flagged_count": 2,
+  "states_processed": "all"
+}

@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FCC Coverage Change Audit</title>
+  <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
+  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+  <style>
+    :root {
+      --bg: #0b0f14;
+      --panel: #121820;
+      --panel2: #1a2330;
+      --ink: #eef2f7;
+      --muted: #8b98a8;
+      --accent: #3b82f6;
+      --flag: #ef4444;
+      --warn: #f59e0b;
+      --ok: #22c55e;
+      --border: #243041;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background: var(--bg); color: var(--ink); }
+    #app { display: grid; grid-template-columns: 380px 1fr; height: 100vh; }
+    #sidebar { background: var(--panel); border-right: 1px solid var(--border); display: flex; flex-direction: column; overflow: hidden; }
+    #map-wrap { position: relative; }
+    #map { width: 100%; height: 100%; }
+    header { padding: 20px 18px 12px; border-bottom: 1px solid var(--border); }
+    header h1 { margin: 0 0 4px; font-size: 18px; font-weight: 700; letter-spacing: -0.02em; }
+    header p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.4; }
+    .controls { padding: 14px 18px; border-bottom: 1px solid var(--border); display: grid; gap: 10px; }
+    label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; display: block; margin-bottom: 4px; }
+    select, input[type=search] {
+      width: 100%; background: var(--panel2); color: var(--ink); border: 1px solid var(--border);
+      border-radius: 8px; padding: 9px 10px; font-size: 13px;
+    }
+    .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; padding: 0 18px 12px; }
+    .stat { background: var(--panel2); border: 1px solid var(--border); border-radius: 10px; padding: 10px; }
+    .stat b { display: block; font-size: 20px; font-variant-numeric: tabular-nums; }
+    .stat span { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .05em; }
+    .list-head { padding: 8px 18px; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; display: flex; justify-content: space-between; align-items: center; }
+    #list { flex: 1; overflow-y: auto; }
+    .row { padding: 12px 18px; border-top: 1px solid var(--border); cursor: pointer; transition: background .15s; }
+    .row:hover, .row.active { background: var(--panel2); }
+    .row .top { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+    .row .name { font-weight: 600; font-size: 13px; }
+    .row .score { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+    .row .sub { color: var(--muted); font-size: 11px; margin-top: 4px; line-height: 1.35; }
+    .pill { display: inline-block; font-size: 10px; padding: 2px 7px; border-radius: 999px; margin-left: 6px; vertical-align: middle; }
+    .pill.flag { background: rgba(239,68,68,.15); color: var(--flag); border: 1px solid rgba(239,68,68,.35); }
+    .pill.sev-critical { background: rgba(239,68,68,.2); color: #fca5a5; }
+    .pill.sev-high { background: rgba(245,158,11,.15); color: #fcd34d; }
+    .pill.sev-moderate { background: rgba(59,130,246,.15); color: #93c5fd; }
+    #detail {
+      position: absolute; top: 16px; right: 16px; width: 340px; max-height: calc(100% - 32px);
+      background: rgba(18,24,32,.96); backdrop-filter: blur(8px); border: 1px solid var(--border);
+      border-radius: 14px; padding: 16px; overflow-y: auto; display: none; box-shadow: 0 12px 40px rgba(0,0,0,.35);
+    }
+    #detail.visible { display: block; }
+    #detail h2 { margin: 0 0 6px; font-size: 16px; }
+    #detail .meta { color: var(--muted); font-size: 12px; margin-bottom: 12px; }
+    #detail .headline { font-size: 14px; line-height: 1.45; margin-bottom: 12px; }
+    #detail ul { margin: 0 0 12px; padding-left: 18px; font-size: 12px; line-height: 1.45; color: #cbd5e1; }
+    #detail .rec { background: var(--panel2); border: 1px solid var(--border); border-radius: 8px; padding: 10px; font-size: 12px; line-height: 1.4; }
+    #detail .close { float: right; background: none; border: none; color: var(--muted); cursor: pointer; font-size: 18px; }
+    .toolbar {
+      position: absolute; bottom: 16px; left: 16px; display: flex; gap: 8px; align-items: center;
+      background: rgba(18,24,32,.92); border: 1px solid var(--border); border-radius: 10px; padding: 8px 12px; font-size: 12px;
+    }
+    .toolbar label { margin: 0; text-transform: none; letter-spacing: 0; display: flex; align-items: center; gap: 6px; color: var(--ink); }
+    .legend {
+      position: absolute; bottom: 16px; right: 16px; background: rgba(18,24,32,.92); border: 1px solid var(--border);
+      border-radius: 10px; padding: 10px 12px; font-size: 11px;
+    }
+    .legend div { display: flex; align-items: center; gap: 8px; margin: 3px 0; color: var(--muted); }
+    .swatch { width: 14px; height: 14px; border-radius: 3px; display: inline-block; }
+    .err { padding: 18px; color: var(--flag); font-size: 13px; line-height: 1.5; }
+    @media (max-width: 900px) {
+      #app { grid-template-columns: 1fr; grid-template-rows: 45vh 55vh; }
+      #detail { width: calc(100% - 32px); left: 16px; right: 16px; }
+    }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div id="sidebar">
+      <header>
+        <h1>Coverage Change Audit</h1>
+        <p id="vintage-label">Loading data…</p>
+      </header>
+      <div class="controls">
+        <div>
+          <label for="provider">Provider</label>
+          <select id="provider"></select>
+        </div>
+        <div>
+          <label for="service">Service</label>
+          <select id="service"></select>
+        </div>
+        <div>
+          <label for="search">Search flagged counties</label>
+          <input id="search" type="search" placeholder="County name…" />
+        </div>
+      </div>
+      <div class="stats">
+        <div class="stat"><b id="n-scored">0</b><span>counties</span></div>
+        <div class="stat"><b id="n-flagged" style="color:var(--flag)">0</b><span>flagged</span></div>
+        <div class="stat"><b id="n-providers">0</b><span>providers</span></div>
+      </div>
+      <div class="list-head"><span>Flagged for review</span><span id="metric-toggle" style="cursor:pointer;color:var(--accent)">Metric: priority</span></div>
+      <div id="list"></div>
+    </div>
+    <div id="map-wrap">
+      <div id="map"></div>
+      <div id="detail">
+        <button class="close" id="detail-close" aria-label="Close">&times;</button>
+        <h2 id="detail-title"></h2>
+        <div class="meta" id="detail-meta"></div>
+        <div class="headline" id="detail-headline"></div>
+        <ul id="detail-bullets"></ul>
+        <div class="rec" id="detail-rec"></div>
+      </div>
+      <div class="toolbar">
+        <label><input type="checkbox" id="show-towers" /> Show inferred towers</label>
+        <label><input type="checkbox" id="flagged-only" /> Flagged counties only</label>
+      </div>
+      <div class="legend">
+        <div><span class="swatch" style="background:#ef4444"></span> High priority / flagged</div>
+        <div><span class="swatch" style="background:#f59e0b"></span> Moderate change</div>
+        <div><span class="swatch" style="background:#334155"></span> No data / low change</div>
+      </div>
+    </div>
+  </div>
+  <script>
+    const DATA_BASE = 'public/data';
+    let meta = {}, records = {}, countiesGeo = null;
+    let currentProvider = null, currentService = null;
+    let metricMode = 'priority'; // or 'change'
+    let towerMarkers = [];
+    let towersCache = {};
+
+    const map = new maplibregl.Map({
+      container: 'map',
+      style: {
+        version: 8,
+        sources: {
+          osm: {
+            type: 'raster',
+            tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
+            tileSize: 256,
+            attribution: '© OpenStreetMap'
+          }
+        },
+        layers: [{ id: 'osm', type: 'raster', source: 'osm' }]
+      },
+      center: [-98.5, 39.0],
+      zoom: 4,
+      maxZoom: 12
+    });
+
+    async function loadData() {
+      const [metaRes, recRes, geoRes] = await Promise.all([
+        fetch(`${DATA_BASE}/meta.json`),
+        fetch(`${DATA_BASE}/records.json`),
+        fetch(`${DATA_BASE}/counties.geojson`)
+      ]);
+      if (!metaRes.ok || !recRes.ok || !geoRes.ok) {
+        throw new Error('Missing web bundle. Run: python -m fcc_audit.cli build-web');
+      }
+      meta = await metaRes.json();
+      records = await recRes.json();
+      countiesGeo = await geoRes.json();
+    }
+
+    function providerRecords(pid, svc) {
+      return (records[pid] && records[pid][svc]) ? records[pid][svc] : {};
+    }
+
+    function fillDropdowns() {
+      const pSel = document.getElementById('provider');
+      const sSel = document.getElementById('service');
+      pSel.innerHTML = '';
+      (meta.providers || []).forEach(p => {
+        const o = document.createElement('option');
+        o.value = String(p.id);
+        o.textContent = p.name;
+        pSel.appendChild(o);
+      });
+      sSel.innerHTML = '';
+      (meta.services || []).forEach(s => {
+        const o = document.createElement('option');
+        o.value = s;
+        o.textContent = s;
+        sSel.appendChild(o);
+      });
+      currentProvider = pSel.value;
+      currentService = sSel.value;
+      document.getElementById('vintage-label').textContent =
+        `${meta.current_vintage || '?'} vs ${meta.prior_vintage || '?'}`;
+      document.getElementById('n-providers').textContent = (meta.providers || []).length;
+    }
+
+    function colorForRecord(rec) {
+      if (!rec) return '#334155';
+      const p = rec.priority || 0;
+      const ch = rec.metrics?.pct_increase || rec.metrics?.added_frac_of_county || 0;
+      const v = metricMode === 'change' ? Math.min(ch || 0, 1) : p;
+      if (rec.flag) return '#ef4444';
+      if (v >= 0.7) return '#ef4444';
+      if (v >= 0.4) return '#f59e0b';
+      if (v >= 0.15) return '#64748b';
+      return '#334155';
+    }
+
+    function applyFeatureStates() {
+      if (!map.getSource('counties')) return;
+      const recs = providerRecords(currentProvider, currentService);
+      const flaggedOnly = document.getElementById('flagged-only').checked;
+      countiesGeo.features.forEach(f => {
+        const geoid = f.properties.geoid;
+        const rec = recs[geoid];
+        const hasData = !!rec;
+        const show = hasData && (!flaggedOnly || rec.flag);
+        map.setFeatureState(
+          { source: 'counties', id: geoid },
+          {
+            hasData: show,
+            flag: rec?.flag || false,
+            priority: rec?.priority || 0,
+            color: colorForRecord(rec)
+          }
+        );
+      });
+    }
+
+    function setupMapLayers() {
+      if (map.getSource('counties')) {
+        applyFeatureStates();
+        return;
+      }
+      map.addSource('counties', {
+        type: 'geojson',
+        data: countiesGeo,
+        promoteId: 'geoid'
+      });
+      map.addLayer({
+        id: 'counties-fill',
+        type: 'fill',
+        source: 'counties',
+        paint: {
+          'fill-color': ['case', ['feature-state', 'hasData'], ['feature-state', 'color'], '#1e293b'],
+          'fill-opacity': ['case', ['feature-state', 'hasData'], 0.72, 0.25]
+        }
+      });
+      map.addLayer({
+        id: 'counties-outline',
+        type: 'line',
+        source: 'counties',
+        paint: {
+          'line-color': ['case', ['feature-state', 'flag'], '#ef4444', '#475569'],
+          'line-width': ['case', ['feature-state', 'flag'], 2.5, 0.5],
+          'line-opacity': ['case', ['feature-state', 'hasData'], 0.9, 0.3]
+        }
+      });
+      map.on('click', 'counties-fill', e => {
+        const geoid = e.features[0].properties.geoid;
+        const rec = providerRecords(currentProvider, currentService)[geoid];
+        if (rec) showDetail(rec);
+      });
+      map.on('mouseenter', 'counties-fill', () => map.getCanvas().style.cursor = 'pointer');
+      map.on('mouseleave', 'counties-fill', () => map.getCanvas().style.cursor = '');
+      applyFeatureStates();
+    }
+
+    function renderList() {
+      const recs = providerRecords(currentProvider, currentService);
+      const q = document.getElementById('search').value.toLowerCase();
+      const rows = Object.values(recs)
+        .filter(r => r.flag)
+        .filter(r => !q || r.name.toLowerCase().includes(q))
+        .sort((a, b) => (b.priority || 0) - (a.priority || 0));
+
+      document.getElementById('n-scored').textContent = Object.keys(recs).length;
+      document.getElementById('n-flagged').textContent = rows.length;
+
+      const list = document.getElementById('list');
+      list.innerHTML = '';
+      if (!rows.length) {
+        list.innerHTML = '<div class="err">No flagged counties for this provider/service yet. Process more state batches and run build-web.</div>';
+        return;
+      }
+      rows.forEach(r => {
+        const div = document.createElement('div');
+        div.className = 'row';
+        div.dataset.geoid = r.geoid;
+        const sev = (r.explanation?.severity || 'Low').toLowerCase();
+        div.innerHTML =
+          `<div class="top"><span class="name">${r.name}<span class="pill flag">FLAG</span><span class="pill sev-${sev}">${r.explanation?.severity || ''}</span></span>`
+          + `<span class="score">${(r.priority || 0).toFixed(2)}</span></div>`
+          + `<div class="sub">${r.explanation?.headline || ''}</div>`;
+        div.onclick = () => {
+          document.querySelectorAll('.row').forEach(el => el.classList.remove('active'));
+          div.classList.add('active');
+          showDetail(r);
+          flyToCounty(r.geoid);
+        };
+        list.appendChild(div);
+      });
+    }
+
+    function flyToCounty(geoid) {
+      const f = countiesGeo.features.find(x => x.properties.geoid === geoid);
+      if (!f) return;
+      const coords = f.geometry.type === 'Polygon'
+        ? f.geometry.coordinates[0]
+        : f.geometry.coordinates[0][0];
+      const bounds = coords.reduce((b, c) => b.extend(c), new maplibregl.LngLatBounds(coords[0], coords[0]));
+      map.fitBounds(bounds, { padding: 80, maxZoom: 9 });
+    }
+
+    function showDetail(rec) {
+      const d = document.getElementById('detail');
+      d.classList.add('visible');
+      document.getElementById('detail-title').textContent = rec.name;
+      document.getElementById('detail-meta').textContent =
+        `${rec.provider_name} · ${rec.service} · Priority ${(rec.priority || 0).toFixed(2)} · ${rec.explanation?.severity || ''}`;
+      document.getElementById('detail-headline').textContent = rec.explanation?.headline || '';
+      const ul = document.getElementById('detail-bullets');
+      ul.innerHTML = '';
+      (rec.explanation?.bullets || []).forEach(b => {
+        const li = document.createElement('li');
+        li.textContent = b;
+        ul.appendChild(li);
+      });
+      document.getElementById('detail-rec').textContent = rec.explanation?.recommendation || '';
+    }
+
+    async function loadTowers(show) {
+      towerMarkers.forEach(m => m.remove());
+      towerMarkers = [];
+      if (!show) return;
+      const pid = currentProvider;
+      if (!towersCache[pid]) {
+        try {
+          const res = await fetch(`${DATA_BASE}/towers/${pid}.json`);
+          towersCache[pid] = res.ok ? await res.json() : [];
+        } catch { towersCache[pid] = []; }
+      }
+      const svc = currentService;
+      towersCache[pid].filter(t => !t.service || t.service === svc).forEach(t => {
+        const el = document.createElement('div');
+        const colors = { new_site: '#22c55e', expanded_site: '#f59e0b', stable_site: '#94a3b8' };
+        el.style.cssText = `width:8px;height:8px;border-radius:50%;background:${colors[t.site_class] || '#94a3b8'};border:1px solid #0006`;
+        towerMarkers.push(new maplibregl.Marker({ element: el }).setLngLat([t.lng, t.lat]).addTo(map));
+      });
+    }
+
+    function onSelectionChange() {
+      currentProvider = document.getElementById('provider').value;
+      currentService = document.getElementById('service').value;
+      applyFeatureStates();
+      renderList();
+      loadTowers(document.getElementById('show-towers').checked);
+    }
+
+    document.getElementById('provider').addEventListener('change', onSelectionChange);
+    document.getElementById('service').addEventListener('change', onSelectionChange);
+    document.getElementById('search').addEventListener('input', renderList);
+    document.getElementById('flagged-only').addEventListener('change', () => { applyFeatureStates(); });
+    document.getElementById('show-towers').addEventListener('change', e => loadTowers(e.target.checked));
+    document.getElementById('detail-close').addEventListener('click', () => document.getElementById('detail').classList.remove('visible'));
+    document.getElementById('metric-toggle').addEventListener('click', () => {
+      metricMode = metricMode === 'priority' ? 'change' : 'priority';
+      document.getElementById('metric-toggle').textContent = `Metric: ${metricMode}`;
+      applyFeatureStates();
+    });
+
+    map.on('load', async () => {
+      try {
+        await loadData();
+        fillDropdowns();
+        setupMapLayers();
+        renderList();
+        map.fitBounds([[-125, 24], [-66, 50]], { padding: 40 });
+      } catch (e) {
+        document.getElementById('list').innerHTML = `<div class="err">${e.message}</div>`;
+      }
+    });
+  </script>
+</body>
+</html>

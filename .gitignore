@@ -22,6 +22,10 @@ data/outputs/
 *.duckdb
 *.parquet
 
+# Web bundle (committed for Vercel deploy)
+!web/public/data/
+!web/public/data/**
+
 # Keep small fixtures and the directory structure
 !data/fixtures/
 !**/.gitkeep

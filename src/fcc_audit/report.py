@@ -1,18 +1,40 @@
-"""Outputs: ranked priority CSV, a human-readable summary, and dashboard data.
+"""Outputs: ranked priority CSV, a human-readable summary, dashboard data, and web bundle.
 
-The dashboard payload (JSON) is consumed by ``dashboard/index.html`` (MapLibre),
-which renders flagged counties and inferred new/expanded sites on a map.
+The dashboard payload (JSON) is consumed by ``dashboard/index.html`` (legacy) and
+``web/index.html`` (production MapLibre choropleth). The web bundle is a compact
+static set of files suitable for Vercel deployment.
 """
 from __future__ import annotations
 
 import json
 import logging
 import math
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import geopandas as gpd
 import pandas as pd
+
+from .explain import add_explanations, explain_row
+
+log = logging.getLogger(__name__)
+
+_CSV_COLUMNS = [
+    "rank", "provider_name", "provider_id", "technology",
+    "county_geoid", "county_name",
+    "state_fips", "priority_score", "flag_for_review", "flag_reason", "plain_explanation",
+    "added_km2", "added_frac_of_county", "pct_increase", "blanket_fillin",
+    "same_site_growth_share", "new_site_share", "unattributed_share",
+    "boundary_snap_share", "new_towers", "new_hexes", "upgraded_hexes",
+]
+
+_METRIC_KEYS = [
+    "priority_score", "flag_for_review", "added_km2", "added_frac_of_county",
+    "pct_increase", "same_site_growth_share", "new_site_share",
+    "unattributed_share", "boundary_snap_share", "blanket_fillin", "new_towers",
+    "prior_cov_frac", "current_cov_frac", "flag_reason",
+]
 
 
 def _finite_or_none(value: Any, ndigits: int = 3) -> float | None:
@@ -24,17 +46,6 @@ def _finite_or_none(value: Any, ndigits: int = 3) -> float | None:
     if not math.isfinite(f):
         return None
     return round(f, ndigits)
-
-log = logging.getLogger(__name__)
-
-_CSV_COLUMNS = [
-    "rank", "provider_name", "provider_id", "technology",
-    "county_geoid", "county_name",
-    "state_fips", "priority_score", "flag_for_review", "flag_reason",
-    "added_km2", "added_frac_of_county", "pct_increase", "blanket_fillin",
-    "same_site_growth_share", "new_site_share", "unattributed_share",
-    "boundary_snap_share", "new_towers", "new_hexes", "upgraded_hexes",
-]
 
 
 def write_ranking_csv(scored: pd.DataFrame, path: Path) -> Path:
@@ -76,11 +87,12 @@ def write_summary_md(scored: pd.DataFrame, path: Path, meta: dict[str, Any]) -> 
         "|-----:|----------|---------|--------|:-----:|:--------:|-----|",
     ]
     for i, (_, r) in enumerate(flagged.head(25).iterrows(), start=1):
-        svc = str(r.get('technology', '')).strip()
+        svc = str(r.get("technology", "")).strip()
+        why = r.get("plain_explanation") or r.get("flag_reason", "")
         lines.append(
             f"| {i} | {r.get('provider_name', r.get('provider_id'))} "
             f"| {svc} | {r.get('county_name', '')} | {r.get('state_fips', '')} "
-            f"| {r['priority_score']:.3f} | {r.get('flag_reason', '')} |"
+            f"| {r['priority_score']:.3f} | {why} |"
         )
     lines += [
         "",
@@ -113,6 +125,7 @@ def build_dashboard_payload(
         latlng = cen.get(str(r["county_geoid"]))
         if not latlng:
             continue
+        expl = explain_row(r)
         county_features.append(
             {
                 "geoid": str(r["county_geoid"]),
@@ -124,6 +137,7 @@ def build_dashboard_payload(
                 "priority": _finite_or_none(r["priority_score"]),
                 "flag": bool(r.get("flag_for_review", False)),
                 "reason": r.get("flag_reason", ""),
+                "plain_explanation": expl["headline"],
                 "pct_increase": _finite_or_none(r.get("pct_increase")),
                 "same_site_growth_share": _finite_or_none(r.get("same_site_growth_share", 0)),
             }
@@ -141,6 +155,141 @@ def build_dashboard_payload(
     return {"counties": county_features, "sites": site_features}
 
 
+def _record_from_row(r: pd.Series) -> dict[str, Any]:
+    """Compact web record for one provider x service x county."""
+    expl = explain_row(r)
+    metrics = {
+        k: _finite_or_none(r[k]) if k in r and k != "flag_for_review" else None
+        for k in _METRIC_KEYS
+    }
+    metrics["flag_for_review"] = bool(r.get("flag_for_review", False))
+    if "pct_increase" in r:
+        metrics["pct_increase"] = _finite_or_none(r["pct_increase"])
+    return {
+        "geoid": str(r["county_geoid"]),
+        "name": str(r.get("county_name", "")),
+        "state_fips": str(r.get("state_fips", "")),
+        "provider_id": int(r["provider_id"]),
+        "provider_name": str(r.get("provider_name", r["provider_id"])),
+        "service": str(r.get("technology", "")),
+        "priority": _finite_or_none(r.get("priority_score")),
+        "flag": bool(r.get("flag_for_review", False)),
+        "metrics": metrics,
+        "explanation": expl,
+    }
+
+
+def build_web_records(scored: pd.DataFrame) -> dict[str, Any]:
+    """Build nested lookup: provider_id -> service -> geoid -> record."""
+    if scored.empty:
+        return {}
+    lookup: dict[str, dict[str, dict[str, Any]]] = {}
+    for _, r in scored.iterrows():
+        pid = str(int(r["provider_id"]))
+        svc = str(r.get("technology", ""))
+        geoid = str(r["county_geoid"])
+        lookup.setdefault(pid, {}).setdefault(svc, {})[geoid] = _record_from_row(r)
+    return lookup
+
+
+def build_web_meta(scored: pd.DataFrame, meta: dict[str, Any]) -> dict[str, Any]:
+    """Site-wide metadata for the web app."""
+    providers = []
+    if not scored.empty and "provider_id" in scored.columns:
+        for pid in sorted(scored["provider_id"].unique()):
+            name = scored.loc[scored["provider_id"] == pid, "provider_name"].iloc[0]
+            providers.append({"id": int(pid), "name": str(name)})
+    services = sorted(scored["technology"].unique().tolist()) if "technology" in scored.columns else []
+    flagged = int(scored["flag_for_review"].sum()) if "flag_for_review" in scored.columns else 0
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "current_vintage": meta.get("current"),
+        "prior_vintage": meta.get("prior"),
+        "providers": providers,
+        "services": services,
+        "total_records": len(scored),
+        "flagged_count": flagged,
+        "states_processed": meta.get("states_processed", "all"),
+    }
+
+
+def build_counties_geojson(
+    counties: gpd.GeoDataFrame,
+    simplify_tolerance: float = 0.005,
+) -> dict[str, Any]:
+    """Simplify county boundaries for web delivery (~1-3 MB GeoJSON)."""
+    gdf = counties.copy()
+    if gdf.crs is None or gdf.crs.to_epsg() != 4326:
+        gdf = gdf.to_crs("EPSG:4326")
+    gdf["geometry"] = gdf.geometry.simplify(simplify_tolerance, preserve_topology=True)
+    gdf = gdf.rename(columns={"county_geoid": "geoid", "county_name": "name", "state_fips": "state"})
+    return json.loads(gdf[["geoid", "name", "state", "geometry"]].to_json())
+
+
+def build_towers_by_provider(sites: pd.DataFrame) -> dict[int, list[dict[str, Any]]]:
+    """Group tower features by provider_id for lazy loading."""
+    if sites.empty:
+        return {}
+    out: dict[int, list[dict[str, Any]]] = {}
+    for _, s in sites.iterrows():
+        pid = int(s.get("provider_id", 0))
+        out.setdefault(pid, []).append({
+            "lat": float(s["lat"]),
+            "lng": float(s["lng"]),
+            "service": str(s.get("technology", "")),
+            "site_class": str(s.get("site_class", "site")),
+            "n_hexes": int(s.get("n_hexes", 0)),
+        })
+    return out
+
+
+def write_web_bundle(
+    scored: pd.DataFrame,
+    sites: pd.DataFrame,
+    counties: gpd.GeoDataFrame,
+    web_dir: Path,
+    meta: dict[str, Any],
+    *,
+    simplify_tolerance: float = 0.005,
+) -> dict[str, Path]:
+    """Write static web data bundle under ``web/public/data/``."""
+    data_dir = web_dir / "public" / "data"
+    towers_dir = data_dir / "towers"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    towers_dir.mkdir(parents=True, exist_ok=True)
+
+    counties_path = data_dir / "counties.geojson"
+    records_path = data_dir / "records.json"
+    meta_path = data_dir / "meta.json"
+
+    geo = build_counties_geojson(counties, simplify_tolerance)
+    counties_path.write_text(json.dumps(geo), encoding="utf-8")
+
+    records = build_web_records(scored)
+    records_path.write_text(json.dumps(records, allow_nan=False), encoding="utf-8")
+
+    web_meta = build_web_meta(scored, meta)
+    meta_path.write_text(json.dumps(web_meta, indent=2), encoding="utf-8")
+
+    towers_by_provider = build_towers_by_provider(sites)
+    tower_paths: dict[str, Path] = {}
+    for pid, feats in towers_by_provider.items():
+        tp = towers_dir / f"{pid}.json"
+        tp.write_text(json.dumps(feats, allow_nan=False), encoding="utf-8")
+        tower_paths[str(pid)] = tp
+
+    log.info(
+        "wrote web bundle: %d records, %d providers, %d tower files",
+        len(scored), len(web_meta["providers"]), len(tower_paths),
+    )
+    return {
+        "counties": counties_path,
+        "records": records_path,
+        "meta": meta_path,
+        "towers_dir": towers_dir,
+    }
+
+
 def write_outputs(
     scored: pd.DataFrame,
     sites: pd.DataFrame,
@@ -149,6 +298,7 @@ def write_outputs(
     dashboard_dir: Path,
     meta: dict[str, Any],
 ) -> dict[str, Path]:
+    scored = add_explanations(scored)
     tag = f"{meta.get('current')}_vs_{meta.get('prior')}"
     csv_path = write_ranking_csv(scored, outputs_dir / f"priority_ranking_{tag}.csv")
     selected_path = write_selected_list(scored, outputs_dir / f"selected_counties_{tag}.csv")
@@ -168,3 +318,47 @@ def write_outputs(
         "summary": md_path,
         "dashboard_data": data_path,
     }
+
+
+def load_accumulated_scored(scored_dir: Path) -> pd.DataFrame:
+    """Load and merge all batch parquet files from ``data/processed/scored/``."""
+    if not scored_dir.exists():
+        return pd.DataFrame()
+    parts = sorted(scored_dir.glob("scored_*.parquet"))
+    if not parts:
+        return pd.DataFrame()
+    dfs = [pd.read_parquet(p) for p in parts]
+    combined = pd.concat(dfs, ignore_index=True)
+    # De-duplicate on provider + service + county, keeping the latest batch.
+    if "batch_ts" in combined.columns:
+        combined = combined.sort_values("batch_ts").drop_duplicates(
+            subset=["provider_id", "technology", "county_geoid"], keep="last"
+        )
+    else:
+        combined = combined.drop_duplicates(
+            subset=["provider_id", "technology", "county_geoid"], keep="last"
+        )
+    return combined.reset_index(drop=True)
+
+
+def save_batch_scored(
+    scored: pd.DataFrame,
+    scored_dir: Path,
+    *,
+    service_label: str,
+    states: list[str],
+    meta: dict[str, Any],
+) -> Path:
+    """Persist one batch's scored rows for later web bundle assembly."""
+    scored_dir.mkdir(parents=True, exist_ok=True)
+    states_key = "-".join(sorted(states)) if states else "all"
+    safe_svc = service_label.replace("/", "-").replace(" ", "")
+    path = scored_dir / f"scored_{safe_svc}_{states_key}.parquet"
+    df = scored.copy()
+    df["batch_ts"] = datetime.now(timezone.utc).isoformat()
+    df["batch_states"] = ",".join(states) if states else "all"
+    df["batch_current"] = meta.get("current")
+    df["batch_prior"] = meta.get("prior")
+    df.to_parquet(path, index=False)
+    log.info("saved batch scored: %s (%d rows)", path.name, len(df))
+    return path
