@@ -270,19 +270,31 @@ class FccDownloadSource(DataSource):
     def _read_coverage_zip(zip_path: Path):
         """Read the shapefile / GeoPackage held inside an FCC coverage ZIP.
 
-        The download endpoint always returns a ZIP; GDAL reads its contents
-        in-place via the /vsizip/ virtual filesystem (no extraction needed)."""
+        A GeoPackage is a SQLite DB and does many random seeks; reading it
+        through GDAL's /vsizip/ forces repeated decompression and is
+        pathologically slow for large files, so we extract it to disk first
+        (on the same drive as the zip) and read the real file, cleaning up
+        after. Shapefiles read sequentially, so /vsizip/ is fine for those."""
+        import shutil
         import zipfile
 
         import geopandas as gpd
 
         with zipfile.ZipFile(zip_path) as zf:
             names = zf.namelist()
-        inner = ([n for n in names if n.lower().endswith(".gpkg")]
-                 or [n for n in names if n.lower().endswith(".shp")])
-        if not inner:
-            raise RuntimeError(f"No .gpkg/.shp inside {zip_path.name} (has {names[:5]})")
-        return gpd.read_file(f"/vsizip/{zip_path.resolve()}/{inner[0]}")
+            gpkg = [n for n in names if n.lower().endswith(".gpkg")]
+            shp = [n for n in names if n.lower().endswith(".shp")]
+            if gpkg:
+                workdir = zip_path.parent / (zip_path.stem + "_extract")
+                workdir.mkdir(exist_ok=True)
+                try:
+                    extracted = Path(zf.extract(gpkg[0], workdir))
+                    return gpd.read_file(extracted)
+                finally:
+                    shutil.rmtree(workdir, ignore_errors=True)
+        if shp:
+            return gpd.read_file(f"/vsizip/{zip_path.resolve()}/{shp[0]}")
+        raise RuntimeError(f"No .gpkg/.shp inside {zip_path.name} (has {names[:5]})")
 
     def fetch(self, provider_id: int, technology: str, vintage: str) -> CoverageFile:
         """`technology` here is the service *desc* (e.g. '5G-NR (7/1 Mbps)').
