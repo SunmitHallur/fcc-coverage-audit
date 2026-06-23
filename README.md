@@ -209,13 +209,14 @@ The `web/` folder is a static site ready for Vercel:
 
 1. Push this repo to GitHub (or your FCC private repo).
 2. Go to [vercel.com](https://vercel.com) → **Add New Project** → import the repo.
-3. Set **Root Directory** to `web` and deploy. No build command needed.
+3. Leave **Root Directory** blank (repo root). The root `vercel.json` sets
+   `outputDirectory` to `web` automatically. No build command needed.
 4. Every `git push` that updates `web/public/data/` auto-redeploys the site.
 
 Or deploy from CLI:
 
 ```bash
-cd web && npx vercel --prod
+npx vercel --prod    # from repo root (vercel.json points at web/)
 ```
 
 The site loads `public/data/counties.geojson` (county boundaries) and
