@@ -68,11 +68,28 @@ def _to_dbm(value: float) -> float:
 def coverage_to_hex(
     gdf: gpd.GeoDataFrame, resolution: int, signal_col: str | None
 ) -> pd.DataFrame:
-    """Fill polygons with H3 cells, keeping the strongest signal band per hex."""
+    """Fill polygons with H3 cells, keeping the strongest signal band per hex.
+
+    This is the most CPU-intensive stage: it polyfills every coverage polygon
+    (FCC mobile files run into the millions). Progress is logged periodically so
+    a long run is visibly making progress rather than appearing hung.
+    """
+    import time
+
     best: dict[str, float] = {}
-    for geom, sig in zip(
-        gdf.geometry, (gdf[signal_col] if signal_col else [None] * len(gdf))
-    ):
+    total = len(gdf)
+    signals = gdf[signal_col] if signal_col else [None] * total
+    log_every = 250_000
+    start = time.monotonic()
+    for i, (geom, sig) in enumerate(zip(gdf.geometry, signals)):
+        if i and i % log_every == 0:
+            elapsed = time.monotonic() - start
+            rate = i / elapsed if elapsed else 0.0
+            eta = (total - i) / rate if rate else 0.0
+            log.info(
+                "    H3-indexing %s/%s polygons (%.0f/s, ~%.0fs left, %s hexes so far)",
+                f"{i:,}", f"{total:,}", rate, eta, f"{len(best):,}",
+            )
         if geom is None or geom.is_empty:
             continue
         dbm = _to_dbm(sig) if sig is not None else 0.0
@@ -211,6 +228,10 @@ def normalize_layer(
     signal_col = detect_signal_column(gdf)
     if signal_col is None:
         log.warning("no signal column in %s; treating coverage as flat band", cov.local_path.name)
+    log.info(
+        "  normalize %s provider %s %s: H3-indexing %s polygons (r%d)",
+        cov.vintage, cov.provider_id, service_label, f"{len(gdf):,}", resolution,
+    )
     hex_df = coverage_to_hex(gdf, resolution, signal_col)
     hex_df = assign_counties(hex_df, counties)
     hex_df["provider_id"] = cov.provider_id
