@@ -263,10 +263,13 @@ def render_coverage_map(
 
     _add_scale_bar(ax, extent_3857)
 
+    # Fixed margins so prior/current PNGs have identical pixel layout (swipe compare).
+    fig.subplots_adjust(left=0.02, right=0.82, top=0.90, bottom=0.02)
+
     if show_colorbar:
         sm = plt.cm.ScalarMappable(cmap=_CMAP, norm=_NORM)
         sm.set_array([])
-        cbar = fig.colorbar(sm, ax=ax, fraction=0.035, pad=0.02, aspect=28)
+        cbar = fig.colorbar(sm, ax=ax, fraction=0.046, pad=0.02, aspect=28)
         cbar.set_label("dBm", fontsize=8)
         cbar.ax.tick_params(labelsize=7)
 
@@ -277,8 +280,8 @@ def render_coverage_map(
     fig.savefig(
         output_path,
         dpi=dpi,
-        bbox_inches="tight",
-        pad_inches=0.06,
+        bbox_inches=None,
+        pad_inches=0,
         facecolor=fig.get_facecolor(),
     )
     plt.close(fig)
@@ -323,7 +326,7 @@ def render_county_compare_maps(
             title=title,
             output_path=path,
             extent_wgs84=extent,
-            show_colorbar=(json_key == "current_map"),
+            show_colorbar=True,
         ):
             refs[json_key] = filename
     return refs
