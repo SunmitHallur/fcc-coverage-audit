@@ -61,7 +61,7 @@
     .pill.sev-high { background: rgba(245,158,11,.15); color: #fcd34d; }
     .pill.sev-moderate { background: rgba(59,130,246,.15); color: #93c5fd; }
     #detail {
-      position: absolute; top: 16px; right: 16px; width: min(720px, calc(100% - 32px));
+      position: absolute; top: 16px; right: 16px; width: min(920px, calc(100% - 32px));
       max-height: calc(100% - 32px);
       background: rgba(18,24,32,.96); backdrop-filter: blur(8px); border: 1px solid var(--border);
       border-radius: 14px; padding: 16px; overflow-y: auto; display: none; box-shadow: 0 12px 40px rgba(0,0,0,.35);
@@ -97,7 +97,12 @@
       padding: 8px 10px; font-size: 11px; color: var(--muted); border-bottom: 1px solid var(--border);
       text-transform: uppercase; letter-spacing: .04em;
     }
-    .compare-map { width: 100%; height: 300px; background: #e8e4dc; }
+    .compare-map { width: 100%; height: 420px; background: #e8e4dc; }
+    .compare-raster {
+      width: 100%; height: 420px; background: #e8e4dc; display: none;
+      align-items: center; justify-content: center; overflow: hidden;
+    }
+    .compare-raster img { width: 100%; height: 100%; object-fit: contain; display: block; }
     .signal-legend {
       display: flex; flex-wrap: wrap; gap: 8px; font-size: 10px; color: #475569;
       padding: 6px 10px 8px; border-top: 1px solid var(--border); background: #f8fafc;
@@ -201,9 +206,10 @@
           <div class="compare-maps" id="compare-maps" style="display:none">
             <div class="compare-panel">
               <div class="panel-head" id="map-prior-label">Prior coverage</div>
+              <div id="map-prior-raster" class="compare-raster"><img id="img-prior" alt="Prior coverage map" /></div>
               <div id="map-prior" class="compare-map"></div>
               <div class="empty-map-note" id="map-prior-empty" style="display:none">No prior coverage in this county</div>
-              <div class="signal-legend">
+              <div class="signal-legend" id="map-prior-legend">
                 <span><i style="background:#a3e635"></i> Strong (−85+)</span>
                 <span><i style="background:#22c55e"></i> Medium (−95)</span>
                 <span><i style="background:#f97316"></i> Light (−105)</span>
@@ -212,9 +218,10 @@
             </div>
             <div class="compare-panel">
               <div class="panel-head" id="map-current-label">Current coverage</div>
+              <div id="map-current-raster" class="compare-raster"><img id="img-current" alt="Current coverage map" /></div>
               <div id="map-current" class="compare-map"></div>
               <div class="empty-map-note" id="map-current-empty" style="display:none">No current coverage in this county</div>
-              <div class="signal-legend">
+              <div class="signal-legend" id="map-current-legend">
                 <span><i style="background:#a3e635"></i> Strong (−85+)</span>
                 <span><i style="background:#22c55e"></i> Medium (−95)</span>
                 <span><i style="background:#f97316"></i> Light (−105)</span>
@@ -349,6 +356,30 @@
       });
     }
 
+    function setCompareMode(mode) {
+      const useRaster = mode === 'raster';
+      ['prior', 'current'].forEach(side => {
+        document.getElementById(`map-${side}-raster`).style.display = useRaster ? 'flex' : 'none';
+        document.getElementById(`map-${side}`).style.display = useRaster ? 'none' : 'block';
+        document.getElementById(`map-${side}-legend`).style.display = useRaster ? 'none' : 'flex';
+      });
+      if (useRaster) destroyCompareMaps();
+    }
+
+    function detailAssetBase(rec) {
+      const pid = rec.provider_id || currentProvider;
+      const svc = rec.service || currentService;
+      const geoid = rec.geoid;
+      return `${DATA_BASE}/details/${pid}/${safeServiceKey(svc)}/${geoid}`;
+    }
+
+    function showRasterCompare(detail, rec) {
+      const base = detailAssetBase(rec);
+      document.getElementById('img-prior').src = `${base}/${detail.prior_map}`;
+      document.getElementById('img-current').src = `${base}/${detail.current_map}`;
+      setCompareMode('raster');
+    }
+
     function renderCompareMap(containerId, geo, countyFeature, emptyNoteId, sharedBounds) {
       const emptyEl = emptyNoteId ? document.getElementById(emptyNoteId) : null;
       const hasCoverage = (geo.features || []).some(f => f.properties?.kind !== 'tower');
@@ -363,16 +394,19 @@
         style: {
           version: 8,
           sources: {
-            osm: {
+            topo: {
               type: 'raster',
-              tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
-              tileSize: 256
+              tiles: ['https://tile.opentopomap.org/{z}/{x}/{y}.png'],
+              tileSize: 256,
+              maxzoom: 17
             }
           },
-          layers: [{ id: 'osm', type: 'raster', source: 'osm', paint: { 'raster-opacity': 0.45 } }]
+          layers: [{ id: 'topo', type: 'raster', source: 'topo', paint: { 'raster-opacity': 0.58 } }]
         },
         center: [-98.5, 39.0],
         zoom: 8,
+        maxZoom: 14,
+        pixelRatio: 2,
         attributionControl: false,
         interactive: true,
         preserveDrawingBuffer: true
@@ -447,7 +481,7 @@
           });
         }
         const b = sharedBounds || boundsFromGeoJSON(geo) || countyBounds(countyFeature);
-        if (b) mapObj.fitBounds(b, { padding: 36, maxZoom: 12, duration: 0 });
+        if (b) mapObj.fitBounds(b, { padding: 24, maxZoom: 14, duration: 0 });
         requestAnimationFrame(() => mapObj.resize());
       });
       return mapObj;
@@ -518,6 +552,20 @@
         }
       });
       return best || String(meta.providers?.[0]?.id || '');
+    }
+
+    function openDemoCounty() {
+      const geoid = meta.default_county_geoid;
+      if (!geoid) return;
+      if (meta.default_provider_id != null) {
+        const pid = String(meta.default_provider_id);
+        document.getElementById('provider').value = pid;
+        currentProvider = pid;
+      }
+      const rec = providerRecords(currentProvider, currentService)[geoid];
+      if (!rec) return;
+      showDetail(rec);
+      flyToCounty(geoid);
     }
 
     function fitMapToCounties() {
@@ -790,6 +838,13 @@
           `${formatVintage(detail.current_vintage) || detail.current_vintage || 'Current'} — ${rec.service} coverage`;
         statusEl.style.display = 'none';
         document.getElementById('compare-maps').style.display = 'grid';
+
+        if (detail.prior_map && detail.current_map) {
+          showRasterCompare(detail, rec);
+          return;
+        }
+
+        setCompareMode('map');
         const countyFeature = resolveCountyFeature(rec.geoid, detail);
         const priorGeo = hexesToGeoJSON(detail.prior_hexes, detail.sites_prior);
         const currentGeo = hexesToGeoJSON(detail.current_hexes, detail.sites_current);
@@ -873,6 +928,7 @@
         setupMapLayers();
         renderList();
         fitMapToCounties();
+        openDemoCounty();
         loader.classList.add('hidden');
         setTimeout(() => loader.remove(), 400);
       } catch (e) {

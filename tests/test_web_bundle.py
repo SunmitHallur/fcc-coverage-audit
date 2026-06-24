@@ -43,7 +43,9 @@ def test_county_detail_fixture_structure():
 
 
 def test_write_county_details_creates_files(tmp_path):
+    import geopandas as gpd
     import pandas as pd
+    from shapely.geometry import box
 
     scored = pd.DataFrame([{
         "provider_id": 130403,
@@ -58,11 +60,21 @@ def test_write_county_details_creates_files(tmp_path):
          "vintage": "prior", "h3": "8826e64247fffff", "signal_dbm": -95.0},
     ])
     sites = pd.DataFrame()
+    counties = gpd.GeoDataFrame([{
+        "county_geoid": "90003",
+        "county_name": "Charlie County",
+        "state_fips": "90",
+        "geometry": box(-99.0, 39.0, -98.5, 39.5),
+    }], crs="EPSG:4326")
     data_dir = tmp_path / "data"
-    n = write_county_details(scored, coverage, sites, data_dir, {"prior": "a", "current": "b"})
+    n = write_county_details(
+        scored, coverage, sites, data_dir, {"prior": "a", "current": "b"}, counties=counties,
+    )
     assert n == 1
     out = data_dir / "details" / "130403" / "5G-NR7-1" / "90003.json"
     assert out.exists()
     blob = json.loads(out.read_text())
     assert blob["towers_prior"] == 1
     assert blob["towers_current"] == 2
+    assert blob.get("prior_map") == "prior.png"
+    assert (out.parent / "prior.png").exists()

@@ -34,6 +34,19 @@ def _states_list(cfg: Config) -> list[str]:
     return [] if s == "all" else list(s)
 
 
+def _demo_web_defaults(cfg: Config, scored: pd.DataFrame) -> dict[str, Any]:
+    """Landing-page defaults for the fixture / synthetic county demo."""
+    if scored.empty:
+        return {}
+    geoids = scored["county_geoid"].astype(str)
+    if cfg.backend != "fixture" and not geoids.str.startswith("90").any():
+        return {}
+    return {
+        "default_provider_id": 130077,
+        "default_county_geoid": "90003",
+    }
+
+
 def _analyze_unit(
     cfg, provider, service_label, cur_file, pri_file, counties, county_area_km2,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -290,8 +303,10 @@ def cmd_run(cfg: Config, args) -> int:
 
     if getattr(args, "build_web", False):
         web_dir = cfg.project_root / "web"
+        web_meta = dict(meta)
+        web_meta.update(_demo_web_defaults(cfg, scored))
         web_paths = report.write_web_bundle(
-            scored, sites, counties, web_dir, meta, coverage=coverage,
+            scored, sites, counties, web_dir, web_meta, coverage=coverage,
         )
         paths.update({f"web_{k}": v for k, v in web_paths.items()})
 
@@ -349,8 +364,10 @@ def cmd_build_web(cfg: Config, args) -> int:
     coverage = report.load_accumulated_coverage(coverage_dir)
     counties = normalize.load_counties(cfg)
     web_dir = cfg.project_root / "web"
+    web_meta = dict(meta)
+    web_meta.update(_demo_web_defaults(cfg, scored))
     paths = report.write_web_bundle(
-        scored, sites, counties, web_dir, meta, coverage=coverage,
+        scored, sites, counties, web_dir, web_meta, coverage=coverage,
     )
     flagged = int(scored["flag_for_review"].sum()) if "flag_for_review" in scored.columns else 0
     log.info("web bundle ready: %d records, %d flagged", len(scored), flagged)

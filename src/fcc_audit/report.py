@@ -19,6 +19,7 @@ from shapely.geometry import mapping
 
 from .explain import add_explanations, explain_row
 from . import attribute
+from . import map_render
 
 log = logging.getLogger(__name__)
 
@@ -207,7 +208,7 @@ def build_web_meta(scored: pd.DataFrame, meta: dict[str, Any]) -> dict[str, Any]
             providers.append({"id": int(pid), "name": str(name)})
     services = sorted(scored["technology"].unique().tolist()) if "technology" in scored.columns else []
     flagged = int(scored["flag_for_review"].sum()) if "flag_for_review" in scored.columns else 0
-    return {
+    web_meta = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "current_vintage": meta.get("current"),
         "prior_vintage": meta.get("prior"),
@@ -217,13 +218,18 @@ def build_web_meta(scored: pd.DataFrame, meta: dict[str, Any]) -> dict[str, Any]
         "flagged_count": flagged,
         "states_processed": meta.get("states_processed", "all"),
     }
+    if meta.get("default_provider_id") is not None:
+        web_meta["default_provider_id"] = int(meta["default_provider_id"])
+    if meta.get("default_county_geoid"):
+        web_meta["default_county_geoid"] = str(meta["default_county_geoid"])
+    return web_meta
 
 
 def _county_boundary_feature(
     counties: gpd.GeoDataFrame,
     geoid: str,
     *,
-    simplify_tolerance: float | None = 0.001,
+    simplify_tolerance: float | None = 0.0002,
 ) -> dict[str, Any] | None:
     """GeoJSON Feature for one county (used in compare maps)."""
     if counties.empty:
@@ -234,8 +240,11 @@ def _county_boundary_feature(
     gdf = counties.loc[mask].copy()
     if gdf.crs is None or gdf.crs.to_epsg() != 4326:
         gdf = gdf.to_crs("EPSG:4326")
-    if simplify_tolerance is not None:
-        gdf["geometry"] = gdf.geometry.simplify(simplify_tolerance, preserve_topology=True)
+    tol = simplify_tolerance
+    if tol is not None and len(counties) <= 12:
+        tol = None
+    if tol is not None:
+        gdf["geometry"] = gdf.geometry.simplify(tol, preserve_topology=True)
     row = gdf.iloc[0]
     return {
         "type": "Feature",
@@ -250,7 +259,7 @@ def _county_boundary_feature(
 
 def build_counties_geojson(
     counties: gpd.GeoDataFrame,
-    simplify_tolerance: float = 0.005,
+    simplify_tolerance: float = 0.001,
     geoids: set[str] | None = None,
 ) -> dict[str, Any]:
     """Simplify county boundaries for web delivery (~1-3 MB GeoJSON)."""
@@ -261,7 +270,8 @@ def build_counties_geojson(
         return {"type": "FeatureCollection", "features": []}
     if gdf.crs is None or gdf.crs.to_epsg() != 4326:
         gdf = gdf.to_crs("EPSG:4326")
-    gdf["geometry"] = gdf.geometry.simplify(simplify_tolerance, preserve_topology=True)
+    if simplify_tolerance is not None and len(gdf) > 12:
+        gdf["geometry"] = gdf.geometry.simplify(simplify_tolerance, preserve_topology=True)
     gdf = gdf.rename(columns={"county_geoid": "geoid", "county_name": "name", "state_fips": "state"})
     return json.loads(gdf[["geoid", "name", "state", "geometry"]].to_json())
 
@@ -420,6 +430,9 @@ def write_county_details(
             detail["towers_current"] = len(detail["sites_current"])
             detail["new_towers"] = max(0, detail["towers_current"] - detail["towers_prior"])
 
+        map_refs = map_render.render_county_compare_maps(detail, svc_dir)
+        detail.update(map_refs)
+
         out = svc_dir / f"{geoid}.json"
         out.write_text(json.dumps(detail, allow_nan=False), encoding="utf-8")
         n += 1
@@ -453,7 +466,7 @@ def write_web_bundle(
     web_dir: Path,
     meta: dict[str, Any],
     *,
-    simplify_tolerance: float = 0.005,
+    simplify_tolerance: float = 0.001,
     coverage: pd.DataFrame | None = None,
 ) -> dict[str, Path]:
     """Write static web data bundle under ``web/public/data/``."""

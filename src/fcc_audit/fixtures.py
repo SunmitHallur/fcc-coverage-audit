@@ -15,8 +15,11 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+import zipfile
+
 import geopandas as gpd
-from shapely.geometry import box
+import requests
+from shapely.geometry import Point, box
 from shapely.ops import transform
 from pyproj import Transformer
 
@@ -37,15 +40,26 @@ _COUNTY_GRID = [
 ]
 
 # Tower layout per provider per vintage: (lat, lng, outer_radius_km).
+# AT&T Charlie (90003) is the cross-border demo: towers in Alpha/Delta cover
+# Osborne before a new in-county build appears in the current vintage.
 _LAYOUT = {
     "prior": {
-        130077: [(38.75, -98.75, 8.0), (38.75, -98.25, 8.0)],   # AT&T: Alpha, Bravo
+        130077: [
+            (39.10, -98.82, 12.0),   # Alpha (Russell) — north edge, covers Charlie
+            (39.12, -98.58, 11.0),   # Alpha — covers SE Charlie
+            (39.30, -98.28, 12.0),   # Delta (Mitchell) — covers W Charlie
+        ],
         130403: [(39.25, -98.75, 8.0)],                          # T-Mobile: Charlie
         131425: [(39.25, -98.25, 6.0)],                          # Verizon: Delta
         130235: [(38.70, -98.70, 7.0)],                          # UScellular: Alpha
     },
     "current": {
-        130077: [(38.75, -98.75, 8.0), (38.75, -98.25, 8.0), (39.25, -98.70, 8.0)],  # +NEW Charlie
+        130077: [
+            (39.10, -98.82, 12.0),
+            (39.12, -98.58, 11.0),
+            (39.30, -98.28, 12.0),
+            (39.35, -98.77, 9.0),    # NEW tower in Charlie (Osborne)
+        ],
         130403: [(39.25, -98.75, 22.0)],                         # SAME tower, huge inflation
         131425: [(39.25, -98.25, 7.5)],                          # modest growth
         130235: [(38.70, -98.70, 7.0)],                          # unchanged
@@ -53,7 +67,16 @@ _LAYOUT = {
 }
 
 # Concentric signal bands as fractions of the outer radius -> minsignal (dBm).
-_BANDS = [(0.4, -85.0), (0.7, -95.0), (1.0, -105.0)]
+# More rings → smoother heat map when rasterized for compare panels.
+_BANDS = [
+    (0.20, -78.0),
+    (0.35, -85.0),
+    (0.50, -92.0),
+    (0.65, -98.0),
+    (0.80, -105.0),
+    (0.92, -112.0),
+    (1.0, -118.0),
+]
 
 
 def _circle(lat: float, lng: float, radius_m: float):
@@ -80,21 +103,66 @@ def _tower_rings(lat: float, lng: float, outer_km: float):
     return feats
 
 
+def _try_load_tiger(cfg: Config) -> gpd.GeoDataFrame | None:
+    """Load TIGER county boundaries when available (offline CI falls back to boxes)."""
+    raw = cfg.path("raw") / "tl_us_county.zip"
+    if not raw.exists():
+        url = cfg.geography.get("counties_url")
+        if not url:
+            return None
+        try:
+            log.info("downloading TIGER counties for fixture shapes: %s", url)
+            resp = requests.get(url, timeout=300, headers={"user-agent": "fcc-coverage-audit/0.1"})
+            resp.raise_for_status()
+            raw.parent.mkdir(parents=True, exist_ok=True)
+            raw.write_bytes(resp.content)
+        except Exception as exc:
+            log.warning("could not download TIGER counties for fixtures: %s", exc)
+            return None
+    if not zipfile.is_zipfile(raw):
+        return None
+    try:
+        gdf = gpd.read_file(f"zip://{raw}")[["GEOID", "NAME", "STATEFP", "geometry"]]
+        gdf = gdf.rename(columns={"GEOID": "county_geoid", "NAME": "county_name", "STATEFP": "state_fips"})
+        if gdf.crs is None or gdf.crs.to_epsg() != 4326:
+            gdf = gdf.to_crs("EPSG:4326")
+        return gdf
+    except Exception as exc:
+        log.warning("could not read TIGER counties: %s", exc)
+        return None
+
+
+def _fixture_county_geometries(cfg: Config) -> gpd.GeoDataFrame:
+    """Synthetic GEOIDs with real TIGER shapes when a county zip is on disk."""
+    tiger = _try_load_tiger(cfg)
+    rows = []
+    for geoid, name, lat0, lat1, lng0, lng1 in _COUNTY_GRID:
+        cell = box(lng0, lat0, lng1, lat1)
+        cx, cy = (lng0 + lng1) / 2.0, (lat0 + lat1) / 2.0
+        geom = cell
+        display_name = name
+        if tiger is not None and not tiger.empty:
+            pt = Point(cx, cy)
+            hit = tiger[tiger.contains(pt)]
+            if hit.empty:
+                hit = tiger[tiger.intersects(cell)]
+            if not hit.empty:
+                row = hit.iloc[0]
+                geom = row.geometry
+                display_name = f"{name} ({row['county_name']})"
+        rows.append({
+            "county_geoid": geoid,
+            "county_name": display_name,
+            "state_fips": geoid[:2],
+            "geometry": geom,
+        })
+    return gpd.GeoDataFrame(rows, crs="EPSG:4326")
+
+
 def make_fixtures(cfg: Config) -> None:
     """Write synthetic counties + per-provider/vintage coverage GeoJSON."""
     # 1) Synthetic county grid -> interim cache so normalize.load_counties uses it.
-    counties = gpd.GeoDataFrame(
-        [
-            {
-                "county_geoid": geoid,
-                "county_name": name,
-                "state_fips": geoid[:2],
-                "geometry": box(lng0, lat0, lng1, lat1),
-            }
-            for geoid, name, lat0, lat1, lng0, lng1 in _COUNTY_GRID
-        ],
-        crs="EPSG:4326",
-    )
+    counties = _fixture_county_geometries(cfg)
     cache = cfg.path("interim") / "tl_us_county.gpkg"
     counties.to_file(cache, driver="GPKG")
     log.info("wrote synthetic counties: %s", cache)
