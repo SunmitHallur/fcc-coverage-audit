@@ -35,10 +35,12 @@ _TOWER_OUT = {
 
 def _hex_polygon(cell: str) -> Polygon | None:
     try:
-        ring = h3.cell_to_boundary(cell, geo_json=True)
+        ring = h3.cell_to_boundary(cell)
         if not ring:
             return None
-        return Polygon(ring)
+        # h3 v4 returns (lat, lng); GeoJSON/Shapely want (lng, lat).
+        coords = [(lng, lat) for lat, lng in ring]
+        return Polygon(coords)
     except Exception:
         return None
 
