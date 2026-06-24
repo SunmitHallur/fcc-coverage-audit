@@ -1,11 +1,15 @@
 {
-  "generated_at": "2026-06-24T06:55:48.674581+00:00",
+  "generated_at": "2026-06-24T06:55:58.948819+00:00",
   "current_vintage": "December 31, 2025",
   "prior_vintage": "June 30, 2025",
   "providers": [
     {
       "id": 130077,
       "name": "AT&T"
+    },
+    {
+      "id": 130235,
+      "name": "UScellular"
     },
     {
       "id": 130403,
@@ -21,7 +25,7 @@
     "5G-NR 35/3",
     "5G-NR 7/1"
   ],
-  "total_records": 1493,
-  "flagged_count": 154,
-  "states_processed": "55,56"
+  "total_records": 1500,
+  "flagged_count": 156,
+  "states_processed": "55,56,all"
 }
