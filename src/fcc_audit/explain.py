@@ -68,6 +68,9 @@ def explain_row(row: pd.Series | dict[str, Any]) -> dict[str, Any]:
     new_towers = int(r.get("new_towers") or 0)
     prior_towers = int(r.get("prior_towers") or 0)
     current_towers = int(r.get("current_towers") or 0)
+    prior_cross = int(r.get("prior_towers_cross_border") or 0)
+    current_cross = int(r.get("current_towers_cross_border") or 0)
+    new_cross = int(r.get("new_towers_cross_border") or 0)
 
     # --- headline (one sentence) ---
     if flagged and same_site >= 0.5:
@@ -91,10 +94,22 @@ def explain_row(row: pd.Series | dict[str, Any]) -> dict[str, Any]:
             f"compared to other counties nationwide."
         )
     elif added_km2 > 0 and new_site >= 0.5:
-        headline = (
-            f"{provider} expanded {service} in {county} primarily through "
-            f"{new_towers} new tower{'s' if new_towers != 1 else ''} — a typical build pattern."
-        )
+        if new_cross > 0 and new_towers > new_cross:
+            headline = (
+                f"{provider} expanded {service} in {county} primarily through "
+                f"new towers — including {new_cross} just outside the county border."
+            )
+        elif new_cross > 0:
+            headline = (
+                f"{provider} expanded {service} in {county} from "
+                f"{new_cross} newly inferred tower{'s' if new_cross != 1 else ''} "
+                f"in a neighboring county."
+            )
+        else:
+            headline = (
+                f"{provider} expanded {service} in {county} primarily through "
+                f"{new_towers} new tower{'s' if new_towers != 1 else ''} — a typical build pattern."
+            )
     elif added_km2 > 0:
         headline = (
             f"{provider} reported a modest {service} coverage change in {county} "
@@ -110,9 +125,22 @@ def explain_row(row: pd.Series | dict[str, Any]) -> dict[str, Any]:
     if pct_inc is not None and math.isfinite(float(pct_inc)) and float(pct_inc) > 0.05:
         bullets.append(f"Relative increase vs. prior map: {_pct(pct_inc)}.")
     if prior_towers or current_towers:
+        tower_line = (
+            f"Inferred towers covering this county: {prior_towers} prior → {current_towers} current"
+        )
+        if new_towers:
+            tower_line += f" ({new_towers} new"
+            if new_cross:
+                tower_line += f", {new_cross} outside county"
+            tower_line += ")"
+        tower_line += "."
+        bullets.append(tower_line)
+    if current_cross or prior_cross:
         bullets.append(
-            f"Inferred towers: {prior_towers} in the prior map → {current_towers} in the current map"
-            f"{f' ({new_towers} new)' if new_towers else ''}."
+            f"{current_cross or prior_cross} neighboring-county tower"
+            f"{'s' if max(current_cross, prior_cross) != 1 else ''} "
+            f"{'cover' if max(current_cross, prior_cross) != 1 else 'covers'} into {county} "
+            f"and {'are' if max(current_cross, prior_cross) != 1 else 'is'} included in these counts."
         )
     if same_site >= 0.3:
         bullets.append(
@@ -120,10 +148,16 @@ def explain_row(row: pd.Series | dict[str, Any]) -> dict[str, Any]:
             f"— the provider claims existing sites got stronger, not that new ones were built."
         )
     if new_site >= 0.3:
-        bullets.append(
-            f"{_pct(new_site)} of growth comes from {new_towers} newly inferred tower"
-            f"{'s' if new_towers != 1 else ''}."
-        )
+        if new_cross:
+            bullets.append(
+                f"{_pct(new_site)} of growth is attributed to {new_towers} newly inferred tower"
+                f"{'s' if new_towers != 1 else ''} ({new_cross} outside this county)."
+            )
+        else:
+            bullets.append(
+                f"{_pct(new_site)} of growth comes from {new_towers} newly inferred tower"
+                f"{'s' if new_towers != 1 else ''}."
+            )
     if unattributed >= 0.2:
         bullets.append(
             f"{_pct(unattributed)} of new coverage sits far from any inferred tower, "

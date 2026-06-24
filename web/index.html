@@ -87,16 +87,20 @@
     .tower-compare .label { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .05em; }
     .tower-compare .count { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
     .tower-compare .arrow { color: var(--muted); font-size: 18px; text-align: center; }
+    .tower-note {
+      font-size: 11px; color: #64748b; margin: -4px 0 10px; line-height: 1.45;
+      padding: 0 2px;
+    }
     .compare-maps { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 12px; }
     .compare-panel { background: var(--panel2); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
     .compare-panel .panel-head {
       padding: 8px 10px; font-size: 11px; color: var(--muted); border-bottom: 1px solid var(--border);
       text-transform: uppercase; letter-spacing: .04em;
     }
-    .compare-map { width: 100%; height: 240px; background: #0f1419; }
+    .compare-map { width: 100%; height: 300px; background: #e8e4dc; }
     .signal-legend {
-      display: flex; flex-wrap: wrap; gap: 10px; font-size: 10px; color: var(--muted);
-      padding: 6px 10px 8px; border-top: 1px solid var(--border);
+      display: flex; flex-wrap: wrap; gap: 8px; font-size: 10px; color: #475569;
+      padding: 6px 10px 8px; border-top: 1px solid var(--border); background: #f8fafc;
     }
     .signal-legend span { display: inline-flex; align-items: center; gap: 4px; }
     .signal-legend i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
@@ -176,20 +180,21 @@
         <h2 id="detail-title"></h2>
         <div class="meta" id="detail-meta"></div>
         <div class="headline" id="detail-headline"></div>
-        <div class="section-label">Inferred towers</div>
+        <div class="section-label">Inferred towers covering this county</div>
         <div class="tower-compare" id="tower-compare" style="display:none">
           <div>
             <div class="label" id="tower-prior-label">Prior map</div>
             <div class="count" id="tower-prior-count">—</div>
-            <div class="label">inferred towers</div>
+            <div class="label">towers covering county</div>
           </div>
           <div class="arrow">→</div>
           <div>
             <div class="label" id="tower-current-label">Current map</div>
             <div class="count" id="tower-current-count">—</div>
-            <div class="label" id="tower-delta-label">inferred towers</div>
+            <div class="label" id="tower-delta-label">towers covering county</div>
           </div>
         </div>
+        <div class="tower-note" id="tower-cross-border-note" style="display:none"></div>
         <div class="section-label">Coverage maps (side-by-side)</div>
         <div id="compare-wrap">
           <div class="detail-loading" id="detail-map-status"><span class="spinner"></span><span>Select a county to compare prior vs current coverage.</span></div>
@@ -199,9 +204,10 @@
               <div id="map-prior" class="compare-map"></div>
               <div class="empty-map-note" id="map-prior-empty" style="display:none">No prior coverage in this county</div>
               <div class="signal-legend">
-                <span><i style="background:#1a7f37"></i> Strong</span>
-                <span><i style="background:#3fb950"></i> Medium</span>
-                <span><i style="background:#7ee787"></i> Light</span>
+                <span><i style="background:#a3e635"></i> Strong (−85+)</span>
+                <span><i style="background:#22c55e"></i> Medium (−95)</span>
+                <span><i style="background:#f97316"></i> Light (−105)</span>
+                <span><i style="background:#dc2626"></i> Fringe</span>
               </div>
             </div>
             <div class="compare-panel">
@@ -209,9 +215,10 @@
               <div id="map-current" class="compare-map"></div>
               <div class="empty-map-note" id="map-current-empty" style="display:none">No current coverage in this county</div>
               <div class="signal-legend">
-                <span><i style="background:#1a7f37"></i> Strong</span>
-                <span><i style="background:#3fb950"></i> Medium</span>
-                <span><i style="background:#7ee787"></i> Light</span>
+                <span><i style="background:#a3e635"></i> Strong (−85+)</span>
+                <span><i style="background:#22c55e"></i> Medium (−95)</span>
+                <span><i style="background:#f97316"></i> Light (−105)</span>
+                <span><i style="background:#dc2626"></i> Fringe</span>
               </div>
             </div>
           </div>
@@ -257,11 +264,22 @@
       return String(service).replace(/\//g, '-').replace(/\s/g, '');
     }
 
+    /** FCC-style heat map colors (strong → fringe), similar to BDC map legend. */
     function signalColor(dbm) {
-      if (dbm >= -85) return '#1a7f37';
-      if (dbm >= -95) return '#3fb950';
-      if (dbm >= -105) return '#7ee787';
-      return '#aff5b4';
+      if (dbm >= -85) return '#a3e635';
+      if (dbm >= -95) return '#22c55e';
+      if (dbm >= -105) return '#f97316';
+      return '#dc2626';
+    }
+
+    function getCountyFeature(geoid) {
+      if (!countiesGeo?.features) return null;
+      return countiesGeo.features.find(f => String(f.properties.geoid) === String(geoid)) || null;
+    }
+
+    function countyBounds(countyFeature) {
+      if (!countyFeature) return null;
+      return boundsFromGeoJSON({ type: 'FeatureCollection', features: [countyFeature] });
     }
 
     function h3RingLngLat(cell) {
@@ -271,9 +289,15 @@
       return [...ring, ring[0]];
     }
 
+    function resolveCountyFeature(geoid, detail) {
+      return getCountyFeature(geoid)
+        || (detail?.county_boundary?.type === 'Feature' ? detail.county_boundary : null);
+    }
+
     function hexesToGeoJSON(hexes, sites) {
+      const sorted = [...(hexes || [])].sort((a, b) => (a[1] || 0) - (b[1] || 0));
       const features = [];
-      (hexes || []).forEach(([cell, dbm]) => {
+      sorted.forEach(([cell, dbm]) => {
         const ring = h3RingLngLat(cell);
         if (!ring) return;
         features.push({
@@ -285,7 +309,11 @@
       (sites || []).forEach(s => {
         features.push({
           type: 'Feature',
-          properties: { kind: 'tower', site_class: s.site_class || 'site' },
+          properties: {
+            kind: 'tower',
+            site_class: s.site_class || 'site',
+            in_county: s.in_county !== false,
+          },
           geometry: { type: 'Point', coordinates: [s.lng, s.lat] }
         });
       });
@@ -305,16 +333,30 @@
       return [[minLng, minLat], [maxLng, maxLat]];
     }
 
+    function unionBounds(...boundsList) {
+      let minLng = Infinity, minLat = Infinity, maxLng = -Infinity, maxLat = -Infinity;
+      boundsList.filter(Boolean).forEach(b => {
+        minLng = Math.min(minLng, b[0][0]); minLat = Math.min(minLat, b[0][1]);
+        maxLng = Math.max(maxLng, b[1][0]); maxLat = Math.max(maxLat, b[1][1]);
+      });
+      if (!Number.isFinite(minLng)) return null;
+      return [[minLng, minLat], [maxLng, maxLat]];
+    }
+
     function destroyCompareMaps() {
       ['prior', 'current'].forEach(k => {
         if (compareMaps[k]) { compareMaps[k].remove(); compareMaps[k] = null; }
       });
     }
 
-    function renderCompareMap(containerId, geo, emptyNoteId) {
+    function renderCompareMap(containerId, geo, countyFeature, emptyNoteId, sharedBounds) {
       const emptyEl = emptyNoteId ? document.getElementById(emptyNoteId) : null;
       const hasCoverage = (geo.features || []).some(f => f.properties?.kind !== 'tower');
       if (emptyEl) emptyEl.style.display = hasCoverage ? 'none' : 'flex';
+
+      const countyGeo = countyFeature
+        ? { type: 'FeatureCollection', features: [countyFeature] }
+        : { type: 'FeatureCollection', features: [] };
 
       const mapObj = new maplibregl.Map({
         container: containerId,
@@ -327,14 +369,24 @@
               tileSize: 256
             }
           },
-          layers: [{ id: 'osm', type: 'raster', source: 'osm' }]
+          layers: [{ id: 'osm', type: 'raster', source: 'osm', paint: { 'raster-opacity': 0.45 } }]
         },
         center: [-98.5, 39.0],
         zoom: 8,
         attributionControl: false,
-        interactive: true
+        interactive: true,
+        preserveDrawingBuffer: true
       });
       mapObj.on('load', () => {
+        if (countyFeature) {
+          mapObj.addSource('county', { type: 'geojson', data: countyGeo });
+          mapObj.addLayer({
+            id: 'county-fill',
+            type: 'fill',
+            source: 'county',
+            paint: { 'fill-color': '#f5f0e6', 'fill-opacity': 0.92 }
+          });
+        }
         mapObj.addSource('coverage', { type: 'geojson', data: geo });
         mapObj.addLayer({
           id: 'coverage-fill',
@@ -343,36 +395,59 @@
           filter: ['!=', ['get', 'kind'], 'tower'],
           paint: {
             'fill-color': ['get', 'color'],
-            'fill-opacity': 0.78
+            'fill-opacity': 0.88
           }
-        });
-        mapObj.addLayer({
-          id: 'coverage-outline',
-          type: 'line',
-          source: 'coverage',
-          filter: ['!=', ['get', 'kind'], 'tower'],
-          paint: { 'line-color': '#14532d', 'line-width': 0.3, 'line-opacity': 0.35 }
         });
         mapObj.addLayer({
           id: 'tower-points',
           type: 'circle',
           source: 'coverage',
-          filter: ['==', ['get', 'kind'], 'tower'],
+          filter: ['all', ['==', ['get', 'kind'], 'tower'], ['==', ['get', 'in_county'], true]],
           paint: {
-            'circle-radius': 5,
+            'circle-radius': 6,
             'circle-color': [
               'match', ['get', 'site_class'],
-              'new_site', '#22c55e',
-              'expanded_site', '#f59e0b',
-              'prior_site', '#64748b',
-              '#ef4444'
+              'new_site', '#15803d',
+              'expanded_site', '#c2410c',
+              'prior_site', '#475569',
+              '#b91c1c'
             ],
-            'circle-stroke-width': 1.5,
-            'circle-stroke-color': '#0f172a'
+            'circle-stroke-width': 2,
+            'circle-stroke-color': '#111827'
           }
         });
-        const b = boundsFromGeoJSON(geo);
-        if (b) mapObj.fitBounds(b, { padding: 28, maxZoom: 11, duration: 0 });
+        mapObj.addLayer({
+          id: 'tower-points-cross',
+          type: 'circle',
+          source: 'coverage',
+          filter: ['all', ['==', ['get', 'kind'], 'tower'], ['==', ['get', 'in_county'], false]],
+          paint: {
+            'circle-radius': 7,
+            'circle-color': [
+              'match', ['get', 'site_class'],
+              'new_site', '#2563eb',
+              'expanded_site', '#7c3aed',
+              'prior_site', '#64748b',
+              '#334155'
+            ],
+            'circle-stroke-width': 2.5,
+            'circle-stroke-color': '#f8fafc'
+          }
+        });
+        if (countyFeature) {
+          mapObj.addLayer({
+            id: 'county-outline',
+            type: 'line',
+            source: 'county',
+            paint: {
+              'line-color': '#111827',
+              'line-width': 3.5,
+              'line-opacity': 1
+            }
+          });
+        }
+        const b = sharedBounds || boundsFromGeoJSON(geo) || countyBounds(countyFeature);
+        if (b) mapObj.fitBounds(b, { padding: 36, maxZoom: 12, duration: 0 });
         requestAnimationFrame(() => mapObj.resize());
       });
       return mapObj;
@@ -600,7 +675,7 @@
       if (!bounds.isEmpty()) map.fitBounds(bounds, { padding: 80, maxZoom: 9 });
     }
 
-    function setTowerCompare(prior, current, newCount) {
+    function setTowerCompare(prior, current, newCount, crossBorder) {
       const tc = document.getElementById('tower-compare');
       tc.style.display = 'grid';
       document.getElementById('tower-prior-label').textContent =
@@ -611,7 +686,20 @@
       document.getElementById('tower-current-count').textContent = current ?? '—';
       const delta = newCount != null ? newCount : (current ?? 0) - (prior ?? 0);
       document.getElementById('tower-delta-label').textContent =
-        delta > 0 ? `inferred towers (+${delta} new)` : 'inferred towers';
+        delta > 0 ? `covering county (+${delta} new)` : 'covering county';
+      const note = document.getElementById('tower-cross-border-note');
+      const cb = crossBorder || {};
+      const curX = cb.current || 0;
+      const newX = cb.new || 0;
+      if (curX > 0 || newX > 0) {
+        note.style.display = 'block';
+        note.textContent = curX > 0
+          ? `${curX} neighboring-county tower${curX !== 1 ? 's' : ''} shown in blue — their coverage extends into this county and is counted above.`
+          : `${newX} new tower${newX !== 1 ? 's' : ''} outside this county explain part of the growth here.`;
+      } else {
+        note.style.display = 'none';
+        note.textContent = '';
+      }
     }
 
     function showDetail(rec) {
@@ -634,9 +722,13 @@
       const priorT = rec.metrics?.prior_towers;
       const currentT = rec.metrics?.current_towers;
       if (priorT != null || currentT != null) {
-        setTowerCompare(priorT, currentT, rec.metrics?.new_towers);
+        setTowerCompare(priorT, currentT, rec.metrics?.new_towers, {
+          current: rec.metrics?.current_towers_cross_border,
+          new: rec.metrics?.new_towers_cross_border,
+        });
       } else {
         document.getElementById('tower-compare').style.display = 'none';
+        document.getElementById('tower-cross-border-note').style.display = 'none';
       }
 
       const statusEl = document.getElementById('detail-map-status');
@@ -661,18 +753,27 @@
           return;
         }
         if (detail.towers_prior != null) {
-          setTowerCompare(detail.towers_prior, detail.towers_current, detail.new_towers);
+          setTowerCompare(
+            detail.towers_prior, detail.towers_current, detail.new_towers,
+            { current: detail.current_towers_cross_border, new: detail.new_towers_cross_border },
+          );
         }
         document.getElementById('map-prior-label').textContent =
-          formatVintage(detail.prior_vintage) || detail.prior_vintage || 'Prior coverage';
+          `${formatVintage(detail.prior_vintage) || detail.prior_vintage || 'Prior'} — ${rec.service} coverage`;
         document.getElementById('map-current-label').textContent =
-          formatVintage(detail.current_vintage) || detail.current_vintage || 'Current coverage';
+          `${formatVintage(detail.current_vintage) || detail.current_vintage || 'Current'} — ${rec.service} coverage`;
         statusEl.style.display = 'none';
         document.getElementById('compare-maps').style.display = 'grid';
+        const countyFeature = resolveCountyFeature(rec.geoid, detail);
         const priorGeo = hexesToGeoJSON(detail.prior_hexes, detail.sites_prior);
         const currentGeo = hexesToGeoJSON(detail.current_hexes, detail.sites_current);
-        compareMaps.prior = renderCompareMap('map-prior', priorGeo, 'map-prior-empty');
-        compareMaps.current = renderCompareMap('map-current', currentGeo, 'map-current-empty');
+        const sharedBounds = unionBounds(
+          countyBounds(countyFeature),
+          boundsFromGeoJSON(priorGeo),
+          boundsFromGeoJSON(currentGeo),
+        );
+        compareMaps.prior = renderCompareMap('map-prior', priorGeo, countyFeature, 'map-prior-empty', sharedBounds);
+        compareMaps.current = renderCompareMap('map-current', currentGeo, countyFeature, 'map-current-empty', sharedBounds);
         setTimeout(() => {
           compareMaps.prior?.resize();
           compareMaps.current?.resize();

@@ -76,10 +76,14 @@ def build_features(
         df["boundary_snap_share"] = 0.0
     df["boundary_snap_share"] = df["boundary_snap_share"].fillna(0.0)
 
-    df["signal_jump_implausibility"] = df["mean_signal_delta"].clip(lower=0.0).fillna(0.0)
+    df["signal_jump_implausibility"] = df.get("mean_signal_delta", pd.Series(0.0, index=df.index)).clip(lower=0.0).fillna(0.0)
     if "new_towers" not in df:
         df["new_towers"] = 0
     df["new_towers"] = df["new_towers"].fillna(0).astype(int)
+    for col in ["new_towers_in_county", "new_towers_cross_border"]:
+        if col not in df:
+            df[col] = 0
+        df[col] = df[col].fillna(0).astype(int)
     return df
 
 
@@ -125,7 +129,13 @@ def score(features: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     # near-empty counties and non-area-increasing signal shifts.
     eligible = df["added_km2"].fillna(0.0) >= min_added
     suspicious = (df["priority_score"] >= threshold) | (df["same_site_growth_share"] >= susp)
-    df["flag_for_review"] = eligible & suspicious
+    # Growth explained by new towers outside this county is usually legitimate.
+    cross_border_build = (
+        (df["new_site_share"].fillna(0.0) >= 0.35)
+        & (df["new_towers"].fillna(0).astype(int) >= 1)
+        & (df.get("new_towers_cross_border", 0).fillna(0).astype(int) >= 1)
+    )
+    df["flag_for_review"] = eligible & suspicious & ~cross_border_build
     df["flag_reason"] = df.apply(_reason, axis=1, susp=susp)
     return df.sort_values("priority_score", ascending=False).reset_index(drop=True)
 

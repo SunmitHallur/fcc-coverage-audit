@@ -71,14 +71,38 @@ def _analyze_unit(
         "technology": service_label,
     }
     if not feats.empty:
-        prior_counts = attribute.tower_counts_by_county(prior_sites)
-        current_counts = attribute.tower_counts_by_county(current_sites)
-        feats["prior_towers"] = (
-            feats["county_geoid"].map(prior_counts).fillna(0).astype(int)
-        )
-        feats["current_towers"] = (
-            feats["county_geoid"].map(current_counts).fillna(0).astype(int)
-        )
+        feats["county_geoid"] = feats["county_geoid"].astype(str)
+        prior_srv = attribute.serving_towers_by_county(pri8, prior_sites)
+        current_srv = attribute.serving_towers_by_county(cur8, current_sites)
+        if not prior_srv.empty:
+            prior_srv["county_geoid"] = prior_srv["county_geoid"].astype(str)
+            feats = feats.merge(
+                prior_srv.rename(columns={
+                    "towers_serving": "prior_towers",
+                    "towers_in_county": "prior_towers_in_county",
+                    "towers_cross_border": "prior_towers_cross_border",
+                }),
+                on="county_geoid",
+                how="left",
+            )
+        if not current_srv.empty:
+            current_srv["county_geoid"] = current_srv["county_geoid"].astype(str)
+            feats = feats.merge(
+                current_srv.rename(columns={
+                    "towers_serving": "current_towers",
+                    "towers_in_county": "current_towers_in_county",
+                    "towers_cross_border": "current_towers_cross_border",
+                }),
+                on="county_geoid",
+                how="left",
+            )
+        for col in [
+            "prior_towers", "current_towers",
+            "prior_towers_in_county", "current_towers_in_county",
+            "prior_towers_cross_border", "current_towers_cross_border",
+        ]:
+            if col in feats:
+                feats[col] = feats[col].fillna(0).astype(int)
         for k, v in tag.items():
             feats[k] = v
 

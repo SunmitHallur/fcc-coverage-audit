@@ -15,8 +15,10 @@ from typing import Any
 
 import geopandas as gpd
 import pandas as pd
+from shapely.geometry import mapping
 
 from .explain import add_explanations, explain_row
+from . import attribute
 
 log = logging.getLogger(__name__)
 
@@ -26,14 +28,18 @@ _CSV_COLUMNS = [
     "state_fips", "priority_score", "flag_for_review", "flag_reason", "plain_explanation",
     "added_km2", "added_frac_of_county", "pct_increase", "blanket_fillin",
     "same_site_growth_share", "new_site_share", "unattributed_share",
-    "boundary_snap_share", "new_towers", "prior_towers", "current_towers", "new_hexes", "upgraded_hexes",
+    "boundary_snap_share", "new_towers",     "prior_towers", "current_towers", "prior_towers_cross_border", "current_towers_cross_border",
+    "new_towers_in_county", "new_towers_cross_border", "new_hexes", "upgraded_hexes",
 ]
 
 _METRIC_KEYS = [
     "priority_score", "flag_for_review", "added_km2", "added_frac_of_county",
     "pct_increase", "same_site_growth_share", "new_site_share",
     "unattributed_share", "boundary_snap_share", "blanket_fillin", "new_towers",
-    "prior_towers", "current_towers", "prior_cov_frac", "current_cov_frac", "flag_reason",
+    "new_towers_in_county", "new_towers_cross_border",
+    "prior_towers", "current_towers", "prior_towers_in_county", "current_towers_in_county",
+    "prior_towers_cross_border", "current_towers_cross_border",
+    "prior_cov_frac", "current_cov_frac", "flag_reason",
 ]
 
 
@@ -213,12 +219,46 @@ def build_web_meta(scored: pd.DataFrame, meta: dict[str, Any]) -> dict[str, Any]
     }
 
 
+def _county_boundary_feature(
+    counties: gpd.GeoDataFrame,
+    geoid: str,
+    *,
+    simplify_tolerance: float | None = 0.001,
+) -> dict[str, Any] | None:
+    """GeoJSON Feature for one county (used in compare maps)."""
+    if counties.empty:
+        return None
+    mask = counties["county_geoid"].astype(str) == str(geoid)
+    if not mask.any():
+        return None
+    gdf = counties.loc[mask].copy()
+    if gdf.crs is None or gdf.crs.to_epsg() != 4326:
+        gdf = gdf.to_crs("EPSG:4326")
+    if simplify_tolerance is not None:
+        gdf["geometry"] = gdf.geometry.simplify(simplify_tolerance, preserve_topology=True)
+    row = gdf.iloc[0]
+    return {
+        "type": "Feature",
+        "properties": {
+            "geoid": str(geoid),
+            "name": str(row.get("county_name", "")),
+            "state": str(row.get("state_fips", "")),
+        },
+        "geometry": mapping(row.geometry),
+    }
+
+
 def build_counties_geojson(
     counties: gpd.GeoDataFrame,
     simplify_tolerance: float = 0.005,
+    geoids: set[str] | None = None,
 ) -> dict[str, Any]:
     """Simplify county boundaries for web delivery (~1-3 MB GeoJSON)."""
     gdf = counties.copy()
+    if geoids is not None:
+        gdf = gdf[gdf["county_geoid"].astype(str).isin(geoids)]
+    if gdf.empty:
+        return {"type": "FeatureCollection", "features": []}
     if gdf.crs is None or gdf.crs.to_epsg() != 4326:
         gdf = gdf.to_crs("EPSG:4326")
     gdf["geometry"] = gdf.geometry.simplify(simplify_tolerance, preserve_topology=True)
@@ -257,6 +297,47 @@ def _sites_for_county(sites: pd.DataFrame, geoid: str, vintage: str) -> list[dic
             "lng": float(s["lng"]),
             "site_class": str(s.get("site_class", "site")),
             "n_hexes": int(s.get("n_hexes", 0)),
+            "in_county": True,
+            "home_county": str(s.get("county_geoid", geoid)),
+        })
+    return out
+
+
+def _sites_serving_county(
+    sites: pd.DataFrame,
+    coverage: pd.DataFrame,
+    geoid: str,
+    vintage: str,
+) -> list[dict[str, Any]]:
+    """All inferred sites whose lobes cover hexes in this county (incl. neighbors)."""
+    if sites.empty:
+        return []
+    sub_sites = sites[sites.get("vintage", "current") == vintage].reset_index(drop=True)
+    if sub_sites.empty:
+        return []
+
+    cov = coverage
+    if not cov.empty and "vintage" in cov.columns:
+        cov = cov[cov["vintage"] == vintage]
+    if cov.empty:
+        return _sites_for_county(sites, geoid, vintage)
+
+    idxs = attribute.site_indices_serving_county(cov, sub_sites, geoid)
+    if len(idxs) == 0:
+        return _sites_for_county(sites, geoid, vintage)
+
+    out = []
+    geoid_s = str(geoid)
+    for i in idxs:
+        s = sub_sites.iloc[int(i)]
+        home = str(s.get("county_geoid", ""))
+        out.append({
+            "lat": float(s["lat"]),
+            "lng": float(s["lng"]),
+            "site_class": str(s.get("site_class", "site")),
+            "n_hexes": int(s.get("n_hexes", 0)),
+            "in_county": home == geoid_s,
+            "home_county": home,
         })
     return out
 
@@ -266,17 +347,23 @@ def build_county_detail(
     coverage: pd.DataFrame,
     sites: pd.DataFrame,
     meta: dict[str, Any],
+    counties: gpd.GeoDataFrame | None = None,
 ) -> dict[str, Any]:
     """One county's before/after coverage hexes and inferred tower sites."""
-    return {
+    detail: dict[str, Any] = {
         "geoid": str(geoid),
         "prior_vintage": meta.get("prior"),
         "current_vintage": meta.get("current"),
         "prior_hexes": _hexes_for_county(coverage, geoid, "prior"),
         "current_hexes": _hexes_for_county(coverage, geoid, "current"),
-        "sites_prior": _sites_for_county(sites, geoid, "prior"),
-        "sites_current": _sites_for_county(sites, geoid, "current"),
+        "sites_prior": _sites_serving_county(sites, coverage, geoid, "prior"),
+        "sites_current": _sites_serving_county(sites, coverage, geoid, "current"),
     }
+    if counties is not None:
+        boundary = _county_boundary_feature(counties, geoid)
+        if boundary:
+            detail["county_boundary"] = boundary
+    return detail
 
 
 def write_county_details(
@@ -285,6 +372,7 @@ def write_county_details(
     sites: pd.DataFrame,
     data_dir: Path,
     meta: dict[str, Any],
+    counties: gpd.GeoDataFrame | None = None,
 ) -> int:
     """Write per-county JSON for before/after map comparison on click."""
     details_dir = data_dir / "details"
@@ -313,16 +401,20 @@ def write_county_details(
         if not sites.empty and "technology" in sites.columns:
             st = st[st["technology"] == svc]
 
-        detail = build_county_detail(geoid, cov, st, meta)
+        detail = build_county_detail(geoid, cov, st, meta, counties=counties)
         sr = scored[
             (scored["provider_id"] == pid)
             & (scored["technology"] == svc)
             & (scored["county_geoid"].astype(str) == geoid)
         ]
         if not sr.empty:
-            detail["towers_prior"] = int(sr.iloc[0].get("prior_towers", len(detail["sites_prior"])))
-            detail["towers_current"] = int(sr.iloc[0].get("current_towers", len(detail["sites_current"])))
-            detail["new_towers"] = int(sr.iloc[0].get("new_towers", 0))
+            row = sr.iloc[0]
+            detail["towers_prior"] = int(row.get("prior_towers", len(detail["sites_prior"])))
+            detail["towers_current"] = int(row.get("current_towers", len(detail["sites_current"])))
+            detail["new_towers"] = int(row.get("new_towers", 0))
+            detail["prior_towers_cross_border"] = int(row.get("prior_towers_cross_border", 0))
+            detail["current_towers_cross_border"] = int(row.get("current_towers_cross_border", 0))
+            detail["new_towers_cross_border"] = int(row.get("new_towers_cross_border", 0))
         else:
             detail["towers_prior"] = len(detail["sites_prior"])
             detail["towers_current"] = len(detail["sites_current"])
@@ -374,7 +466,14 @@ def write_web_bundle(
     records_path = data_dir / "records.json"
     meta_path = data_dir / "meta.json"
 
-    geo = build_counties_geojson(counties, simplify_tolerance)
+    geoids = set(scored["county_geoid"].astype(str).unique()) if not scored.empty else None
+    geo = build_counties_geojson(counties, simplify_tolerance, geoids=geoids)
+    if not geo.get("features") and geoids:
+        cache = web_dir.parent / "data" / "interim" / "tl_us_county.gpkg"
+        if cache.exists():
+            syn = gpd.read_file(cache)
+            geo = build_counties_geojson(syn, simplify_tolerance, geoids=geoids)
+            log.info("used synthetic county cache for web bundle (%d features)", len(geo.get("features", [])))
     counties_path.write_text(json.dumps(geo), encoding="utf-8")
 
     records = build_web_records(scored)
@@ -392,7 +491,9 @@ def write_web_bundle(
 
     detail_count = 0
     if coverage is not None and not coverage.empty:
-        detail_count = write_county_details(scored, coverage, sites, data_dir, meta)
+        detail_count = write_county_details(
+            scored, coverage, sites, data_dir, meta, counties=counties,
+        )
 
     log.info(
         "wrote web bundle: %d records, %d providers, %d tower files, %d county details",
