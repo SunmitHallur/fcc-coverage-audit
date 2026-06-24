@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-06-24T05:34:41.678777+00:00",
+  "generated_at": "2026-06-24T06:20:43.363238+00:00",
   "current_vintage": "December 31, 2025",
   "prior_vintage": "June 30, 2025",
   "providers": [
@@ -21,7 +21,7 @@
     "5G-NR 35/3",
     "5G-NR 7/1"
   ],
-  "total_records": 1493,
-  "flagged_count": 154,
-  "states_processed": "38,39,40,41,42"
+  "total_records": 1336,
+  "flagged_count": 131,
+  "states_processed": "44,45,46,47,48"
 }
