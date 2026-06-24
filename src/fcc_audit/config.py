@@ -91,6 +91,13 @@ class Config:
             return "all"
         return [str(x).zfill(2) for x in s]
 
+    def states_scope_key(self) -> str:
+        """Filesystem-safe token for the current state scope (used in cache paths)."""
+        s = self.states
+        if s == "all":
+            return "all"
+        return "-".join(sorted(s))
+
     def set_states(self, states: str | list[str] | None) -> None:
         """Override analysis.states at runtime (e.g. from --states CLI flag)."""
         if states is None:

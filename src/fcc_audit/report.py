@@ -329,6 +329,8 @@ def load_accumulated_scored(scored_dir: Path) -> pd.DataFrame:
         return pd.DataFrame()
     dfs = [pd.read_parquet(p) for p in parts]
     combined = pd.concat(dfs, ignore_index=True)
+    # Drop synthetic fixture counties if present from earlier test runs.
+    combined = combined[~combined["county_geoid"].astype(str).str.startswith("900")]
     # De-duplicate on provider + service + county, keeping the latest batch.
     if "batch_ts" in combined.columns:
         combined = combined.sort_values("batch_ts").drop_duplicates(

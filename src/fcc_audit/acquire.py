@@ -312,7 +312,8 @@ class FccDownloadSource(DataSource):
         out_dir = self.raw_dir / vintage / str(provider_id)
         out_dir.mkdir(parents=True, exist_ok=True)
         safe = safe_service_name(technology)
-        merged = out_dir / f"{safe}_merged.gpkg"
+        scope = self.cfg.states_scope_key()
+        merged = out_dir / f"{safe}_{scope}_merged.gpkg"
         if merged.exists() and merged.stat().st_size > 0:
             return CoverageFile(provider_id, technology, vintage, merged)
 
