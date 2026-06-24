@@ -4,20 +4,8 @@
   "prior_vintage": "2025-06-30",
   "providers": [
     {
-      "id": 130077,
-      "name": "AT&T"
-    },
-    {
-      "id": 130235,
-      "name": "UScellular"
-    },
-    {
       "id": 130403,
       "name": "T-Mobile"
-    },
-    {
-      "id": 131425,
-      "name": "Verizon"
     }
   ],
   "services": [
