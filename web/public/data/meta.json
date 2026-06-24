@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-06-24T04:52:44.355940+00:00",
+  "generated_at": "2026-06-24T05:34:41.678777+00:00",
   "current_vintage": "December 31, 2025",
   "prior_vintage": "June 30, 2025",
   "providers": [
@@ -23,5 +23,5 @@
   ],
   "total_records": 1493,
   "flagged_count": 154,
-  "states_processed": "33,34,35,36,37"
+  "states_processed": "38,39,40,41,42"
 }
