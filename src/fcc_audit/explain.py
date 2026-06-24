@@ -86,7 +86,7 @@ def explain_row(row: pd.Series | dict[str, Any]) -> dict[str, Any]:
     elif flagged and added_frac >= 0.10:
         headline = (
             f"{provider} added {service} coverage across {_pct(added_frac)} of {county} "
-            f"since the last filing — a unusually large jump worth verifying."
+            f"since the last filing — an unusually large jump worth verifying."
         )
     elif flagged:
         headline = (
