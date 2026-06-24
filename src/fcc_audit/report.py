@@ -397,7 +397,8 @@ def write_county_details(
         svc = str(row["technology"])
         geoid = str(row["county_geoid"])
         svc_dir = details_dir / str(pid) / _safe_service_key(svc)
-        svc_dir.mkdir(parents=True, exist_ok=True)
+        geoid_dir = svc_dir / geoid
+        geoid_dir.mkdir(parents=True, exist_ok=True)
 
         cov = coverage
         if not coverage.empty and "provider_id" in coverage.columns:
@@ -430,7 +431,7 @@ def write_county_details(
             detail["towers_current"] = len(detail["sites_current"])
             detail["new_towers"] = max(0, detail["towers_current"] - detail["towers_prior"])
 
-        map_refs = map_render.render_county_compare_maps(detail, svc_dir)
+        map_refs = map_render.render_county_compare_maps(detail, geoid_dir)
         detail.update(map_refs)
 
         out = svc_dir / f"{geoid}.json"

@@ -77,4 +77,4 @@ def test_write_county_details_creates_files(tmp_path):
     assert blob["towers_prior"] == 1
     assert blob["towers_current"] == 2
     assert blob.get("prior_map") == "prior.png"
-    assert (out.parent / "prior.png").exists()
+    assert (out.parent / "90003" / "prior.png").exists()
