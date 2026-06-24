@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import geopandas as gpd
+import h3
 import pandas as pd
 from shapely.geometry import mapping
 
@@ -294,6 +295,29 @@ def _hexes_for_county(df: pd.DataFrame, geoid: str, vintage: str) -> list[list]:
     ]
 
 
+def _context_hexes_for_bbox(
+    df: pd.DataFrame,
+    bbox: tuple[float, float, float, float],
+    vintage: str,
+) -> list[list]:
+    """All coverage hexes whose centroids fall inside *bbox* (WGS84 minx,miny,maxx,maxy)."""
+    if df.empty or "vintage" not in df.columns:
+        return []
+    sub = df[df["vintage"] == vintage][["h3", "signal_dbm"]].drop_duplicates(subset=["h3"])
+    if sub.empty:
+        return []
+    minx, miny, maxx, maxy = bbox
+    out: list[list] = []
+    for row in sub.itertuples(index=False):
+        try:
+            lat, lng = h3.cell_to_latlng(str(row.h3))
+        except Exception:
+            continue
+        if minx <= lng <= maxx and miny <= lat <= maxy:
+            out.append([str(row.h3), round(float(row.signal_dbm), 1)])
+    return out
+
+
 def _sites_for_county(sites: pd.DataFrame, geoid: str, vintage: str) -> list[dict[str, Any]]:
     if sites.empty:
         return []
@@ -431,7 +455,18 @@ def write_county_details(
             detail["towers_current"] = len(detail["sites_current"])
             detail["new_towers"] = max(0, detail["towers_current"] - detail["towers_prior"])
 
-        map_refs = map_render.render_county_compare_maps(detail, geoid_dir)
+        all_sites = (detail.get("sites_prior") or []) + (detail.get("sites_current") or [])
+        render_extent = map_render.compute_render_extent(
+            detail.get("county_boundary"), all_sites,
+        )
+        context: dict[str, list] = {}
+        if render_extent is not None:
+            context = {
+                "prior_hexes": _context_hexes_for_bbox(cov, render_extent, "prior"),
+                "current_hexes": _context_hexes_for_bbox(cov, render_extent, "current"),
+            }
+
+        map_refs = map_render.render_county_compare_maps(detail, geoid_dir, context=context)
         detail.update(map_refs)
 
         out = svc_dir / f"{geoid}.json"

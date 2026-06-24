@@ -103,12 +103,70 @@
       align-items: center; justify-content: center; overflow: hidden;
     }
     .compare-raster img { width: 100%; height: 100%; object-fit: contain; display: block; }
-    .signal-legend {
-      display: flex; flex-wrap: wrap; gap: 8px; font-size: 10px; color: #475569;
-      padding: 6px 10px 8px; border-top: 1px solid var(--border); background: #f8fafc;
+    .compare-toolbar {
+      display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 10px;
     }
-    .signal-legend span { display: inline-flex; align-items: center; gap: 4px; }
-    .signal-legend i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+    .compare-toolbar button {
+      background: var(--panel2); color: var(--ink); border: 1px solid var(--border);
+      border-radius: 8px; padding: 6px 12px; font-size: 11px; cursor: pointer;
+    }
+    .compare-toolbar button:hover, .compare-toolbar button.active {
+      border-color: var(--accent); color: #93c5fd;
+    }
+    .signal-gradient-legend {
+      display: grid; grid-template-columns: auto 1fr auto; gap: 10px; align-items: center;
+      font-size: 10px; color: var(--muted); padding: 10px 12px; margin-bottom: 12px;
+      background: var(--panel2); border: 1px solid var(--border); border-radius: 10px;
+    }
+    .grad-bar {
+      height: 10px; border-radius: 4px;
+      background: linear-gradient(to right, #8b0000, #dc2626, #f97316, #eab308, #84cc16, #22c55e, #14b8a6);
+      border: 1px solid rgba(255,255,255,.08);
+    }
+    .colorblind-note {
+      grid-column: 1 / -1; margin: 0; font-size: 10px; color: #64748b; line-height: 1.4;
+    }
+    .swipe-compare {
+      position: relative; height: 420px; border-radius: 10px; overflow: hidden;
+      border: 1px solid var(--border); background: #e8e4dc; margin-bottom: 12px;
+    }
+    .swipe-compare img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+    .swipe-overlay {
+      position: absolute; inset: 0; overflow: hidden; clip-path: inset(0 50% 0 0);
+    }
+    .swipe-handle {
+      position: absolute; top: 0; bottom: 0; left: 50%; width: 3px; background: #fff;
+      box-shadow: 0 0 0 1px rgba(0,0,0,.35); pointer-events: none; z-index: 2;
+    }
+    .swipe-slider {
+      position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; cursor: ew-resize; z-index: 3;
+    }
+    .swipe-labels {
+      position: absolute; top: 8px; left: 8px; right: 8px; display: flex; justify-content: space-between;
+      font-size: 10px; color: #111827; font-weight: 600; pointer-events: none; z-index: 1;
+      text-shadow: 0 0 4px rgba(255,255,255,.9);
+    }
+    #detail-header-sticky {
+      position: sticky; top: -16px; z-index: 5; background: rgba(18,24,32,.98);
+      margin: -16px -16px 12px; padding: 16px 16px 12px; border-bottom: 1px solid var(--border);
+    }
+    .detail-header-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding-right: 28px; }
+    #detail-header-sticky h2 { margin: 0; font-size: 17px; font-weight: 700; }
+    #detail-header-sticky .meta { color: var(--muted); font-size: 12px; margin: 6px 0 0; }
+    .stat-strip {
+      display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-top: 12px;
+    }
+    .stat-chip {
+      background: var(--panel2); border: 1px solid var(--border); border-radius: 8px;
+      padding: 8px 10px; min-width: 0;
+    }
+    .stat-chip .lbl {
+      display: block; font-size: 9px; text-transform: uppercase; letter-spacing: .06em;
+      color: var(--muted); margin-bottom: 2px;
+    }
+    .stat-chip .val { font-size: 14px; font-weight: 600; font-variant-numeric: tabular-nums; }
+    .info-msg { padding: 18px; color: var(--muted); font-size: 13px; line-height: 1.5; }
+    .list-toggle { cursor: pointer; color: var(--accent); font-size: 10px; margin-left: 8px; }
     .detail-loading { color: var(--muted); font-size: 12px; padding: 12px 0; display: flex; align-items: center; gap: 8px; }
     .spinner {
       width: 14px; height: 14px; border: 2px solid var(--border); border-top-color: var(--accent);
@@ -144,6 +202,8 @@
       #app { grid-template-columns: 1fr; grid-template-rows: 42vh 58vh; }
       #detail { width: calc(100% - 24px); left: 12px; right: 12px; top: auto; bottom: 12px; max-height: 70vh; }
       .compare-maps { grid-template-columns: 1fr; }
+      .stat-strip { grid-template-columns: repeat(2, 1fr); }
+      .swipe-compare { display: none !important; }
       .toolbar, .legend { font-size: 10px; padding: 6px 10px; }
     }
   </style>
@@ -166,7 +226,7 @@
           <select id="service"></select>
         </div>
         <div>
-          <label for="search">Search flagged counties</label>
+          <label for="search">Search counties</label>
           <input id="search" type="search" placeholder="County name…" />
         </div>
       </div>
@@ -175,15 +235,32 @@
         <div class="stat"><b id="n-flagged" style="color:var(--flag)">0</b><span>flagged</span></div>
         <div class="stat"><b id="n-providers">0</b><span>providers</span></div>
       </div>
-      <div class="list-head"><span>Flagged for review</span><span id="metric-toggle" style="cursor:pointer;color:var(--accent)">Metric: priority</span></div>
+      <div class="list-head">
+        <span id="list-head-label">Flagged for review</span>
+        <span>
+          <span class="list-toggle" id="list-mode-toggle" title="Toggle all counties">Show all</span>
+          <span id="metric-toggle" style="cursor:pointer;color:var(--accent);margin-left:8px">Metric: priority</span>
+        </span>
+      </div>
       <div id="list"></div>
     </div>
     <div id="map-wrap">
       <div id="map"></div>
       <div id="detail">
-        <button class="close" id="detail-close" aria-label="Close">&times;</button>
-        <h2 id="detail-title"></h2>
-        <div class="meta" id="detail-meta"></div>
+        <div id="detail-header-sticky">
+          <button class="close" id="detail-close" aria-label="Close">&times;</button>
+          <div class="detail-header-row">
+            <h2 id="detail-title"></h2>
+            <span id="detail-severity-pill" class="pill sev-moderate" style="display:none"></span>
+          </div>
+          <div class="meta" id="detail-meta"></div>
+          <div class="stat-strip" id="detail-stat-strip">
+            <div class="stat-chip"><span class="lbl">Added km²</span><span class="val" id="stat-added-km2">—</span></div>
+            <div class="stat-chip"><span class="lbl">% increase</span><span class="val" id="stat-pct">—</span></div>
+            <div class="stat-chip"><span class="lbl">Towers</span><span class="val" id="stat-towers">—</span></div>
+            <div class="stat-chip"><span class="lbl">New towers</span><span class="val" id="stat-new-towers">—</span></div>
+          </div>
+        </div>
         <div class="headline" id="detail-headline"></div>
         <div class="section-label">Inferred towers covering this county</div>
         <div class="tower-compare" id="tower-compare" style="display:none">
@@ -200,34 +277,43 @@
           </div>
         </div>
         <div class="tower-note" id="tower-cross-border-note" style="display:none"></div>
-        <div class="section-label">Coverage maps (side-by-side)</div>
+        <div class="section-label">Coverage comparison</div>
+        <div class="compare-toolbar" id="compare-toolbar" style="display:none">
+          <button type="button" id="btn-side-by-side" class="active">Side by side</button>
+          <button type="button" id="btn-swipe">Swipe compare</button>
+          <button type="button" id="btn-download">Download comparison</button>
+        </div>
         <div id="compare-wrap">
           <div class="detail-loading" id="detail-map-status"><span class="spinner"></span><span>Select a county to compare prior vs current coverage.</span></div>
+          <div class="swipe-compare" id="swipe-compare" style="display:none">
+            <div class="swipe-labels">
+              <span id="swipe-prior-label">Prior</span>
+              <span id="swipe-current-label">Current</span>
+            </div>
+            <img id="swipe-prior" alt="Prior coverage map" />
+            <div class="swipe-overlay" id="swipe-overlay"><img id="swipe-current" alt="Current coverage map" /></div>
+            <div class="swipe-handle" id="swipe-handle"></div>
+            <input type="range" class="swipe-slider" id="swipe-slider" min="0" max="100" value="50" aria-label="Swipe between prior and current coverage" />
+          </div>
           <div class="compare-maps" id="compare-maps" style="display:none">
             <div class="compare-panel">
               <div class="panel-head" id="map-prior-label">Prior coverage</div>
-              <div id="map-prior-raster" class="compare-raster"><img id="img-prior" alt="Prior coverage map" /></div>
+              <div id="map-prior-raster" class="compare-raster"><img id="img-prior" alt="Prior coverage map with signal heatmap and tower locations" /></div>
               <div id="map-prior" class="compare-map"></div>
               <div class="empty-map-note" id="map-prior-empty" style="display:none">No prior coverage in this county</div>
-              <div class="signal-legend" id="map-prior-legend">
-                <span><i style="background:#a3e635"></i> Strong (−85+)</span>
-                <span><i style="background:#22c55e"></i> Medium (−95)</span>
-                <span><i style="background:#f97316"></i> Light (−105)</span>
-                <span><i style="background:#dc2626"></i> Fringe</span>
-              </div>
             </div>
             <div class="compare-panel">
               <div class="panel-head" id="map-current-label">Current coverage</div>
-              <div id="map-current-raster" class="compare-raster"><img id="img-current" alt="Current coverage map" /></div>
+              <div id="map-current-raster" class="compare-raster"><img id="img-current" alt="Current coverage map with signal heatmap and tower locations" /></div>
               <div id="map-current" class="compare-map"></div>
               <div class="empty-map-note" id="map-current-empty" style="display:none">No current coverage in this county</div>
-              <div class="signal-legend" id="map-current-legend">
-                <span><i style="background:#a3e635"></i> Strong (−85+)</span>
-                <span><i style="background:#22c55e"></i> Medium (−95)</span>
-                <span><i style="background:#f97316"></i> Light (−105)</span>
-                <span><i style="background:#dc2626"></i> Fringe</span>
-              </div>
             </div>
+          </div>
+          <div class="signal-gradient-legend" id="signal-gradient-legend" style="display:none">
+            <span class="grad-label">Weaker</span>
+            <div class="grad-bar" role="img" aria-label="Signal strength gradient from weak red to strong green, measured in dBm"></div>
+            <span class="grad-label">Stronger (dBm)</span>
+            <p class="colorblind-note">Signal strength uses a red-to-green color scale; check tower markers and labels if colors are hard to distinguish.</p>
           </div>
         </div>
         <div class="section-label">Analysis</div>
@@ -256,6 +342,9 @@
     let compareMaps = { prior: null, current: null };
     let detailCache = {};
     let detailRequestId = 0;
+    let listShowAll = false;
+    let compareViewMode = 'side'; // side | swipe
+    let lastRasterUrls = { prior: '', current: '' };
 
     const h3lib = window.h3;
 
@@ -361,9 +450,24 @@
       ['prior', 'current'].forEach(side => {
         document.getElementById(`map-${side}-raster`).style.display = useRaster ? 'flex' : 'none';
         document.getElementById(`map-${side}`).style.display = useRaster ? 'none' : 'block';
-        document.getElementById(`map-${side}-legend`).style.display = useRaster ? 'none' : 'flex';
       });
+      document.getElementById('signal-gradient-legend').style.display = useRaster ? 'grid' : 'none';
       if (useRaster) destroyCompareMaps();
+    }
+
+    function setCompareViewLayout(view) {
+      compareViewMode = view;
+      const isSwipe = view === 'swipe' && window.matchMedia('(min-width: 901px)').matches;
+      document.getElementById('compare-maps').style.display = isSwipe ? 'none' : 'grid';
+      document.getElementById('swipe-compare').style.display = isSwipe ? 'block' : 'none';
+      document.getElementById('btn-side-by-side').classList.toggle('active', !isSwipe);
+      document.getElementById('btn-swipe').classList.toggle('active', isSwipe);
+    }
+
+    function updateSwipePosition(pct) {
+      const clip = `inset(0 ${100 - pct}% 0 0)`;
+      document.getElementById('swipe-overlay').style.clipPath = clip;
+      document.getElementById('swipe-handle').style.left = `${pct}%`;
     }
 
     function detailAssetBase(rec) {
@@ -375,9 +479,116 @@
 
     function showRasterCompare(detail, rec) {
       const base = detailAssetBase(rec);
-      document.getElementById('img-prior').src = `${base}/${detail.prior_map}`;
-      document.getElementById('img-current').src = `${base}/${detail.current_map}`;
+      const priorUrl = `${base}/${detail.prior_map || 'prior.png'}`;
+      const currentUrl = `${base}/${detail.current_map || 'current.png'}`;
+      lastRasterUrls = { prior: priorUrl, current: currentUrl };
+      document.getElementById('img-prior').src = priorUrl;
+      document.getElementById('img-current').src = currentUrl;
+      document.getElementById('swipe-prior').src = priorUrl;
+      document.getElementById('swipe-current').src = currentUrl;
+      document.getElementById('compare-toolbar').style.display = 'flex';
       setCompareMode('raster');
+      setCompareViewLayout(compareViewMode);
+      updateSwipePosition(Number(document.getElementById('swipe-slider').value));
+    }
+
+    function showPredictedRasterCompare(rec) {
+      const base = detailAssetBase(rec);
+      const priorUrl = `${base}/prior.png`;
+      const currentUrl = `${base}/current.png`;
+      lastRasterUrls = { prior: priorUrl, current: currentUrl };
+      document.getElementById('img-prior').src = priorUrl;
+      document.getElementById('img-current').src = currentUrl;
+      document.getElementById('swipe-prior').src = priorUrl;
+      document.getElementById('swipe-current').src = currentUrl;
+      document.getElementById('compare-maps').style.display = 'grid';
+      document.getElementById('compare-toolbar').style.display = 'flex';
+      setCompareMode('raster');
+      setCompareViewLayout(compareViewMode);
+    }
+
+    async function downloadComparison() {
+      const { prior, current } = lastRasterUrls;
+      if (!prior || !current) return;
+      const loadImg = src => new Promise((resolve, reject) => {
+        const img = new Image();
+        img.crossOrigin = 'anonymous';
+        img.onload = () => resolve(img);
+        img.onerror = reject;
+        img.src = src;
+      });
+      try {
+        const [pImg, cImg] = await Promise.all([loadImg(prior), loadImg(current)]);
+        const h = Math.max(pImg.naturalHeight, cImg.naturalHeight);
+        const w = pImg.naturalWidth + cImg.naturalWidth + 24;
+        const canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h + 40;
+        const ctx = canvas.getContext('2d');
+        ctx.fillStyle = '#ebe6dc';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = '#111827';
+        ctx.font = '14px Inter, sans-serif';
+        ctx.fillText(document.getElementById('map-prior-label').textContent, 8, 18);
+        ctx.fillText(document.getElementById('map-current-label').textContent, pImg.naturalWidth + 16, 18);
+        ctx.drawImage(pImg, 0, 28, pImg.naturalWidth, pImg.naturalHeight);
+        ctx.drawImage(cImg, pImg.naturalWidth + 24, 28, cImg.naturalWidth, cImg.naturalHeight);
+        const a = document.createElement('a');
+        a.download = `${recSlug()}-coverage-compare.png`;
+        a.href = canvas.toDataURL('image/png');
+        a.click();
+      } catch {
+        window.open(prior, '_blank');
+        window.open(current, '_blank');
+      }
+    }
+
+    function recSlug() {
+      const title = document.getElementById('detail-title').textContent || 'county';
+      return title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+    }
+
+    function formatStatKm2(v) {
+      if (v == null || !Number.isFinite(v)) return '—';
+      return v >= 10 ? v.toFixed(1) : v.toFixed(2);
+    }
+
+    function formatStatPct(v) {
+      if (v == null || !Number.isFinite(v)) return '—';
+      return `${(v * 100).toFixed(1)}%`;
+    }
+
+    function fillDetailHeader(rec, detail) {
+      document.getElementById('detail-title').textContent = rec.name;
+      document.getElementById('detail-meta').textContent =
+        `${rec.provider_name} · ${rec.service} · Priority ${(rec.priority || 0).toFixed(2)}`;
+      const sev = (rec.explanation?.severity || 'Low').toLowerCase();
+      const pill = document.getElementById('detail-severity-pill');
+      pill.style.display = 'inline-block';
+      pill.className = `pill sev-${sev}`;
+      pill.textContent = rec.explanation?.severity || 'Low';
+      if (rec.flag) {
+        const flag = document.createElement('span');
+        flag.className = 'pill flag';
+        flag.textContent = 'FLAG';
+        if (!pill.dataset.hasFlag) {
+          pill.after(flag);
+          pill.dataset.hasFlag = '1';
+        }
+      } else if (pill.nextElementSibling?.classList?.contains('flag')) {
+        pill.nextElementSibling.remove();
+        delete pill.dataset.hasFlag;
+      }
+      const m = rec.metrics || {};
+      const d = detail || {};
+      document.getElementById('stat-added-km2').textContent = formatStatKm2(m.added_km2);
+      document.getElementById('stat-pct').textContent = formatStatPct(m.pct_increase);
+      const priorT = d.towers_prior ?? m.prior_towers;
+      const currentT = d.towers_current ?? m.current_towers;
+      document.getElementById('stat-towers').textContent =
+        priorT != null && currentT != null ? `${priorT} → ${currentT}` : '—';
+      document.getElementById('stat-new-towers').textContent =
+        d.new_towers ?? m.new_towers ?? '—';
     }
 
     function renderCompareMap(containerId, geo, countyFeature, emptyNoteId, sharedBounds) {
@@ -680,20 +891,27 @@
     function renderList() {
       const recs = providerRecords(currentProvider, currentService);
       const q = document.getElementById('search').value.toLowerCase();
-      const rows = Object.values(recs)
-        .filter(r => r.flag)
+      let rows = Object.values(recs);
+      if (!listShowAll) rows = rows.filter(r => r.flag);
+      rows = rows
         .filter(r => !q || r.name.toLowerCase().includes(q))
         .sort((a, b) => (b.priority || 0) - (a.priority || 0));
 
       document.getElementById('n-scored').textContent = Object.keys(recs).length;
-      document.getElementById('n-flagged').textContent = rows.length;
+      document.getElementById('n-flagged').textContent = Object.values(recs).filter(r => r.flag).length;
+      document.getElementById('list-head-label').textContent =
+        listShowAll ? 'All analyzed counties' : 'Flagged for review';
+      document.getElementById('list-mode-toggle').textContent = listShowAll ? 'Flagged only' : 'Show all';
 
       const list = document.getElementById('list');
       list.innerHTML = '';
       if (!rows.length) {
         const n = Object.keys(recs).length;
+        const flaggedN = Object.values(recs).filter(r => r.flag).length;
         list.innerHTML = n
-          ? '<div class="err">No flagged counties for this provider/service. Try another provider from the dropdown.</div>'
+          ? (flaggedN === 0 && !listShowAll
+            ? `<div class="info-msg">${n} ${n === 1 ? 'county' : 'counties'} analyzed — none flagged for this provider/service. Use <strong>Show all</strong> to browse every county.</div>`
+            : '<div class="info-msg">No counties match your search.</div>')
           : '<div class="err">No county data for this provider/service yet. Run the pipeline with <code>--build-web</code>.</div>';
         return;
       }
@@ -708,13 +926,16 @@
         const nameSpan = document.createElement('span');
         nameSpan.className = 'name';
         nameSpan.textContent = r.name;
-        const flagPill = document.createElement('span');
-        flagPill.className = 'pill flag';
-        flagPill.textContent = 'FLAG';
         const sevPill = document.createElement('span');
         sevPill.className = `pill sev-${sev}`;
         sevPill.textContent = r.explanation?.severity || '';
-        nameSpan.append(flagPill, sevPill);
+        nameSpan.append(sevPill);
+        if (r.flag) {
+          const flagPill = document.createElement('span');
+          flagPill.className = 'pill flag';
+          flagPill.textContent = 'FLAG';
+          nameSpan.append(flagPill);
+        }
         const scoreSpan = document.createElement('span');
         scoreSpan.className = 'score';
         scoreSpan.textContent = (r.priority || 0).toFixed(2);
@@ -780,9 +1001,7 @@
       const reqId = ++detailRequestId;
       const d = document.getElementById('detail');
       d.classList.add('visible');
-      document.getElementById('detail-title').textContent = rec.name;
-      document.getElementById('detail-meta').textContent =
-        `${rec.provider_name} · ${rec.service} · Priority ${(rec.priority || 0).toFixed(2)} · ${rec.explanation?.severity || ''}`;
+      fillDetailHeader(rec);
       document.getElementById('detail-headline').textContent = rec.explanation?.headline || '';
       const ul = document.getElementById('detail-bullets');
       ul.innerHTML = '';
@@ -807,25 +1026,36 @@
 
       const statusEl = document.getElementById('detail-map-status');
       statusEl.style.display = 'flex';
-      statusEl.innerHTML = '<span class="spinner"></span><span>Loading coverage maps…</span>';
+      statusEl.innerHTML = '<span class="spinner"></span><span>Loading coverage detail…</span>';
       statusEl.className = 'detail-loading';
       document.getElementById('compare-maps').style.display = 'none';
+      document.getElementById('swipe-compare').style.display = 'none';
+      document.getElementById('compare-toolbar').style.display = 'none';
+      document.getElementById('signal-gradient-legend').style.display = 'none';
       destroyCompareMaps();
 
-      if (!h3lib?.cellToBoundary) {
-        statusEl.innerHTML = 'Map library failed to load. Check your network connection and refresh.';
-        statusEl.className = 'detail-missing';
-        return;
-      }
+      // Show PNGs immediately (pipeline always writes prior.png / current.png).
+      showPredictedRasterCompare(rec);
+      statusEl.style.display = 'none';
+
+      document.getElementById('map-prior-label').textContent =
+        `${formatVintage(meta.prior_vintage) || 'Prior'} — ${rec.service} coverage`;
+      document.getElementById('map-current-label').textContent =
+        `${formatVintage(meta.current_vintage) || 'Current'} — ${rec.service} coverage`;
+      document.getElementById('swipe-prior-label').textContent =
+        formatVintage(meta.prior_vintage) || 'Prior';
+      document.getElementById('swipe-current-label').textContent =
+        formatVintage(meta.current_vintage) || 'Current';
 
       loadCountyDetail(rec).then(detail => {
         if (reqId !== detailRequestId) return;
         if (!detail) {
           statusEl.style.display = 'flex';
-          statusEl.innerHTML = 'Coverage maps not available — re-run the pipeline with <code>--build-web</code> after processing.';
+          statusEl.innerHTML = 'Coverage detail not available — re-run the pipeline with <code>--build-web</code>.';
           statusEl.className = 'detail-missing';
           return;
         }
+        fillDetailHeader(rec, detail);
         if (detail.towers_prior != null) {
           setTowerCompare(
             detail.towers_prior, detail.towers_current, detail.new_towers,
@@ -836,15 +1066,22 @@
           `${formatVintage(detail.prior_vintage) || detail.prior_vintage || 'Prior'} — ${rec.service} coverage`;
         document.getElementById('map-current-label').textContent =
           `${formatVintage(detail.current_vintage) || detail.current_vintage || 'Current'} — ${rec.service} coverage`;
-        statusEl.style.display = 'none';
-        document.getElementById('compare-maps').style.display = 'grid';
 
         if (detail.prior_map && detail.current_map) {
           showRasterCompare(detail, rec);
           return;
         }
 
+        if (!h3lib?.cellToBoundary) {
+          statusEl.style.display = 'flex';
+          statusEl.innerHTML = 'Interactive map fallback unavailable; raster maps shown when present.';
+          statusEl.className = 'detail-missing';
+          return;
+        }
+
+        document.getElementById('compare-toolbar').style.display = 'none';
         setCompareMode('map');
+        document.getElementById('compare-maps').style.display = 'grid';
         const countyFeature = resolveCountyFeature(rec.geoid, detail);
         const priorGeo = hexesToGeoJSON(detail.prior_hexes, detail.sites_prior);
         const currentGeo = hexesToGeoJSON(detail.current_hexes, detail.sites_current);
@@ -861,9 +1098,7 @@
         }, 100);
       }).catch(() => {
         if (reqId !== detailRequestId) return;
-        statusEl.style.display = 'flex';
-        statusEl.textContent = 'Could not load coverage maps.';
-        statusEl.className = 'detail-missing';
+        statusEl.style.display = 'none';
       });
     }
 
@@ -918,6 +1153,16 @@
       metricMode = metricMode === 'priority' ? 'change' : 'priority';
       document.getElementById('metric-toggle').textContent = `Metric: ${metricMode}`;
       applyFeatureStates();
+    });
+    document.getElementById('list-mode-toggle').addEventListener('click', () => {
+      listShowAll = !listShowAll;
+      renderList();
+    });
+    document.getElementById('btn-side-by-side').addEventListener('click', () => setCompareViewLayout('side'));
+    document.getElementById('btn-swipe').addEventListener('click', () => setCompareViewLayout('swipe'));
+    document.getElementById('btn-download').addEventListener('click', downloadComparison);
+    document.getElementById('swipe-slider').addEventListener('input', e => {
+      updateSwipePosition(Number(e.target.value));
     });
 
     map.on('load', async () => {
