@@ -395,7 +395,20 @@ class RedshiftSource(DataSource):
         )
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(query)
-            df = cur.fetch_dataframe()
+            try:
+                df = cur.fetch_dataframe()
+            except AttributeError:
+                import pandas as pd
+                cols = [d[0] for d in cur.description]
+                df = pd.DataFrame(cur.fetchall(), columns=cols)
+        if df.empty:
+            raise FileNotFoundError(
+                f"No Redshift rows for provider {provider_id} {technology} @ {vintage}"
+            )
+        if "geometry_wkt" not in df.columns:
+            raise RuntimeError(
+                "coverage_query must return a geometry_wkt column (WKT, EPSG:4326)"
+            )
         df["geometry"] = df["geometry_wkt"].apply(wkt.loads)
         gdf = gpd.GeoDataFrame(df.drop(columns=["geometry_wkt"]), geometry="geometry", crs="EPSG:4326")
         gdf.to_file(dest, driver="GPKG")

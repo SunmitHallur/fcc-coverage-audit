@@ -1,0 +1,25 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run pipeline (Redshift)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "fcc_audit.cli",
+      "args": ["--backend", "redshift", "run", "--build-web"],
+      "cwd": "${workspaceFolder}",
+      "env": { "PYTHONPATH": "${workspaceFolder}/src" },
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Build web bundle",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "fcc_audit.cli",
+      "args": ["build-web"],
+      "cwd": "${workspaceFolder}",
+      "env": { "PYTHONPATH": "${workspaceFolder}/src" },
+      "console": "integratedTerminal"
+    }
+  ]
+}

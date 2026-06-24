@@ -13,8 +13,7 @@ set PYTHONPATH=src
 echo === Processing states: %STATES% ===
 ".venv\Scripts\python.exe" -m fcc_audit.cli run --states %STATES% --cleanup-raw --build-web
 
-echo.
-echo === Done. Next steps ===
-echo   git add web/public/data config/pipeline.yaml
-echo   git commit -m "Add batch results for states %STATES%"
-echo   git push   # Vercel auto-deploys web/
+echo === Done. View the website locally ===
+echo   cd web
+echo   ..\.venv\Scripts\python.exe -m http.server 8000
+echo   then open http://localhost:8000 in your browser
