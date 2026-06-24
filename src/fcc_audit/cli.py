@@ -36,7 +36,7 @@ def _states_list(cfg: Config) -> list[str]:
 
 def _analyze_unit(
     cfg, provider, service_label, cur_file, pri_file, counties, county_area_km2,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Run change/site/attribute/scoring for one (provider, service) unit."""
     log = logging.getLogger(__name__)
     county_res = int(cfg.geography["county_h3_resolution"])
@@ -49,7 +49,7 @@ def _analyze_unit(
         cfg, pri_file, counties, county_res, site_res, service_label
     )
     if cur8.empty and pri8.empty:
-        return pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
     change = changedetect.hex_change(pri8, cur8)
     cc = changedetect.county_change(change, county_res, county_area_km2)
 
@@ -71,17 +71,51 @@ def _analyze_unit(
         "technology": service_label,
     }
     if not feats.empty:
+        prior_counts = attribute.tower_counts_by_county(prior_sites)
+        current_counts = attribute.tower_counts_by_county(current_sites)
+        feats["prior_towers"] = (
+            feats["county_geoid"].map(prior_counts).fillna(0).astype(int)
+        )
+        feats["current_towers"] = (
+            feats["county_geoid"].map(current_counts).fillna(0).astype(int)
+        )
         for k, v in tag.items():
             feats[k] = v
-    if not current_sites.empty:
-        current_sites = current_sites.copy()
+
+    prior_out = prior_sites.copy()
+    if not prior_out.empty:
+        prior_out["vintage"] = "prior"
+        prior_out["site_class"] = "prior_site"
         for k, v in tag.items():
-            current_sites[k] = v
+            prior_out[k] = v
+    current_out = current_sites.copy()
+    if not current_out.empty:
+        current_out["vintage"] = "current"
+        for k, v in tag.items():
+            current_out[k] = v
+    sites = pd.concat([prior_out, current_out], ignore_index=True)
+
+    cov_cols = ["h3", "signal_dbm", "county_geoid"]
+    cov_parts = []
+    if not pri8.empty:
+        p = pri8[cov_cols].copy()
+        p["vintage"] = "prior"
+        cov_parts.append(p)
+    if not cur8.empty:
+        c = cur8[cov_cols].copy()
+        c["vintage"] = "current"
+        cov_parts.append(c)
+    coverage = pd.concat(cov_parts, ignore_index=True) if cov_parts else pd.DataFrame()
+    if not coverage.empty:
+        for k, v in tag.items():
+            coverage[k] = v
+
     log.info(
-        "  %s %s: %d counties changed, %d current sites",
-        provider.name, service_label, 0 if feats.empty else len(feats), len(current_sites),
+        "  %s %s: %d counties changed, %d prior / %d current sites",
+        provider.name, service_label,
+        0 if feats.empty else len(feats), len(prior_sites), len(current_sites),
     )
-    return feats, current_sites
+    return feats, sites, coverage
 
 
 def process_provider(
@@ -93,11 +127,11 @@ def process_provider(
     counties,
     county_area_km2: dict | None = None,
     cleanup_raw: bool = False,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     log = logging.getLogger(__name__)
     log.info("=== %s (id=%s) ===", provider.name, provider.id)
 
-    feats_parts, sites_parts = [], []
+    feats_parts, sites_parts, coverage_parts = [], [], []
     for svc in cfg.services:
         label, desc = svc["label"], svc["desc"]
         try:
@@ -107,13 +141,15 @@ def process_provider(
             log.warning("skip %s %s: %s", provider.name, label, exc)
             continue
 
-        feats, sites = _analyze_unit(
+        feats, sites, coverage = _analyze_unit(
             cfg, provider, label, cur_file, pri_file, counties, county_area_km2,
         )
         if not feats.empty:
             feats_parts.append(feats)
         if not sites.empty:
             sites_parts.append(sites)
+        if not coverage.empty:
+            coverage_parts.append(coverage)
 
         if cleanup_raw:
             import os
@@ -125,7 +161,8 @@ def process_provider(
 
     feats = pd.concat(feats_parts, ignore_index=True) if feats_parts else pd.DataFrame()
     sites = pd.concat(sites_parts, ignore_index=True) if sites_parts else pd.DataFrame()
-    return feats, sites
+    coverage = pd.concat(coverage_parts, ignore_index=True) if coverage_parts else pd.DataFrame()
+    return feats, sites, coverage
 
 
 def _resolve_providers(cfg: Config, source: DataSource, vintage: str) -> list[Provider]:
@@ -142,24 +179,35 @@ def _save_batch_results(
     scored: pd.DataFrame,
     sites: pd.DataFrame,
     meta: dict[str, Any],
+    coverage: pd.DataFrame | None = None,
 ) -> None:
-    """Persist scored rows (and optional sites) for incremental web bundle builds."""
+    """Persist scored rows (and optional sites/coverage) for incremental web builds."""
     states = _states_list(cfg)
     scored_dir = cfg.path("processed") / "scored"
     sites_dir = cfg.path("processed") / "sites"
+    coverage_dir = cfg.path("processed") / "coverage"
 
     if not scored.empty and "technology" in scored.columns:
         for svc in scored["technology"].unique():
             svc_rows = scored[scored["technology"] == svc]
             report.save_batch_scored(svc_rows, scored_dir, service_label=str(svc), states=states, meta=meta)
 
+    states_key = "-".join(sorted(states)) if states else "all"
+    batch_ts = meta.get("generated_at", "")
+
     if not sites.empty:
         sites_dir.mkdir(parents=True, exist_ok=True)
-        states_key = "-".join(sorted(states)) if states else "all"
         sites_path = sites_dir / f"sites_{states_key}.parquet"
         batch_sites = sites.copy()
-        batch_sites["batch_ts"] = meta.get("generated_at", "")
+        batch_sites["batch_ts"] = batch_ts
         batch_sites.to_parquet(sites_path, index=False)
+
+    if coverage is not None and not coverage.empty:
+        coverage_dir.mkdir(parents=True, exist_ok=True)
+        cov_path = coverage_dir / f"coverage_{states_key}.parquet"
+        batch_cov = coverage.copy()
+        batch_cov["batch_ts"] = batch_ts
+        batch_cov.to_parquet(cov_path, index=False)
 
 
 def cmd_run(cfg: Config, args) -> int:
@@ -178,15 +226,17 @@ def cmd_run(cfg: Config, args) -> int:
 
     providers = _resolve_providers(cfg, source, current)
     cleanup_raw = bool(getattr(args, "cleanup_raw", False)) and cfg.raw["source"]["backend"] != "fixture"
-    all_feats, all_sites = [], []
+    all_feats, all_sites, all_coverage = [], [], []
     for provider in providers:
-        feats, sites = process_provider(
+        feats, sites, coverage = process_provider(
             cfg, source, provider, current, prior, counties, county_area_km2, cleanup_raw
         )
         if not feats.empty:
             all_feats.append(feats)
         if not sites.empty:
             all_sites.append(sites)
+        if not coverage.empty:
+            all_coverage.append(coverage)
 
     if not all_feats:
         log.error("no features produced; nothing to score")
@@ -196,6 +246,7 @@ def cmd_run(cfg: Config, args) -> int:
     scored = score.score(features, cfg)
     scored = explain.add_explanations(scored)
     sites = pd.concat(all_sites, ignore_index=True) if all_sites else pd.DataFrame()
+    coverage = pd.concat(all_coverage, ignore_index=True) if all_coverage else pd.DataFrame()
 
     states_label = ",".join(_states_list(cfg)) if _states_list(cfg) else "all"
     meta = {
@@ -205,7 +256,7 @@ def cmd_run(cfg: Config, args) -> int:
         "technologies": ", ".join(s["label"] for s in cfg.services),
         "states_processed": states_label,
     }
-    _save_batch_results(cfg, scored, sites, meta)
+    _save_batch_results(cfg, scored, sites, meta, coverage)
 
     dashboard_dir = cfg.project_root / "dashboard"
     dashboard_dir.mkdir(exist_ok=True)
@@ -215,7 +266,9 @@ def cmd_run(cfg: Config, args) -> int:
 
     if getattr(args, "build_web", False):
         web_dir = cfg.project_root / "web"
-        web_paths = report.write_web_bundle(scored, sites, counties, web_dir, meta)
+        web_paths = report.write_web_bundle(
+            scored, sites, counties, web_dir, meta, coverage=coverage,
+        )
         paths.update({f"web_{k}": v for k, v in web_paths.items()})
 
     flagged = int(scored["flag_for_review"].sum())
@@ -233,6 +286,7 @@ def cmd_build_web(cfg: Config, args) -> int:
     log = logging.getLogger(__name__)
     scored_dir = cfg.path("processed") / "scored"
     sites_dir = cfg.path("processed") / "sites"
+    coverage_dir = cfg.path("processed") / "coverage"
     scored = report.load_accumulated_scored(scored_dir)
 
     if scored.empty:
@@ -268,9 +322,12 @@ def cmd_build_web(cfg: Config, args) -> int:
         "states_processed": states_processed,
     }
 
+    coverage = report.load_accumulated_coverage(coverage_dir)
     counties = normalize.load_counties(cfg)
     web_dir = cfg.project_root / "web"
-    paths = report.write_web_bundle(scored, sites, counties, web_dir, meta)
+    paths = report.write_web_bundle(
+        scored, sites, counties, web_dir, meta, coverage=coverage,
+    )
     flagged = int(scored["flag_for_review"].sum()) if "flag_for_review" in scored.columns else 0
     log.info("web bundle ready: %d records, %d flagged", len(scored), flagged)
     print("\nWeb bundle:")

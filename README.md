@@ -224,6 +224,56 @@ The site loads `public/data/counties.geojson` (county boundaries) and
 Select a provider from the dropdown to see coverage-change shading and flagged
 counties highlighted in red.
 
+### 6. Work laptop (local website, no Vercel)
+
+On a locked-down work machine, skip Vercel entirely. The website is static files
+under `web/` — no server-side code, no external hosting required.
+
+```powershell
+git clone <your-repo-url>
+cd fcc-coverage-audit
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+copy .env.example .env          # fill in Redshift creds (see below)
+```
+
+**Redshift via DBeaver:** DBeaver is for browsing the warehouse and testing SQL.
+The pipeline connects with the same credentials using `redshift-connector` (now
+in `requirements.txt`). In DBeaver, open your connection → *Edit* and copy host,
+database, user, and password into `.env`:
+
+```
+REDSHIFT_HOST=...
+REDSHIFT_DB=...
+REDSHIFT_USER=...
+REDSHIFT_PASSWORD=...
+```
+
+In DBeaver, find the mobile coverage table (schema/column names vary). Update
+`source.redshift.coverage_query` in `config/pipeline.yaml` so it returns
+`geometry_wkt` (EPSG:4326 WKT) plus the templated `{vintage}`, `{provider_id}`,
+`{tech}` filters. Set `analysis.vintages` to match your warehouse `as_of_date`
+format (usually `2025-12-31`, not the FCC filing label).
+
+Run the pipeline and serve locally:
+
+```powershell
+$env:PYTHONPATH = "src"
+python -m fcc_audit.cli --backend redshift run --build-web
+cd web
+python -m http.server 8000
+# open http://localhost:8000
+```
+
+Or double-click `run.bat` after setting `source.backend: redshift` in the config.
+VS Code: open the folder, let it pick up `.vscode/settings.json` (sets
+`PYTHONPATH=src`), then **Terminal → Run Task** for *Run pipeline (Redshift)*,
+*Build web bundle*, or *Serve website locally*.
+
+Click any county to see **before/after coverage maps** and **tower counts** (detail
+files are written to `web/public/data/details/` during `build-web`).
+
 ---
 
 ## Outputs
@@ -259,12 +309,10 @@ editing the YAML, or set `analysis.states` to a FIPS list (e.g. `["48"]` for Tex
 
 The data layer is pluggable. Once your AWS Redshift access is granted:
 
-1. `pip install redshift-connector` (uncomment in `requirements.txt`).
-2. Fill `source.redshift` in the config (host/db/user/password come from env
-   vars: `REDSHIFT_HOST`, `REDSHIFT_DB`, `REDSHIFT_USER`, `REDSHIFT_PASSWORD`).
-3. Adjust `coverage_query` to your warehouse schema. `provider_id`, `technology`,
-   and the vintage are templated in; `list_providers` and `fetch` already issue
-   per-provider/technology queries.
+1. `pip install -r requirements.txt` (`redshift-connector` is included).
+2. Copy `.env.example` → `.env` and fill `REDSHIFT_*` (same values as your DBeaver connection).
+3. In DBeaver, locate the mobile coverage table and edit `source.redshift.coverage_query`
+   in `config/pipeline.yaml`. Set `analysis.vintages` to your warehouse date format.
 4. Set `source.backend: redshift` (or run with `--backend redshift`).
 
 Nothing else in the pipeline changes. **This is the recommended path for an

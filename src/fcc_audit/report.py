@@ -26,14 +26,14 @@ _CSV_COLUMNS = [
     "state_fips", "priority_score", "flag_for_review", "flag_reason", "plain_explanation",
     "added_km2", "added_frac_of_county", "pct_increase", "blanket_fillin",
     "same_site_growth_share", "new_site_share", "unattributed_share",
-    "boundary_snap_share", "new_towers", "new_hexes", "upgraded_hexes",
+    "boundary_snap_share", "new_towers", "prior_towers", "current_towers", "new_hexes", "upgraded_hexes",
 ]
 
 _METRIC_KEYS = [
     "priority_score", "flag_for_review", "added_km2", "added_frac_of_county",
     "pct_increase", "same_site_growth_share", "new_site_share",
     "unattributed_share", "boundary_snap_share", "blanket_fillin", "new_towers",
-    "prior_cov_frac", "current_cov_frac", "flag_reason",
+    "prior_towers", "current_towers", "prior_cov_frac", "current_cov_frac", "flag_reason",
 ]
 
 
@@ -226,6 +226,115 @@ def build_counties_geojson(
     return json.loads(gdf[["geoid", "name", "state", "geometry"]].to_json())
 
 
+def _safe_service_key(service: str) -> str:
+    return service.replace("/", "-").replace(" ", "")
+
+
+def _hexes_for_county(df: pd.DataFrame, geoid: str, vintage: str) -> list[list]:
+    """Compact [h3, signal_dbm] pairs for one county and vintage."""
+    if df.empty:
+        return []
+    mask = (
+        df["county_geoid"].astype(str) == str(geoid)
+    ) & (df["vintage"] == vintage)
+    sub = df.loc[mask, ["h3", "signal_dbm"]]
+    return [
+        [str(row.h3), round(float(row.signal_dbm), 1)]
+        for row in sub.itertuples(index=False)
+    ]
+
+
+def _sites_for_county(sites: pd.DataFrame, geoid: str, vintage: str) -> list[dict[str, Any]]:
+    if sites.empty:
+        return []
+    mask = (
+        sites["county_geoid"].astype(str) == str(geoid)
+    ) & (sites.get("vintage", "current") == vintage)
+    out = []
+    for _, s in sites.loc[mask].iterrows():
+        out.append({
+            "lat": float(s["lat"]),
+            "lng": float(s["lng"]),
+            "site_class": str(s.get("site_class", "site")),
+            "n_hexes": int(s.get("n_hexes", 0)),
+        })
+    return out
+
+
+def build_county_detail(
+    geoid: str,
+    coverage: pd.DataFrame,
+    sites: pd.DataFrame,
+    meta: dict[str, Any],
+) -> dict[str, Any]:
+    """One county's before/after coverage hexes and inferred tower sites."""
+    return {
+        "geoid": str(geoid),
+        "prior_vintage": meta.get("prior"),
+        "current_vintage": meta.get("current"),
+        "prior_hexes": _hexes_for_county(coverage, geoid, "prior"),
+        "current_hexes": _hexes_for_county(coverage, geoid, "current"),
+        "sites_prior": _sites_for_county(sites, geoid, "prior"),
+        "sites_current": _sites_for_county(sites, geoid, "current"),
+    }
+
+
+def write_county_details(
+    scored: pd.DataFrame,
+    coverage: pd.DataFrame,
+    sites: pd.DataFrame,
+    data_dir: Path,
+    meta: dict[str, Any],
+) -> int:
+    """Write per-county JSON for before/after map comparison on click."""
+    details_dir = data_dir / "details"
+    details_dir.mkdir(parents=True, exist_ok=True)
+    if scored.empty:
+        return 0
+
+    keys = scored[["provider_id", "technology", "county_geoid"]].drop_duplicates()
+    n = 0
+    for _, row in keys.iterrows():
+        pid = int(row["provider_id"])
+        svc = str(row["technology"])
+        geoid = str(row["county_geoid"])
+        svc_dir = details_dir / str(pid) / _safe_service_key(svc)
+        svc_dir.mkdir(parents=True, exist_ok=True)
+
+        cov = coverage
+        if not coverage.empty and "provider_id" in coverage.columns:
+            cov = coverage[coverage["provider_id"] == pid]
+        if not coverage.empty and "technology" in coverage.columns:
+            cov = cov[cov["technology"] == svc]
+
+        st = sites
+        if not sites.empty and "provider_id" in sites.columns:
+            st = sites[sites["provider_id"] == pid]
+        if not sites.empty and "technology" in sites.columns:
+            st = st[st["technology"] == svc]
+
+        detail = build_county_detail(geoid, cov, st, meta)
+        sr = scored[
+            (scored["provider_id"] == pid)
+            & (scored["technology"] == svc)
+            & (scored["county_geoid"].astype(str) == geoid)
+        ]
+        if not sr.empty:
+            detail["towers_prior"] = int(sr.iloc[0].get("prior_towers", len(detail["sites_prior"])))
+            detail["towers_current"] = int(sr.iloc[0].get("current_towers", len(detail["sites_current"])))
+            detail["new_towers"] = int(sr.iloc[0].get("new_towers", 0))
+        else:
+            detail["towers_prior"] = len(detail["sites_prior"])
+            detail["towers_current"] = len(detail["sites_current"])
+            detail["new_towers"] = max(0, detail["towers_current"] - detail["towers_prior"])
+
+        out = svc_dir / f"{geoid}.json"
+        out.write_text(json.dumps(detail, allow_nan=False), encoding="utf-8")
+        n += 1
+    log.info("wrote %d county detail files under %s", n, details_dir)
+    return n
+
+
 def build_towers_by_provider(sites: pd.DataFrame) -> dict[int, list[dict[str, Any]]]:
     """Group tower features by provider_id for lazy loading."""
     if sites.empty:
@@ -238,6 +347,8 @@ def build_towers_by_provider(sites: pd.DataFrame) -> dict[int, list[dict[str, An
             "lng": float(s["lng"]),
             "service": str(s.get("technology", "")),
             "site_class": str(s.get("site_class", "site")),
+            "vintage": str(s.get("vintage", "current")),
+            "county_geoid": str(s.get("county_geoid", "")),
             "n_hexes": int(s.get("n_hexes", 0)),
         })
     return out
@@ -251,6 +362,7 @@ def write_web_bundle(
     meta: dict[str, Any],
     *,
     simplify_tolerance: float = 0.005,
+    coverage: pd.DataFrame | None = None,
 ) -> dict[str, Path]:
     """Write static web data bundle under ``web/public/data/``."""
     data_dir = web_dir / "public" / "data"
@@ -278,9 +390,13 @@ def write_web_bundle(
         tp.write_text(json.dumps(feats, allow_nan=False), encoding="utf-8")
         tower_paths[str(pid)] = tp
 
+    detail_count = 0
+    if coverage is not None and not coverage.empty:
+        detail_count = write_county_details(scored, coverage, sites, data_dir, meta)
+
     log.info(
-        "wrote web bundle: %d records, %d providers, %d tower files",
-        len(scored), len(web_meta["providers"]), len(tower_paths),
+        "wrote web bundle: %d records, %d providers, %d tower files, %d county details",
+        len(scored), len(web_meta["providers"]), len(tower_paths), detail_count,
     )
     return {
         "counties": counties_path,
@@ -340,6 +456,23 @@ def load_accumulated_scored(scored_dir: Path) -> pd.DataFrame:
         combined = combined.drop_duplicates(
             subset=["provider_id", "technology", "county_geoid"], keep="last"
         )
+    return combined.reset_index(drop=True)
+
+
+def load_accumulated_coverage(coverage_dir: Path) -> pd.DataFrame:
+    """Load and merge all batch coverage snapshot parquet files."""
+    if not coverage_dir.exists():
+        return pd.DataFrame()
+    parts = sorted(coverage_dir.glob("coverage_*.parquet"))
+    if not parts:
+        return pd.DataFrame()
+    combined = pd.concat([pd.read_parquet(p) for p in parts], ignore_index=True)
+    dedup = ["provider_id", "technology", "county_geoid", "vintage", "h3"]
+    present = [c for c in dedup if c in combined.columns]
+    if "batch_ts" in combined.columns:
+        combined = combined.sort_values("batch_ts").drop_duplicates(subset=present, keep="last")
+    elif present:
+        combined = combined.drop_duplicates(subset=present, keep="last")
     return combined.reset_index(drop=True)
 
 

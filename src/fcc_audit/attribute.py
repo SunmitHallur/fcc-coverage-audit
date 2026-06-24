@@ -28,6 +28,19 @@ _REACH_MARGIN = 1.6
 _MIN_REACH_M = 3000.0
 
 
+def tower_counts_by_county(sites: pd.DataFrame) -> dict[str, int]:
+    """Count inferred sites per county_geoid."""
+    if sites.empty or "county_geoid" not in sites.columns:
+        return {}
+    return (
+        sites.dropna(subset=["county_geoid"])
+        .groupby("county_geoid")
+        .size()
+        .astype(int)
+        .to_dict()
+    )
+
+
 def match_sites(
     prior_sites: pd.DataFrame, current_sites: pd.DataFrame, radius_m: float
 ) -> pd.DataFrame:

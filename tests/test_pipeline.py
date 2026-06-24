@@ -39,10 +39,16 @@ def scored() -> pd.DataFrame:
     areas = normalize.county_areas_km2(counties, cfg.geography["equal_area_crs"])
 
     all_feats = []
+    all_sites = []
+    all_coverage = []
     for provider in _resolve_providers(cfg, source, current):
-        feats, _ = process_provider(cfg, source, provider, current, prior, counties, areas)
+        feats, sites, coverage = process_provider(cfg, source, provider, current, prior, counties, areas)
         if not feats.empty:
             all_feats.append(feats)
+        if not sites.empty:
+            all_sites.append(sites)
+        if not coverage.empty:
+            all_coverage.append(coverage)
 
     features = pd.concat(all_feats, ignore_index=True)
     return score.score(features, cfg)
@@ -107,3 +113,10 @@ def test_web_bundle_build(scored):
     meta = build_web_meta(scored, {"current": "a", "prior": "b"})
     assert meta["total_records"] == len(scored)
     json.dumps(records, allow_nan=False)
+    assert "prior_towers" in scored.columns
+    assert "current_towers" in scored.columns
+
+
+def test_tower_counts_present(scored):
+    row = scored.iloc[0]
+    assert int(row["current_towers"]) >= int(row["prior_towers"])

@@ -393,8 +393,9 @@ class RedshiftSource(DataSource):
         query = self.rs["coverage_query"].format(
             vintage=vintage, provider_id=provider_id, tech=technology
         )
-        with self._connect() as conn:
-            df = conn.cursor().execute(query).fetch_dataframe()
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(query)
+            df = cur.fetch_dataframe()
         df["geometry"] = df["geometry_wkt"].apply(wkt.loads)
         gdf = gpd.GeoDataFrame(df.drop(columns=["geometry_wkt"]), geometry="geometry", crs="EPSG:4326")
         gdf.to_file(dest, driver="GPKG")

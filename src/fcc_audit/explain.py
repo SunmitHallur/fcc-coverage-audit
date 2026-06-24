@@ -66,6 +66,8 @@ def explain_row(row: pd.Series | dict[str, Any]) -> dict[str, Any]:
     boundary = float(r.get("boundary_snap_share") or 0.0)
     blanket = float(r.get("blanket_fillin") or 0.0)
     new_towers = int(r.get("new_towers") or 0)
+    prior_towers = int(r.get("prior_towers") or 0)
+    current_towers = int(r.get("current_towers") or 0)
 
     # --- headline (one sentence) ---
     if flagged and same_site >= 0.5:
@@ -107,6 +109,11 @@ def explain_row(row: pd.Series | dict[str, Any]) -> dict[str, Any]:
         bullets.append(f"New coverage area: approximately {_km2(added_km2)} ({_pct(added_frac)} of the county).")
     if pct_inc is not None and math.isfinite(float(pct_inc)) and float(pct_inc) > 0.05:
         bullets.append(f"Relative increase vs. prior map: {_pct(pct_inc)}.")
+    if prior_towers or current_towers:
+        bullets.append(
+            f"Inferred towers: {prior_towers} in the prior map → {current_towers} in the current map"
+            f"{f' ({new_towers} new)' if new_towers else ''}."
+        )
     if same_site >= 0.3:
         bullets.append(
             f"{_pct(same_site)} of the new coverage is attributed to towers that already existed "

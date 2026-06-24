@@ -31,9 +31,8 @@ Pillow==12.2.0
 scikit-image==0.26.0
 mercantile==1.2.1
 
-# --- optional: Redshift backend (enable once access is granted) ---
-# Uncomment when wiring RedshiftSource:
-# redshift-connector==2.1.5
+# --- Redshift backend (work laptop / warehouse path) ---
+redshift-connector==2.1.5
 
 # --- dev / testing (optional) ---
 pytest==8.4.2

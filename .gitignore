@@ -32,7 +32,10 @@ data/outputs/
 
 # OS / editor
 .DS_Store
-.vscode/
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
 .idea/
 
 # Secrets (Redshift creds, FCC API token)

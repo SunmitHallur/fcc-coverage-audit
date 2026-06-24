@@ -6,6 +6,7 @@
   <title>FCC Coverage Change Audit</title>
   <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
   <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+  <script src="https://unpkg.com/h3-js@4.1.0/dist/h3-js.umd.js"></script>
   <style>
     :root {
       --bg: #0b0f14;
@@ -52,17 +53,35 @@
     .pill.sev-high { background: rgba(245,158,11,.15); color: #fcd34d; }
     .pill.sev-moderate { background: rgba(59,130,246,.15); color: #93c5fd; }
     #detail {
-      position: absolute; top: 16px; right: 16px; width: 340px; max-height: calc(100% - 32px);
+      position: absolute; top: 16px; right: 16px; width: min(720px, calc(100% - 32px));
+      max-height: calc(100% - 32px);
       background: rgba(18,24,32,.96); backdrop-filter: blur(8px); border: 1px solid var(--border);
       border-radius: 14px; padding: 16px; overflow-y: auto; display: none; box-shadow: 0 12px 40px rgba(0,0,0,.35);
     }
     #detail.visible { display: block; }
     #detail h2 { margin: 0 0 6px; font-size: 16px; }
-    #detail .meta { color: var(--muted); font-size: 12px; margin-bottom: 12px; }
-    #detail .headline { font-size: 14px; line-height: 1.45; margin-bottom: 12px; }
-    #detail ul { margin: 0 0 12px; padding-left: 18px; font-size: 12px; line-height: 1.45; color: #cbd5e1; }
-    #detail .rec { background: var(--panel2); border: 1px solid var(--border); border-radius: 8px; padding: 10px; font-size: 12px; line-height: 1.4; }
+    #detail .meta { color: var(--muted); font-size: 12px; margin-bottom: 10px; }
+    #detail .headline { font-size: 14px; line-height: 1.45; margin-bottom: 10px; }
+    #detail ul { margin: 0 0 10px; padding-left: 18px; font-size: 12px; line-height: 1.45; color: #cbd5e1; }
+    #detail .rec { background: var(--panel2); border: 1px solid var(--border); border-radius: 8px; padding: 10px; font-size: 12px; line-height: 1.4; margin-bottom: 12px; }
     #detail .close { float: right; background: none; border: none; color: var(--muted); cursor: pointer; font-size: 18px; }
+    .tower-compare {
+      display: grid; grid-template-columns: 1fr auto 1fr; gap: 8px; align-items: center;
+      background: var(--panel2); border: 1px solid var(--border); border-radius: 10px;
+      padding: 10px 12px; margin-bottom: 12px; font-size: 12px;
+    }
+    .tower-compare .label { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .05em; }
+    .tower-compare .count { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
+    .tower-compare .arrow { color: var(--muted); font-size: 18px; text-align: center; }
+    .compare-maps { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 12px; }
+    .compare-panel { background: var(--panel2); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+    .compare-panel .panel-head {
+      padding: 8px 10px; font-size: 11px; color: var(--muted); border-bottom: 1px solid var(--border);
+      text-transform: uppercase; letter-spacing: .04em;
+    }
+    .compare-map { width: 100%; height: 220px; }
+    .detail-loading { color: var(--muted); font-size: 12px; padding: 8px 0; }
+    .detail-missing { color: var(--warn); font-size: 12px; padding: 8px 0; line-height: 1.4; }
     .toolbar {
       position: absolute; bottom: 16px; left: 16px; display: flex; gap: 8px; align-items: center;
       background: rgba(18,24,32,.92); border: 1px solid var(--border); border-radius: 10px; padding: 8px 12px; font-size: 12px;
@@ -117,6 +136,32 @@
         <h2 id="detail-title"></h2>
         <div class="meta" id="detail-meta"></div>
         <div class="headline" id="detail-headline"></div>
+        <div class="tower-compare" id="tower-compare" style="display:none">
+          <div>
+            <div class="label" id="tower-prior-label">Prior map</div>
+            <div class="count" id="tower-prior-count">—</div>
+            <div class="label">inferred towers</div>
+          </div>
+          <div class="arrow">→</div>
+          <div>
+            <div class="label" id="tower-current-label">Current map</div>
+            <div class="count" id="tower-current-count">—</div>
+            <div class="label" id="tower-delta-label">inferred towers</div>
+          </div>
+        </div>
+        <div id="compare-wrap">
+          <div class="detail-loading" id="detail-map-status">Select a county to compare coverage maps.</div>
+          <div class="compare-maps" id="compare-maps" style="display:none">
+            <div class="compare-panel">
+              <div class="panel-head" id="map-prior-label">Prior coverage</div>
+              <div id="map-prior" class="compare-map"></div>
+            </div>
+            <div class="compare-panel">
+              <div class="panel-head" id="map-current-label">Current coverage</div>
+              <div id="map-current" class="compare-map"></div>
+            </div>
+          </div>
+        </div>
         <ul id="detail-bullets"></ul>
         <div class="rec" id="detail-rec"></div>
       </div>
@@ -138,6 +183,138 @@
     let metricMode = 'priority'; // or 'change'
     let towerMarkers = [];
     let towersCache = {};
+    let compareMaps = { prior: null, current: null };
+    let detailCache = {};
+
+    const h3lib = window.h3 || window.H3;
+
+    function safeServiceKey(service) {
+      return String(service).replace(/\//g, '-').replace(/\s/g, '');
+    }
+
+    function signalColor(dbm) {
+      if (dbm >= -85) return '#1a7f37';
+      if (dbm >= -95) return '#3fb950';
+      if (dbm >= -105) return '#7ee787';
+      return '#aff5b4';
+    }
+
+    function hexesToGeoJSON(hexes, sites) {
+      const features = [];
+      (hexes || []).forEach(([cell, dbm]) => {
+        if (!h3lib || !h3lib.cellToBoundary) return;
+        const ring = h3lib.cellToBoundary(cell, true).map(([lat, lng]) => [lng, lat]);
+        ring.push(ring[0]);
+        features.push({
+          type: 'Feature',
+          properties: { dbm, color: signalColor(dbm) },
+          geometry: { type: 'Polygon', coordinates: [ring] }
+        });
+      });
+      (sites || []).forEach(s => {
+        features.push({
+          type: 'Feature',
+          properties: { kind: 'tower', site_class: s.site_class || 'site' },
+          geometry: { type: 'Point', coordinates: [s.lng, s.lat] }
+        });
+      });
+      return { type: 'FeatureCollection', features };
+    }
+
+    function boundsFromGeoJSON(geo) {
+      let minLng = Infinity, minLat = Infinity, maxLng = -Infinity, maxLat = -Infinity;
+      const visit = coords => {
+        if (typeof coords[0] === 'number') {
+          minLng = Math.min(minLng, coords[0]); maxLng = Math.max(maxLng, coords[0]);
+          minLat = Math.min(minLat, coords[1]); maxLat = Math.max(maxLat, coords[1]);
+        } else coords.forEach(visit);
+      };
+      (geo.features || []).forEach(f => visit(f.geometry.coordinates));
+      if (!Number.isFinite(minLng)) return null;
+      return [[minLng, minLat], [maxLng, maxLat]];
+    }
+
+    function destroyCompareMaps() {
+      ['prior', 'current'].forEach(k => {
+        if (compareMaps[k]) { compareMaps[k].remove(); compareMaps[k] = null; }
+      });
+    }
+
+    function renderCompareMap(containerId, geo) {
+      const mapObj = new maplibregl.Map({
+        container: containerId,
+        style: {
+          version: 8,
+          sources: {
+            osm: {
+              type: 'raster',
+              tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
+              tileSize: 256
+            }
+          },
+          layers: [{ id: 'osm', type: 'raster', source: 'osm' }]
+        },
+        center: [-98.5, 39.0],
+        zoom: 8,
+        attributionControl: false,
+        interactive: true
+      });
+      mapObj.on('load', () => {
+        mapObj.addSource('coverage', { type: 'geojson', data: geo });
+        mapObj.addLayer({
+          id: 'coverage-fill',
+          type: 'fill',
+          source: 'coverage',
+          filter: ['!=', ['get', 'kind'], 'tower'],
+          paint: {
+            'fill-color': ['get', 'color'],
+            'fill-opacity': 0.78
+          }
+        });
+        mapObj.addLayer({
+          id: 'coverage-outline',
+          type: 'line',
+          source: 'coverage',
+          filter: ['!=', ['get', 'kind'], 'tower'],
+          paint: { 'line-color': '#14532d', 'line-width': 0.3, 'line-opacity': 0.35 }
+        });
+        mapObj.addLayer({
+          id: 'tower-points',
+          type: 'circle',
+          source: 'coverage',
+          filter: ['==', ['get', 'kind'], 'tower'],
+          paint: {
+            'circle-radius': 5,
+            'circle-color': [
+              'match', ['get', 'site_class'],
+              'new_site', '#22c55e',
+              'expanded_site', '#f59e0b',
+              'prior_site', '#64748b',
+              '#ef4444'
+            ],
+            'circle-stroke-width': 1.5,
+            'circle-stroke-color': '#0f172a'
+          }
+        });
+        const b = boundsFromGeoJSON(geo);
+        if (b) mapObj.fitBounds(b, { padding: 24, maxZoom: 11, duration: 0 });
+      });
+      return mapObj;
+    }
+
+    async function loadCountyDetail(rec) {
+      const pid = rec.provider_id || currentProvider;
+      const svc = rec.service || currentService;
+      const geoid = rec.geoid;
+      const key = `${pid}/${safeServiceKey(svc)}/${geoid}`;
+      if (detailCache[key]) return detailCache[key];
+      const url = `${DATA_BASE}/details/${pid}/${safeServiceKey(svc)}/${geoid}.json`;
+      const res = await fetch(url);
+      if (!res.ok) return null;
+      const data = await res.json();
+      detailCache[key] = data;
+      return data;
+    }
 
     const map = new maplibregl.Map({
       container: 'map',
@@ -333,6 +510,58 @@
         ul.appendChild(li);
       });
       document.getElementById('detail-rec').textContent = rec.explanation?.recommendation || '';
+
+      const priorT = rec.metrics?.prior_towers;
+      const currentT = rec.metrics?.current_towers;
+      const tc = document.getElementById('tower-compare');
+      if (priorT != null || currentT != null) {
+        tc.style.display = 'grid';
+        document.getElementById('tower-prior-label').textContent = meta.prior_vintage || 'Prior map';
+        document.getElementById('tower-current-label').textContent = meta.current_vintage || 'Current map';
+        document.getElementById('tower-prior-count').textContent = priorT ?? '—';
+        document.getElementById('tower-current-count').textContent = currentT ?? '—';
+        const delta = (currentT ?? 0) - (priorT ?? 0);
+        document.getElementById('tower-delta-label').textContent =
+          delta > 0 ? `inferred towers (+${delta} new)` : 'inferred towers';
+      } else {
+        tc.style.display = 'none';
+      }
+
+      document.getElementById('detail-map-status').textContent = 'Loading coverage maps…';
+      document.getElementById('detail-map-status').className = 'detail-loading';
+      document.getElementById('compare-maps').style.display = 'none';
+      destroyCompareMaps();
+      loadCountyDetail(rec).then(detail => {
+        if (!detail) {
+          document.getElementById('detail-map-status').textContent =
+            'Coverage comparison maps not available yet — re-run the pipeline with build-web after processing.';
+          document.getElementById('detail-map-status').className = 'detail-missing';
+          return;
+        }
+        if (detail.towers_prior != null) {
+          tc.style.display = 'grid';
+          document.getElementById('tower-prior-count').textContent = detail.towers_prior;
+          document.getElementById('tower-current-count').textContent = detail.towers_current;
+          const delta = (detail.new_towers != null)
+            ? detail.new_towers
+            : detail.towers_current - detail.towers_prior;
+          document.getElementById('tower-delta-label').textContent =
+            delta > 0 ? `inferred towers (+${delta} new)` : 'inferred towers';
+        }
+        document.getElementById('map-prior-label').textContent =
+          detail.prior_vintage || meta.prior_vintage || 'Prior coverage';
+        document.getElementById('map-current-label').textContent =
+          detail.current_vintage || meta.current_vintage || 'Current coverage';
+        document.getElementById('detail-map-status').style.display = 'none';
+        document.getElementById('compare-maps').style.display = 'grid';
+        const priorGeo = hexesToGeoJSON(detail.prior_hexes, detail.sites_prior);
+        const currentGeo = hexesToGeoJSON(detail.current_hexes, detail.sites_current);
+        compareMaps.prior = renderCompareMap('map-prior', priorGeo);
+        compareMaps.current = renderCompareMap('map-current', currentGeo);
+      }).catch(() => {
+        document.getElementById('detail-map-status').textContent = 'Could not load coverage maps.';
+        document.getElementById('detail-map-status').className = 'detail-missing';
+      });
     }
 
     async function loadTowers(show) {
@@ -347,7 +576,9 @@
         } catch { towersCache[pid] = []; }
       }
       const svc = currentService;
-      towersCache[pid].filter(t => !t.service || t.service === svc).forEach(t => {
+      towersCache[pid].filter(t =>
+        (!t.service || t.service === svc) && (!t.vintage || t.vintage === 'current')
+      ).forEach(t => {
         const el = document.createElement('div');
         const colors = { new_site: '#22c55e', expanded_site: '#f59e0b', stable_site: '#94a3b8' };
         el.style.cssText = `width:8px;height:8px;border-radius:50%;background:${colors[t.site_class] || '#94a3b8'};border:1px solid #0006`;
@@ -368,7 +599,10 @@
     document.getElementById('search').addEventListener('input', renderList);
     document.getElementById('flagged-only').addEventListener('change', () => { applyFeatureStates(); });
     document.getElementById('show-towers').addEventListener('change', e => loadTowers(e.target.checked));
-    document.getElementById('detail-close').addEventListener('click', () => document.getElementById('detail').classList.remove('visible'));
+    document.getElementById('detail-close').addEventListener('click', () => {
+      document.getElementById('detail').classList.remove('visible');
+      destroyCompareMaps();
+    });
     document.getElementById('metric-toggle').addEventListener('click', () => {
       metricMode = metricMode === 'priority' ? 'change' : 'priority';
       document.getElementById('metric-toggle').textContent = `Metric: ${metricMode}`;

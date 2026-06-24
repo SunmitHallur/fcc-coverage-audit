@@ -1,0 +1,56 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Run pipeline (Redshift)",
+      "type": "shell",
+      "windows": {
+        "command": ".venv\\Scripts\\python.exe -m fcc_audit.cli --backend redshift run --build-web"
+      },
+      "linux": {
+        "command": ".venv/bin/python -m fcc_audit.cli --backend redshift run --build-web"
+      },
+      "osx": {
+        "command": ".venv/bin/python -m fcc_audit.cli --backend redshift run --build-web"
+      },
+      "options": {
+        "env": { "PYTHONPATH": "${workspaceFolder}/src" },
+        "cwd": "${workspaceFolder}"
+      },
+      "group": "build"
+    },
+    {
+      "label": "Build web bundle",
+      "type": "shell",
+      "windows": {
+        "command": ".venv\\Scripts\\python.exe -m fcc_audit.cli build-web"
+      },
+      "linux": {
+        "command": ".venv/bin/python -m fcc_audit.cli build-web"
+      },
+      "osx": {
+        "command": ".venv/bin/python -m fcc_audit.cli build-web"
+      },
+      "options": {
+        "env": { "PYTHONPATH": "${workspaceFolder}/src" },
+        "cwd": "${workspaceFolder}"
+      }
+    },
+    {
+      "label": "Serve website locally",
+      "type": "shell",
+      "windows": {
+        "command": ".venv\\Scripts\\python.exe -m http.server 8000"
+      },
+      "linux": {
+        "command": ".venv/bin/python -m http.server 8000"
+      },
+      "osx": {
+        "command": ".venv/bin/python -m http.server 8000"
+      },
+      "options": { "cwd": "${workspaceFolder}/web" },
+      "isBackground": true,
+      "problemMatcher": []
+    }
+  ]
+}
