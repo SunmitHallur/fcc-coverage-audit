@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-06-24T15:23:53.956862+00:00",
+  "generated_at": "2026-06-24T18:01:16.798920+00:00",
   "current_vintage": "2025-12-31",
   "prior_vintage": "2025-06-30",
   "providers": [
@@ -23,7 +23,8 @@
   "services": [
     "5G-NR 7/1"
   ],
-  "total_records": 7,
-  "flagged_count": 2,
-  "states_processed": "all"
+  "total_records": 1,
+  "flagged_count": 1,
+  "states_processed": "demo-1-county",
+  "demo_note": "Single-county demo: T-Mobile Charlie (fixture gaming case)"
 }
