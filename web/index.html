@@ -504,6 +504,28 @@
       return (records[pid] && records[pid][svc]) ? records[pid][svc] : {};
     }
 
+    function preferredProviderId() {
+      if (meta.default_provider_id != null) return String(meta.default_provider_id);
+      let best = null;
+      let bestFlagged = -1;
+      const svc = (meta.services || [])[0];
+      (meta.providers || []).forEach(p => {
+        const pid = String(p.id);
+        const n = Object.values(providerRecords(pid, svc)).filter(r => r.flag).length;
+        if (n > bestFlagged) {
+          bestFlagged = n;
+          best = pid;
+        }
+      });
+      return best || String(meta.providers?.[0]?.id || '');
+    }
+
+    function fitMapToCounties() {
+      if (!countiesGeo?.features?.length) return;
+      const b = boundsFromGeoJSON(countiesGeo);
+      if (b) map.fitBounds(b, { padding: 48, maxZoom: 9, duration: 0 });
+    }
+
     function fillDropdowns() {
       const pSel = document.getElementById('provider');
       const sSel = document.getElementById('service');
@@ -521,6 +543,7 @@
         o.textContent = s;
         sSel.appendChild(o);
       });
+      pSel.value = preferredProviderId();
       currentProvider = pSel.value;
       currentService = sSel.value;
       document.getElementById('vintage-label').textContent =
@@ -620,7 +643,10 @@
       const list = document.getElementById('list');
       list.innerHTML = '';
       if (!rows.length) {
-        list.innerHTML = '<div class="err">No flagged counties for this provider/service yet. Process more state batches and run build-web.</div>';
+        const n = Object.keys(recs).length;
+        list.innerHTML = n
+          ? '<div class="err">No flagged counties for this provider/service. Try another provider from the dropdown.</div>'
+          : '<div class="err">No county data for this provider/service yet. Run the pipeline with <code>--build-web</code>.</div>';
         return;
       }
       rows.forEach(r => {
@@ -846,7 +872,7 @@
         fillDropdowns();
         setupMapLayers();
         renderList();
-        map.fitBounds([[-125, 24], [-66, 50]], { padding: 40 });
+        fitMapToCounties();
         loader.classList.add('hidden');
         setTimeout(() => loader.remove(), 400);
       } catch (e) {

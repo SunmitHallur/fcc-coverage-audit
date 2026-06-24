@@ -2,28 +2,18 @@
   "generated_at": "2026-06-24T18:14:17.098714+00:00",
   "current_vintage": "2025-12-31",
   "prior_vintage": "2025-06-30",
+  "default_provider_id": 130403,
   "providers": [
-    {
-      "id": 130077,
-      "name": "AT&T"
-    },
-    {
-      "id": 130235,
-      "name": "UScellular"
-    },
     {
       "id": 130403,
       "name": "T-Mobile"
-    },
-    {
-      "id": 131425,
-      "name": "Verizon"
     }
   ],
   "services": [
     "5G-NR 7/1"
   ],
-  "total_records": 7,
-  "flagged_count": 2,
-  "states_processed": "all"
+  "total_records": 1,
+  "flagged_count": 1,
+  "states_processed": "demo",
+  "demo_note": "Single-county demo: T-Mobile Charlie County (fixture gaming case)"
 }
