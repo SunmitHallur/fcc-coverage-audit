@@ -107,11 +107,25 @@ def coverage_to_hex(
     return pd.DataFrame({"h3": list(best.keys()), "signal_dbm": list(best.values())})
 
 
+def _is_fixture_county_cache(gdf: gpd.GeoDataFrame) -> bool:
+    """True when the cached counties file is synthetic fixture geography."""
+    if len(gdf) < 100:
+        return True
+    states = gdf["state_fips"].astype(str).unique()
+    return len(states) == 1 and states[0] == "90"
+
+
 def load_counties(cfg: Config) -> gpd.GeoDataFrame:
     """Load (and cache/download) TIGER county boundaries in EPSG:4326."""
     cache = cfg.path("interim") / "tl_us_county.gpkg"
     if cache.exists():
-        return gpd.read_file(cache)
+        gdf = gpd.read_file(cache)
+        # Fixture runs write a 4-county synthetic layer; replace it for real FCC runs.
+        if cfg.backend != "fixture" and _is_fixture_county_cache(gdf):
+            log.info("replacing fixture county cache with TIGER/Line boundaries")
+            cache.unlink()
+        else:
+            return gdf
 
     url = cfg.geography["counties_url"]
     raw = cfg.path("raw") / "tl_us_county.zip"
@@ -190,15 +204,26 @@ def assign_counties(hex_df: pd.DataFrame, counties: gpd.GeoDataFrame) -> pd.Data
     """Attach county attributes via each hex centroid (point-in-polygon join)."""
     if hex_df.empty:
         return hex_df.assign(county_geoid=None, county_name=None, state_fips=None)
-    centers = [h3.cell_to_latlng(c) for c in hex_df["h3"]]
+    base = hex_df[["h3", "signal_dbm"]].copy()
+    centers = [h3.cell_to_latlng(c) for c in base["h3"]]
     pts = gpd.GeoDataFrame(
-        hex_df.copy(),
+        base,
         geometry=gpd.points_from_xy(
             [lng for _lat, lng in centers], [lat for lat, _lng in centers]
         ),
         crs="EPSG:4326",
     )
     joined = gpd.sjoin(pts, counties, how="left", predicate="within")
+    # Drop sjoin index column; prefer right (TIGER) attrs when both sides exist.
+    if "index_right" in joined.columns:
+        joined = joined.drop(columns=["index_right"])
+    for col in ["county_geoid", "county_name", "state_fips"]:
+        right = f"{col}_right"
+        if right in joined.columns:
+            joined[col] = joined[right]
+            joined = joined.drop(columns=[c for c in joined.columns if c.endswith("_right") or c.endswith("_left")])
+        elif col not in joined.columns:
+            joined[col] = None
     return pd.DataFrame(
         joined[["h3", "signal_dbm", "county_geoid", "county_name", "state_fips"]]
     )
