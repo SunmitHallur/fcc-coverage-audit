@@ -256,15 +256,34 @@ class FccDownloadSource(DataSource):
             file_id=row["id"],
             file_type=self.file_format,
         )
-        resp = self._get(url, stream=True,
-                          headers={"accept": "application/zip, application/octet-stream, */*"})
         tmp = dest.with_suffix(dest.suffix + ".part")
-        with open(tmp, "wb") as fh:
-            for chunk in resp.iter_content(chunk_size=1 << 20):
-                if chunk:
-                    fh.write(chunk)
-        tmp.rename(dest)
-        return dest
+        last_exc: Exception | None = None
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                resp = self._get(
+                    url,
+                    stream=True,
+                    headers={"accept": "application/zip, application/octet-stream, */*"},
+                )
+                with open(tmp, "wb") as fh:
+                    for chunk in resp.iter_content(chunk_size=1 << 20):
+                        if chunk:
+                            fh.write(chunk)
+                tmp.rename(dest)
+                return dest
+            except (requests.RequestException, OSError) as exc:
+                last_exc = exc
+                if tmp.exists():
+                    tmp.unlink(missing_ok=True)
+                backoff = min(60, 2 ** attempt)
+                log.warning(
+                    "download %s failed (attempt %d/%d): %s - retry in %ss",
+                    dest.name, attempt, self.max_retries, exc, backoff,
+                )
+                time.sleep(backoff)
+        raise RuntimeError(
+            f"download {dest.name} failed after {self.max_retries} attempts"
+        ) from last_exc
 
     @staticmethod
     def _read_coverage_zip(zip_path: Path):
