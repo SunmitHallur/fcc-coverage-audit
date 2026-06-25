@@ -349,7 +349,9 @@ class FccDownloadSource(DataSource):
         if not parts:
             raise RuntimeError(f"Downloaded 0 readable files for provider {provider_id} {technology}")
         gdf = gpd.GeoDataFrame(pd.concat(parts, ignore_index=True), crs=parts[0].crs)
-        gdf.to_file(merged, driver="GPKG")
+        tmp = merged.with_suffix(merged.suffix + ".part")
+        gdf.to_file(tmp, driver="GPKG")
+        tmp.replace(merged)
         return CoverageFile(provider_id, technology, vintage, merged)
 
 
