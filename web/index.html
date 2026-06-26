@@ -978,6 +978,11 @@
       if (b) map.fitBounds(b, { padding: 48, maxZoom: 9, duration: 0 });
     }
 
+    function fitMapToUS() {
+      // Zoom to the contiguous US on initial load so the user picks where to look.
+      map.fitBounds([[-125.0, 24.5], [-66.5, 49.5]], { padding: 32, duration: 600 });
+    }
+
     function fillDropdowns() {
       const pSel = document.getElementById('provider');
       const sSel = document.getElementById('service');
@@ -1586,8 +1591,7 @@
         setupMapLayers();
         initThresholdSlider();
         renderList();
-        fitMapToCounties();
-        openDemoCounty();
+        fitMapToUS();
         loader.classList.add('hidden');
         setTimeout(() => loader.remove(), 400);
       } catch (e) {
