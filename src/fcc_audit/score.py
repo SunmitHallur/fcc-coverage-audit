@@ -134,7 +134,10 @@ def score(features: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     else:
         df["anomaly_score"] = df["risk_score"]
 
-    df["priority_score"] = 0.7 * df["risk_score"] + 0.3 * df["anomaly_score"]
+    # Rescale to [0, 1] so the score is always on a consistent absolute scale
+    # regardless of how compressed the input features are (small batches in
+    # particular can produce a weighted sum that only spans e.g. 0.00–0.10).
+    df["priority_score"] = _minmax(0.7 * df["risk_score"] + 0.3 * df["anomaly_score"])
 
     flag_pct = float(cfg.scoring["flag_percentile"])
     threshold = df["priority_score"].quantile(flag_pct) if len(df) > 1 else 0.0

@@ -1534,11 +1534,21 @@
     function initThresholdSlider() {
       const recs = providerRecords(currentProvider, currentService);
       const scores = Object.values(recs).map(r => r.priority || 0).filter(Boolean).sort((a,b) => a - b);
-      if (!scores.length) return;
-      const pct90 = scores[Math.floor(scores.length * 0.9)] || 0;
       const slider = document.getElementById('thresh-slider');
-      slider.max = (Math.ceil(Math.max(...scores) * 100) / 100).toFixed(2);
-      slider.value = pct90.toFixed(2);
+      // Always span [0, 1] — the full valid score range — regardless of how
+      // compressed the actual scores are in this dataset.
+      slider.min   = '0';
+      slider.max   = '1';
+      slider.step  = '0.001';
+      if (!scores.length) {
+        slider.value = '0';
+        document.getElementById('thresh-val').textContent = '—';
+        return;
+      }
+      // Default to the 90th-percentile score (mirrors the pipeline's flag_percentile).
+      const idx   = Math.min(Math.floor(scores.length * 0.9), scores.length - 1);
+      const pct90 = scores[idx] ?? 0;
+      slider.value = pct90.toFixed(3);
       applyLiveThreshold(pct90);
     }
 
