@@ -120,7 +120,7 @@
     }
     .grad-bar {
       height: 10px; border-radius: 4px;
-      background: linear-gradient(to right, rgb(140,0,0), rgb(214,40,40), rgb(240,110,36), rgb(250,166,40), rgb(250,214,48), rgb(176,214,64), rgb(58,188,92), rgb(28,178,178));
+      background: linear-gradient(to right, rgb(200,55,45), rgb(235,120,40), rgb(245,185,52), rgb(220,215,58), rgb(140,200,72), rgb(60,185,95), rgb(30,180,155), rgb(28,178,178));
       border: 1px solid rgba(255,255,255,.08);
     }
     .colorblind-note {
@@ -465,7 +465,7 @@
             <span class="grad-label">−120 dBm (weak)</span>
             <div class="grad-bar" role="img" aria-label="Signal strength gradient from weak dark-red at -120 dBm to strong teal at -50 dBm"></div>
             <span class="grad-label">−50 dBm (strong)</span>
-            <p class="colorblind-note">Signal strength uses the FCC red→orange→yellow→green→teal scale; check tower markers and labels if colors are hard to distinguish.</p>
+            <p class="colorblind-note">Signal strength uses a red→orange→yellow→green→teal scale (shifted toward green for visibility, since most coverage sits at the weak end); check tower markers if colors are hard to distinguish.</p>
           </div>
         </div>
         <div class="section-label">Analysis</div>
@@ -542,20 +542,20 @@
       return String(service).replace(/\//g, '-').replace(/\s/g, '');
     }
 
-    /** FCC-style heat map colors (strong → fringe), similar to BDC map legend. */
-    // FCC broadbandmap.fcc.gov RSRP color scale: dark-red (weak) → red → orange →
-    // yellow → green → teal (strong). Piecewise-linear over the published dBm stops
-    // so the common -100/-90 dBm band reads ORANGE (as on the FCC maps), not red,
-    // and strong tower cores (-60/-50) read green/teal.
+    /** Heat-map color scale (weak → strong), shifted toward green/yellow. */
+    // Real FCC mobile coverage clusters at the weak end (-100 to -120 dBm), so the
+    // strict RSRP scale (green only at -60/-50) renders almost everything red. This
+    // ramp is shifted ~20 dB warmer for visibility: the common mid band (-85 to
+    // -100) reads yellow/green and red is reserved for the very weakest fringe.
     const _SIGNAL_STOPS = [
-      [-120, [140, 0, 0]],
-      [-110, [214, 40, 40]],
-      [-100, [240, 110, 36]],
-      [-90,  [250, 166, 40]],
-      [-80,  [250, 214, 48]],
-      [-70,  [176, 214, 64]],
-      [-60,  [58, 188, 92]],
-      [-50,  [28, 178, 178]],
+      [-125, [200, 55, 45]],
+      [-118, [235, 120, 40]],
+      [-110, [245, 185, 52]],
+      [-102, [220, 215, 58]],
+      [-94,  [140, 200, 72]],
+      [-85,  [60, 185, 95]],
+      [-72,  [30, 180, 155]],
+      [-55,  [28, 178, 178]],
     ];
     function signalColor(dbm) {
       const stops = _SIGNAL_STOPS;
