@@ -78,6 +78,11 @@ def explain_row(row: pd.Series | dict[str, Any]) -> dict[str, Any]:
             f"{provider} reported a large {service} coverage increase in {county} "
             f"but attributed most of it to existing towers — not new construction."
         )
+    elif not flagged and same_site >= 0.3 and added_km2 > 0:
+        headline = (
+            f"{provider} expanded {service} coverage in {county} through upgrades "
+            f"to existing towers — a normal 6-month growth pattern."
+        )
     elif flagged and unattributed >= 0.3:
         headline = (
             f"{provider}'s new {service} coverage in {county} does not line up with "
@@ -143,10 +148,18 @@ def explain_row(row: pd.Series | dict[str, Any]) -> dict[str, Any]:
             f"and {'are' if max(current_cross, prior_cross) != 1 else 'is'} included in these counts."
         )
     if same_site >= 0.3:
-        bullets.append(
-            f"{_pct(same_site)} of the new coverage is attributed to towers that already existed "
-            f"— the provider claims existing sites got stronger, not that new ones were built."
-        )
+        if flagged:
+            bullets.append(
+                f"{_pct(same_site)} of the new coverage is attributed to towers that already "
+                f"existed — the provider claims existing sites got stronger, not that new ones "
+                f"were built."
+            )
+        else:
+            bullets.append(
+                f"{_pct(same_site)} of growth comes from upgrades to existing towers "
+                f"(antenna additions, carrier aggregation, or software improvements) — "
+                f"typical for mid-cycle filings."
+            )
     if new_site >= 0.3:
         if new_cross:
             bullets.append(

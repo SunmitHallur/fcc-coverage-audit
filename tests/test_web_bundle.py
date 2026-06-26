@@ -76,5 +76,5 @@ def test_write_county_details_creates_files(tmp_path):
     blob = json.loads(out.read_text())
     assert blob["towers_prior"] == 1
     assert blob["towers_current"] == 2
-    assert blob.get("prior_map") == "prior.png"
-    assert (out.parent / "90003" / "prior.png").exists()
+    # PNG rendering is opt-in (render_pngs=False by default); prior_map key should be absent.
+    assert blob.get("prior_map") is None

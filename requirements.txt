@@ -37,5 +37,13 @@ mercantile==1.2.1
 # --- Redshift backend (work laptop / warehouse path) ---
 redshift-connector==2.1.5
 
+# --- SHAP feature explanations (optional; used by validate.py when available) ---
+shap==0.47.2
+
 # --- dev / testing (optional) ---
 pytest==8.4.2
+pytest-timeout==2.4.0
+pytest-cov==6.2.1
+hypothesis==6.136.2
+ruff==0.12.0
+mypy==1.16.1

@@ -23,9 +23,11 @@ from fcc_audit.acquire import get_source  # noqa: E402
 from fcc_audit.cli import _resolve_providers, process_provider  # noqa: E402
 from fcc_audit.config import load_config  # noqa: E402
 
-ATT = 130077       # AT&T - builds a genuine new tower
-TMOBILE = 130403   # T-Mobile - inflates an existing tower (gaming)
-CHARLIE = "90003"  # county where both the new build and the inflation land
+ATT = 130077         # AT&T - builds a genuine new tower
+TMOBILE = 130403     # T-Mobile - inflates an existing tower (gaming)
+USCELLULAR = 130235  # UScellular - single tower, smooth organic expansion (must NOT flag)
+CHARLIE = "90003"    # county where both the new build and the inflation land
+ALPHA = "90001"      # county where UScellular's single-tower smooth expansion lands
 
 
 @pytest.fixture(scope="module")
@@ -69,9 +71,34 @@ def test_gaming_case_is_top_flagged(scored):
 
 def test_inflated_site_attributed_to_existing(scored):
     tmo = _row(scored, TMOBILE, CHARLIE)
-    # Nearly all growth comes from the SAME (existing) site -> gaming signal.
-    assert tmo["same_site_growth_share"] >= 0.65
+    # After the lobe-reach fix, all growth is correctly attributed to the same
+    # existing tower (no fringe hexes mis-labelled as unattributed).
+    assert tmo["same_site_growth_share"] >= 0.80
     assert tmo["new_site_share"] <= 0.1
+
+
+def test_smooth_single_tower_expansion_not_flagged(scored):
+    """A single existing tower that modestly grows its lobe must NOT be flagged.
+
+    UScellular in Alpha County has exactly one tower before and after, with a
+    ~47% area increase (7.0 -> 8.5 km radius). This represents normal organic
+    growth (antenna upgrade, carrier add) and should never be flagged. This
+    test guards the Phase 0 attribution + flag-logic fix against regression.
+    """
+    usc = _row(scored, USCELLULAR, ALPHA)
+    # Single matched tower -> ~100% same_site after lobe-reach fix.
+    assert usc["same_site_growth_share"] >= 0.80, (
+        f"Expected same_site_growth_share >= 0.80 but got {usc['same_site_growth_share']:.2f}; "
+        "lobe-reach attribution may have regressed"
+    )
+    # Small area increase relative to county -> must not trigger implausibility gate.
+    assert usc.get("added_frac_of_county", 0.0) < 0.10, (
+        "UScellular smooth expansion added too large a fraction of county area"
+    )
+    # Must not be flagged — this is the core regression guard.
+    assert bool(usc["flag_for_review"]) is False, (
+        "Single-tower smooth organic expansion was incorrectly flagged"
+    )
 
 
 def test_new_tower_buildout_not_flagged(scored):

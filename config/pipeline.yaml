@@ -87,8 +87,12 @@ analysis:
 # ---------------------------------------------------------------------------
 geography:
   equal_area_crs: "EPSG:5070"      # USA Contiguous Albers (for area / distance math)
-  county_h3_resolution: 8          # matches FCC mobile-audit hex geography (~0.7 km^2)
-  site_h3_resolution: 9            # finer res for tower-cluster inference
+  # Resolution 9 (~0.1 km^2 per hex) matches FCC broadbandmap.fcc.gov rendering
+  # fidelity and gives ~7x more detail than the legacy res-8 (~0.7 km^2).
+  # Use res 10 (~0.015 km^2) for maximum fidelity when compute allows — requires
+  # the DuckDB rollup path (duckdb-perf) for acceptable memory at national scale.
+  county_h3_resolution: 9          # FCC-map fidelity (~0.1 km^2)
+  site_h3_resolution: 10           # finer res for tower-cluster inference
   # TIGER/Line county boundaries. Auto-downloaded if absent.
   counties_url: "https://www2.census.gov/geo/tiger/TIGER2024/COUNTY/tl_2024_us_county.zip"
 
@@ -101,7 +105,14 @@ towers:
   # A site is inferred per CONTIGUOUS blob of such hexes (H3 adjacency), so one
   # tower yields one site regardless of footprint size.
   min_signal_band_dbm: -95
-  min_site_hexes: 5                # ignore tiny specks below this many hexes
+  # Minimum hexes in a site blob. Scale with resolution so the minimum physical
+  # area is ~0.35 km^2 regardless of H3 resolution:
+  #   res 8  (~0.737 km^2/hex) ->  5 hexes (~3.7 km^2)  -- legacy
+  #   res 9  (~0.105 km^2/hex) -> 35 hexes (~3.7 km^2)
+  #   res 10 (~0.015 km^2/hex) -> 25 hexes (~0.38 km^2)
+  # The pipeline auto-scales this when site_h3_resolution != 9; the value here
+  # is the reference for site_h3_resolution 10 (current default).
+  min_site_hexes: 25               # for site_h3_resolution 10
   # Two inferred sites within this distance (meters) across vintages are
   # treated as the same physical site (matched), else "new".
   site_match_radius_m: 2000
@@ -127,13 +138,21 @@ reconcile:
 scoring:
   # A county-provider is "flagged" if its anomaly percentile is at/above this.
   flag_percentile: 0.90
-  # Increases larger than this fraction of prior coverage attributed to the
-  # SAME existing sites (not new towers) are inherently suspicious.
+  # Fraction of new coverage attributed to SAME existing sites above which the
+  # same-site growth signal fires. Must ALSO be paired with an implausibility
+  # gate (below) — high same-site share alone is normal 6-month growth.
   suspicious_same_site_growth: 0.50
+  # Implausibility gates: at least ONE must fire alongside same_site_growth for
+  # a county to be flagged via the same-site path. This prevents flagging normal
+  # single-tower expansions (antenna/carrier upgrades, modest lobe growth).
+  suspicious_same_site_min_county_frac: 0.15   # added_frac_of_county threshold
+  suspicious_same_site_min_blanket: 0.20        # blanket_fillin threshold
+  suspicious_same_site_min_unattributed: 0.20   # unattributed_share threshold
   # Magnitude gate (learned from FCC examples): a county must add at least this
   # much in-county 5G coverage to be eligible for flagging. Prevents flagging
   # near-empty counties (e.g. Edmunds, SD) or non-area-increasing signal shifts
-  # (e.g. Menard, TX). Set higher for nationwide runs; ~10 works for pilots.
+  # (e.g. Menard, TX). At res 9/10, area math is more precise so this threshold
+  # is reliable across resolutions; ~10 km^2 works for pilots and nationwide runs.
   min_added_km2_to_flag: 10.0
   # Weight of each risk feature in the composite priority score.
   # Positive = raises suspicion; negative = lowers it. Features not listed are
@@ -154,6 +173,10 @@ scoring:
     new_site_share: -0.10               # growth from genuine new towers
     # signal_jump_implausibility: 0.0   # available; off (Menard-type degradation ignored)
     # historical_volatility: 0.10       # enable once >2 vintages are processed
+    # --- independent ground-truth corroboration (optional; 0 when data absent) ---
+    # These are the strongest gaming signals when combined with same-site growth.
+    asr_no_new_structure: 0.12          # no registered structure built in window
+    measurement_gap: 0.10               # coverage claimed but nobody measured it
 
 # ---------------------------------------------------------------------------
 # Ground-truth benchmark (from FCC J25 vs D25 5G 7/1 Mbps example slides).
@@ -195,3 +218,13 @@ paths:
   interim: "data/interim"
   processed: "data/processed"
   outputs: "data/outputs"
+
+# ---------------------------------------------------------------------------
+# Optional LLM narrative backend (default: none — deterministic only)
+# ---------------------------------------------------------------------------
+llm:
+  backend: "none"            # none | local | gemini
+  local_url: "http://localhost:11434"   # Ollama or llama.cpp server
+  model: "llama3"            # model name (for local backend)
+  gemini_model: "gemini-1.5-flash"     # model name (for gemini backend)
+  # gemini_api_key: ""       # set here or via GEMINI_API_KEY env var

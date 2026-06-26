@@ -1,0 +1,18 @@
+# ruff configuration for fcc-coverage-audit
+line-length = 100
+
+[lint]
+select = ["E", "F", "W", "I"]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+    "E741",   # ambiguous variable name (l, O, I) — used in math contexts
+    "F401",   # unused import (some are re-exports in shim modules)
+]
+
+[lint.per-file-ignores]
+"tests/*" = ["F811"]      # allow re-definition in tests
+"src/fcc_audit/report.py" = ["F401"]  # shim re-exports
+
+[format]
+quote-style = "double"
+indent-style = "space"

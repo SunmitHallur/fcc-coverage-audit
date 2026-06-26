@@ -76,12 +76,41 @@ def coverage_to_hex(
     """
     import time
 
-    best: dict[str, float] = {}
     total = len(gdf)
-    signals = gdf[signal_col] if signal_col else [None] * total
     log_every = 250_000
     start = time.monotonic()
-    for i, (geom, sig) in enumerate(zip(gdf.geometry, signals)):
+
+    def _cells_for(geom) -> list[str]:
+        try:
+            return h3.geo_to_cells(geom, resolution)
+        except Exception:  # noqa: BLE001 - h3 raises on odd geometries
+            pt = geom.representative_point()
+            return [h3.latlng_to_cell(pt.y, pt.x, resolution)]
+
+    # Flat-coverage fast path: with no signal column only the SET of covered
+    # cells matters, so we union C-level cell lists instead of doing a per-cell
+    # Python comparison. Much faster on large national files.
+    if signal_col is None:
+        covered: set[str] = set()
+        for i, geom in enumerate(gdf.geometry):
+            if i and i % log_every == 0:
+                elapsed = time.monotonic() - start
+                rate = i / elapsed if elapsed else 0.0
+                eta = (total - i) / rate if rate else 0.0
+                log.info(
+                    "    H3-indexing %s/%s polygons (%.0f/s, ~%.0fs left, %s hexes so far)",
+                    f"{i:,}", f"{total:,}", rate, eta, f"{len(covered):,}",
+                )
+            if geom is None or geom.is_empty:
+                continue
+            covered.update(_cells_for(geom))
+        if not covered:
+            return pd.DataFrame(columns=["h3", "signal_dbm"])
+        return pd.DataFrame({"h3": list(covered), "signal_dbm": 0.0})
+
+    best: dict[str, float] = {}
+    best_get = best.get
+    for i, (geom, sig) in enumerate(zip(gdf.geometry, gdf[signal_col])):
         if i and i % log_every == 0:
             elapsed = time.monotonic() - start
             rate = i / elapsed if elapsed else 0.0
@@ -92,15 +121,10 @@ def coverage_to_hex(
             )
         if geom is None or geom.is_empty:
             continue
-        dbm = _to_dbm(sig) if sig is not None else 0.0
-        try:
-            cells = h3.geo_to_cells(geom, resolution)
-        except Exception:  # noqa: BLE001 - h3 raises on odd geometries
-            # Fall back to filling the geometry's representative point.
-            pt = geom.representative_point()
-            cells = [h3.latlng_to_cell(pt.y, pt.x, resolution)]
-        for c in cells:
-            if c not in best or dbm > best[c]:
+        dbm = _to_dbm(sig)
+        for c in _cells_for(geom):
+            cur = best_get(c)
+            if cur is None or dbm > cur:
                 best[c] = dbm
     if not best:
         return pd.DataFrame(columns=["h3", "signal_dbm"])
@@ -282,7 +306,12 @@ def normalize_layers(
 
     # Parent rollup requires site_res to be strictly finer than county_res.
     # Otherwise fall back to indexing each resolution independently.
-    if site_res <= county_res:
+    if site_res == county_res:
+        # Same grid for county + site work: index ONCE and reuse (avoids a second
+        # full polyfill). This is the fast configuration for large national runs.
+        df = normalize_layer(cfg, cov, counties, county_res, service_label)
+        return df, df
+    if site_res < county_res:
         return (
             normalize_layer(cfg, cov, counties, county_res, service_label),
             normalize_layer(cfg, cov, counties, site_res, service_label),

@@ -1,0 +1,65 @@
+name: Fixture Tests
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+    branches: ["main", "master"]
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest-cov
+
+      - name: Run offline fixture tests
+        run: |
+          pytest tests/test_pipeline.py tests/test_validate.py tests/test_attribute.py \
+                 tests/test_web_bundle.py tests/test_property.py \
+            -v --tb=short -x --timeout=120 \
+            --cov=fcc_audit --cov-report=term-missing --cov-fail-under=40
+        env:
+          PYTHONPATH: src
+
+      - name: Reproduce-from-clean-clone check
+        run: |
+          python - <<'EOF'
+          import sys, pathlib
+          sys.path.insert(0, "src")
+          from fcc_audit import fixtures, config
+          cfg = config.load_config("config/pipeline.yaml")
+          rows = fixtures.make_fixtures(cfg)
+          assert len(rows) > 0, "make_fixtures returned empty"
+          print(f"OK: {len(rows)} fixture rows generated")
+          EOF
+        env:
+          PYTHONPATH: src
+
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install ruff
+        run: pip install ruff
+      - name: Run ruff
+        run: ruff check src/ tests/ --select E,F,W,I --ignore E501

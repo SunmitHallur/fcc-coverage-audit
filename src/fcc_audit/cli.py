@@ -71,6 +71,12 @@ def _analyze_unit(
     current_sites = attribute.match_sites(
         prior_sites, current_sites, float(cfg.towers["site_match_radius_m"])
     )
+    # Compute empirical lobe reach from full-band coverage so fringe hexes
+    # (beyond the strong-signal core) are attributed to their tower rather
+    # than being mis-classified as 'unattributed'. A single matched tower
+    # will capture ~100% of its gained hexes after this step.
+    current_sites = towers.compute_lobe_reach(cur9, current_sites)
+    prior_sites = towers.compute_lobe_reach(pri9, prior_sites)
 
     attr = attribute.attribute_changes(change, current_sites, county_res)
     bsnap = normalize.boundary_snap_share(
@@ -202,6 +208,31 @@ def process_provider(
     return feats, sites, coverage
 
 
+def _provider_worker(payload: dict) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Process one provider in a separate process (for ``run --workers N``).
+
+    Each worker rebuilds its own config/source/counties so nothing large needs
+    to be pickled across the process boundary; results are identical to the
+    serial path. Intended for use after raw files are already downloaded, so
+    workers do CPU-bound H3 indexing in parallel without multiplying the FCC
+    request rate.
+    """
+    setup_logging(payload.get("verbose", False))
+    cfg = load_config(payload["config"])
+    if payload.get("backend"):
+        cfg.raw["source"]["backend"] = payload["backend"]
+    cfg.set_states(payload["states"])
+    source = get_source(cfg)
+    counties = normalize.load_counties(cfg)
+    area = normalize.county_areas_km2(counties, cfg.geography["equal_area_crs"])
+    provider = Provider(**payload["provider"])
+    return process_provider(
+        cfg, source, provider,
+        payload["current"], payload["prior"],
+        counties, area, payload["cleanup_raw"],
+    )
+
+
 def _resolve_providers(cfg: Config, source: DataSource, vintage: str) -> list[Provider]:
     """Explicit provider list, or auto-discovered from the catalog when 'all'."""
     if cfg.providers_all:
@@ -263,17 +294,44 @@ def cmd_run(cfg: Config, args) -> int:
 
     providers = _resolve_providers(cfg, source, current)
     cleanup_raw = bool(getattr(args, "cleanup_raw", False)) and cfg.raw["source"]["backend"] != "fixture"
+    workers = max(1, int(getattr(args, "workers", 1) or 1))
     all_feats, all_sites, all_coverage = [], [], []
-    for provider in providers:
-        feats, sites, coverage = process_provider(
-            cfg, source, provider, current, prior, counties, county_area_km2, cleanup_raw
-        )
+
+    def _collect(result):
+        feats, sites, coverage = result
         if not feats.empty:
             all_feats.append(feats)
         if not sites.empty:
             all_sites.append(sites)
         if not coverage.empty:
             all_coverage.append(coverage)
+
+    if workers > 1 and len(providers) > 1:
+        from concurrent.futures import ProcessPoolExecutor
+
+        n = min(workers, len(providers))
+        log.info("processing %d providers across %d worker processes", len(providers), n)
+        payloads = [
+            {
+                "config": getattr(args, "config", None),
+                "backend": cfg.backend,
+                "states": _states_list(cfg) or "all",
+                "current": current,
+                "prior": prior,
+                "provider": {"id": p.id, "name": p.name},
+                "cleanup_raw": cleanup_raw,
+                "verbose": getattr(args, "verbose", False),
+            }
+            for p in providers
+        ]
+        with ProcessPoolExecutor(max_workers=n) as ex:
+            for result in ex.map(_provider_worker, payloads):
+                _collect(result)
+    else:
+        for provider in providers:
+            _collect(process_provider(
+                cfg, source, provider, current, prior, counties, county_area_km2, cleanup_raw
+            ))
 
     if not all_feats:
         log.error("no features produced; nothing to score")
@@ -366,8 +424,10 @@ def cmd_build_web(cfg: Config, args) -> int:
     web_dir = cfg.project_root / "web"
     web_meta = dict(meta)
     web_meta.update(_demo_web_defaults(cfg, scored))
+    render_pngs = getattr(args, "render_pngs", False)
     paths = report.write_web_bundle(
         scored, sites, counties, web_dir, web_meta, coverage=coverage,
+        render_pngs=render_pngs,
     )
     flagged = int(scored["flag_for_review"].sum()) if "flag_for_review" in scored.columns else 0
     log.info("web bundle ready: %d records, %d flagged", len(scored), flagged)
@@ -427,6 +487,34 @@ def cmd_make_fixtures(cfg: Config, args) -> int:
     fixtures.make_fixtures(cfg)
     print("Fixtures written. Set source.backend: fixture in config to use them.")
     return 0
+
+
+def _cmd_case_files(cfg: Config, args) -> int:
+    """Generate per-county case files from scored pipeline output."""
+    from .casefile import cmd_case_files
+    return cmd_case_files(cfg, args)
+
+
+def cmd_validate(cfg: Config, args) -> int:
+    """Backtest the pipeline against ground-truth labels; write validation report."""
+    from pathlib import Path
+    from .validate import run_validation_from_cli
+
+    gt_path = Path(args.ground_truth) if getattr(args, "ground_truth", None) else None
+    out_dir = Path(args.output_dir) if getattr(args, "output_dir", None) else None
+    report_path = run_validation_from_cli(
+        cfg,
+        ground_truth_path=gt_path,
+        output_dir=out_dir,
+        n_boot=int(getattr(args, "n_boot", 500)),
+        cost_fp=float(getattr(args, "cost_fp", 1.0)),
+        cost_fn=float(getattr(args, "cost_fn", 5.0)),
+    )
+    if report_path:
+        log.info("Validation report: %s", report_path)
+        return 0
+    log.warning("Validation produced no report. Run the pipeline first.")
+    return 1
 
 
 def cmd_benchmark(cfg: Config, args) -> int:
@@ -518,6 +606,12 @@ def main(argv: list[str] | None = None) -> int:
         "--build-web", action="store_true",
         help="also rebuild the static web bundle after this batch",
     )
+    p_run.add_argument(
+        "--workers", type=int, default=1,
+        help="parallel worker processes for provider analysis (CPU-bound). "
+             "Best used after `download` has cached the raw files, so workers "
+             "don't multiply the FCC request rate. Default 1 (serial).",
+    )
     p_run.set_defaults(func=cmd_run)
 
     sub.add_parser("list-vintages", help="list available vintages").set_defaults(
@@ -532,15 +626,54 @@ def main(argv: list[str] | None = None) -> int:
     p_dl.add_argument("--states", default=None, help="comma-separated state FIPS codes")
     p_dl.set_defaults(func=cmd_download)
 
-    sub.add_parser("build-web", help="assemble static web bundle from accumulated batches").set_defaults(
-        func=cmd_build_web
+    p_bw = sub.add_parser("build-web", help="assemble static web bundle from accumulated batches")
+    p_bw.add_argument(
+        "--render-pngs", dest="render_pngs", action="store_true",
+        help="also render server-side prior/current PNG maps (large; client-side hex rendering is the default)",
     )
+    p_bw.set_defaults(func=cmd_build_web)
     sub.add_parser("make-fixtures", help="generate synthetic offline data").set_defaults(
         func=cmd_make_fixtures
     )
     sub.add_parser(
         "benchmark", help="check against FCC's labeled selected/not-selected counties"
     ).set_defaults(func=cmd_benchmark)
+
+    p_val = sub.add_parser(
+        "validate",
+        help="backtest against ground-truth labels; emit precision/recall/F1 + plots",
+    )
+    p_val.add_argument(
+        "--ground-truth", default=None,
+        help="CSV path with columns matching pipeline join keys + a 'label' column (1=gaming)",
+    )
+    p_val.add_argument("--output-dir", default=None, help="output directory (default: data/validation/)")
+    p_val.add_argument("--n-boot", type=int, default=500, help="bootstrap resamples for CIs")
+    p_val.add_argument("--cost-fp", type=float, default=1.0, help="cost of a false positive (wasted drive-test)")
+    p_val.add_argument("--cost-fn", type=float, default=5.0, help="cost of a false negative (missed gaming)")
+    p_val.set_defaults(func=lambda cfg, args: cmd_validate(cfg, args))
+
+    p_cf = sub.add_parser(
+        "case-files",
+        help="auto-generate per-county case files (Markdown/PDF) from scored data",
+    )
+    p_cf.add_argument("--out-dir", dest="out_dir", default=None,
+                      help="output directory for case files (default: <outputs>/case_files/)")
+    p_cf.add_argument("--all", action="store_true",
+                      help="write case files for all counties, not just flagged ones")
+    p_cf.add_argument("--geoid", default=None,
+                      help="generate a single county case file by GEOID")
+    p_cf.add_argument("--pdf", action="store_true",
+                      help="also write PDF files (requires weasyprint + mistune)")
+    p_cf.add_argument("--llm", default="none", choices=["none", "local", "gemini"],
+                      help="LLM backend for narrative drafting (default: none)")
+    p_cf.add_argument("--llm-url", dest="llm_url", default="http://localhost:11434",
+                      help="Ollama/llama.cpp server URL (for --llm local)")
+    p_cf.add_argument("--llm-model", dest="llm_model", default="llama3",
+                      help="model name on the local server (for --llm local)")
+    p_cf.add_argument("--gemini-api-key", dest="gemini_api_key", default=None,
+                      help="Gemini API key (for --llm gemini; or set GEMINI_API_KEY env var)")
+    p_cf.set_defaults(func=lambda cfg, args: _cmd_case_files(cfg, args))
 
     args = parser.parse_args(argv)
     setup_logging(args.verbose)

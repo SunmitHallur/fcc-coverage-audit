@@ -46,6 +46,21 @@ def tower_counts_by_county(sites: pd.DataFrame) -> dict[str, int]:
 
 
 def _site_reach_m(sites: pd.DataFrame) -> np.ndarray:
+    """Per-site propagation reach for hex attribution.
+
+    Prefers ``lobe_reach_m`` (empirical, from ``towers.compute_lobe_reach``)
+    over the core-based ``reach_m * REACH_MARGIN`` heuristic. The lobe reach
+    is derived from ALL covered hexes so it captures how far a tower's signal
+    actually propagates — not just to the edge of the strong-signal core. This
+    ensures a single matched tower captures ~100% of its gained hexes without
+    mis-attributing fringe hexes as 'unattributed'.
+    """
+    if "lobe_reach_m" in sites.columns:
+        lobe = sites["lobe_reach_m"].to_numpy(dtype=float)
+        core = sites.get("reach_m", pd.Series(0.0, index=sites.index)).to_numpy(dtype=float)
+        fallback = np.maximum(core * REACH_MARGIN, _MIN_REACH_M)
+        valid = np.isfinite(lobe) & (lobe > 0)
+        return np.where(valid, np.maximum(lobe, _MIN_REACH_M), fallback)
     reach = sites.get("reach_m", pd.Series(0.0, index=sites.index)).to_numpy(dtype=float)
     return np.maximum(reach * REACH_MARGIN, _MIN_REACH_M)
 

@@ -60,9 +60,12 @@ _LAYOUT = {
             (39.30, -98.28, 12.0),
             (39.35, -98.77, 9.0),    # NEW tower in Charlie (Osborne)
         ],
-        130403: [(39.25, -98.75, 22.0)],                         # SAME tower, huge inflation
-        131425: [(39.25, -98.25, 7.5)],                          # modest growth
-        130235: [(38.70, -98.70, 7.0)],                          # unchanged
+        130403: [(39.25, -98.75, 22.0)],   # SAME tower, huge inflation -> gaming flag
+        131425: [(39.25, -98.25, 7.5)],    # modest growth
+        # UScellular: single existing tower grows from 7.0 -> 8.5 km radius.
+        # This is ~47% area increase but only ~2.4% of the county — a normal
+        # organic upgrade from the same site. Must NOT be flagged after Phase 0.
+        130235: [(38.70, -98.70, 8.5)],
     },
 }
 
@@ -160,7 +163,11 @@ def _fixture_county_geometries(cfg: Config) -> gpd.GeoDataFrame:
 
 
 def make_fixtures(cfg: Config) -> None:
-    """Write synthetic counties + per-provider/vintage coverage GeoJSON."""
+    """Write synthetic counties + per-provider/vintage coverage GeoJSON.
+
+    Also clears any cached interim parquets for the fixture providers/vintages
+    so that changes to the fixture layout are always reflected on the next run.
+    """
     # 1) Synthetic county grid -> interim cache so normalize.load_counties uses it.
     counties = _fixture_county_geometries(cfg)
     cache = cfg.path("interim") / "tl_us_county.gpkg"
@@ -169,6 +176,7 @@ def make_fixtures(cfg: Config) -> None:
 
     # 2) Coverage layers.
     fixture_dir = cfg.project_root / cfg.fixture["dir"]
+    interim_dir = cfg.path("interim")
     for vintage_key, vintage_date in [("prior", "2025-06-30"), ("current", "2025-12-31")]:
         vdir = fixture_dir / vintage_date
         vdir.mkdir(parents=True, exist_ok=True)
@@ -180,6 +188,9 @@ def make_fixtures(cfg: Config) -> None:
             # One file per (provider, service), matching the real FCC layout.
             out = vdir / f"{provider_id}_{safe_service_name(_FIX_SERVICE)}.geojson"
             gdf.to_file(out, driver="GeoJSON")
+            # Invalidate any cached interim parquets so layout changes take effect.
+            for stale in interim_dir.glob(f"hex_{vintage_date}_{provider_id}_*.parquet"):
+                stale.unlink(missing_ok=True)
         log.info("wrote fixture vintage %s (%s)", vintage_key, vintage_date)
 
 

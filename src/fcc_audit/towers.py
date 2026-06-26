@@ -24,11 +24,22 @@ import h3
 import numpy as np
 import pandas as pd
 from pyproj import Transformer
+from scipy.spatial import cKDTree
 
 from .config import Config
 
 _FWD = Transformer.from_crs("EPSG:4326", "EPSG:5070", always_xy=True)
 _INV = Transformer.from_crs("EPSG:5070", "EPSG:4326", always_xy=True)
+
+# Floor on reach so small/new sites still capture their immediate lobe.
+# Kept in sync with attribute._MIN_REACH_M.
+_MIN_REACH_M = 3000.0
+# For compute_lobe_reach: use the 95th-percentile of all assigned-hex distances.
+_LOBE_REACH_PERCENTILE = 95.0
+# Minimum hexes assigned to a site before computing a stable percentile.
+_LOBE_REACH_MIN_HEXES = 3
+# Fallback multiplier on core reach_m when no full-coverage hex data is available.
+_LOBE_REACH_FALLBACK_MARGIN = 2.5
 
 SITE_COLUMNS = [
     "site_id", "lat", "lng", "x_m", "y_m", "reach_m",
@@ -65,7 +76,24 @@ def infer_sites(hex_df: pd.DataFrame, cfg: Config, label_prefix: str = "S") -> p
         return pd.DataFrame(columns=SITE_COLUMNS)
 
     strong = hex_df[hex_df["signal_dbm"] >= float(tcfg["min_signal_band_dbm"])].copy()
-    min_hexes = int(tcfg["min_site_hexes"])
+    # Auto-scale min_site_hexes to keep the minimum physical blob area consistent
+    # across H3 resolutions. Config value is authoritative for the configured
+    # site_h3_resolution; infer actual resolution from the data and scale.
+    base_hexes = int(tcfg["min_site_hexes"])
+    if not strong.empty:
+        try:
+            actual_res = h3.get_resolution(strong["h3"].iloc[0])
+            cfg_res = int(cfg.geography.get("site_h3_resolution", actual_res))
+            if actual_res != cfg_res:
+                # Scale by inverse hex area ratio: each step in H3 resolution
+                # is ~7x finer in area, so keep the total blob area constant.
+                area_ratio = h3.average_hexagon_area(cfg_res, unit="km^2") / max(
+                    h3.average_hexagon_area(actual_res, unit="km^2"), 1e-9
+                )
+                base_hexes = max(3, round(base_hexes * area_ratio))
+        except Exception:
+            pass
+    min_hexes = base_hexes
     if len(strong) < min_hexes:
         return pd.DataFrame(columns=SITE_COLUMNS)
 
@@ -107,3 +135,61 @@ def infer_sites(hex_df: pd.DataFrame, cfg: Config, label_prefix: str = "S") -> p
             }
         )
     return pd.DataFrame(sites, columns=SITE_COLUMNS)
+
+
+def compute_lobe_reach(
+    hex_df: pd.DataFrame,
+    sites: pd.DataFrame,
+    percentile: float = _LOBE_REACH_PERCENTILE,
+) -> pd.DataFrame:
+    """Augment inferred sites with an empirical full-lobe propagation reach.
+
+    ``infer_sites`` derives ``reach_m`` from the strong-signal core only
+    (hexes at/above ``min_signal_band_dbm``). Real coverage lobes extend well
+    beyond that core at weaker signal bands, which means gained fringe hexes
+    fall outside ``reach_m * REACH_MARGIN`` and get mis-attributed as
+    ``unattributed`` — a false gaming signal.
+
+    This function assigns every covered hex in ``hex_df`` (all signal bands,
+    site-resolution) to its nearest site via KD-tree, then sets
+    ``lobe_reach_m`` = <percentile>th percentile of those per-site distances.
+    Attribution in ``attribute.py`` uses ``lobe_reach_m`` when present, so a
+    single matched tower captures ~100% of its gained hexes and
+    ``unattributed_share`` is reserved for coverage genuinely orphaned from
+    every inferred tower.
+
+    Returns a copy of ``sites`` with ``lobe_reach_m`` added.
+    """
+    s = sites.copy()
+    if s.empty:
+        return s
+
+    core_reach = s.get("reach_m", pd.Series(0.0, index=s.index)).to_numpy(dtype=float)
+    fallback = np.maximum(core_reach * _LOBE_REACH_FALLBACK_MARGIN, _MIN_REACH_M)
+
+    if hex_df.empty:
+        s["lobe_reach_m"] = fallback
+        return s
+
+    xs_s = s["x_m"].to_numpy(dtype=float)
+    ys_s = s["y_m"].to_numpy(dtype=float)
+
+    hex_ids = hex_df["h3"].astype(str).tolist()
+    centers = np.array([h3.cell_to_latlng(c) for c in hex_ids])
+    lats, lngs = centers[:, 0], centers[:, 1]
+    xs_h, ys_h = _FWD.transform(lngs, lats)
+
+    tree = cKDTree(np.column_stack([xs_s, ys_s]))
+    dist, idx = tree.query(np.column_stack([xs_h, ys_h]), k=1)
+
+    lobe_reach = fallback.copy()
+    for i in range(len(s)):
+        mask = idx == i
+        n = int(mask.sum())
+        if n >= _LOBE_REACH_MIN_HEXES:
+            emp = float(np.percentile(dist[mask], percentile))
+            # Always at least as large as the fallback so we never shrink reach.
+            lobe_reach[i] = max(emp, fallback[i])
+
+    s["lobe_reach_m"] = np.maximum(lobe_reach, _MIN_REACH_M)
+    return s

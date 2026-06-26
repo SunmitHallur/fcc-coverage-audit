@@ -28,6 +28,9 @@ _RISK_FEATURES = [
     "boundary_snap_share",           # SECONDARY: new coverage hugging county boundary
     "new_site_share",                # legitimacy (negative weight)
     "signal_jump_implausibility",    # available; default weight 0
+    # Ground-truth corroboration signals (available when ASR/measured data loaded).
+    "asr_no_new_structure",          # GT: no registered tower built in window (positive = suspicious)
+    "measurement_gap",               # GT: claimed coverage with no field measurement (suspicious)
 ]
 
 
@@ -84,6 +87,20 @@ def build_features(
         if col not in df:
             df[col] = 0
         df[col] = df[col].fillna(0).astype(int)
+
+    # Ground-truth corroboration features (populated when ASR / Ookla data is
+    # merged in via groundtruth_asr.merge_asr_into_features and
+    # groundtruth_measured.compute_measurement_gap). Default to 0 (no signal)
+    # when not available so the deterministic core is unchanged without GT data.
+    if "asr_has_new_structure" in df:
+        # Invert: "no new structure" is the suspicious direction.
+        df["asr_no_new_structure"] = (~df["asr_has_new_structure"].astype(bool)).astype(float)
+    else:
+        df["asr_no_new_structure"] = 0.0
+    if "measurement_gap" not in df:
+        df["measurement_gap"] = 0.0
+    df["measurement_gap"] = df["measurement_gap"].fillna(0.0).clip(lower=0.0)
+
     return df
 
 
@@ -124,11 +141,34 @@ def score(features: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     susp = float(cfg.scoring["suspicious_same_site_growth"])
     min_added = float(cfg.scoring.get("min_added_km2_to_flag", 0.0))
 
+    # Implausibility gate thresholds (configurable). High same-site share alone
+    # is NORMAL 6-month growth (antenna upgrades, carrier adds, software
+    # improvements at existing towers). It only becomes suspicious when paired
+    # with at least one implausibility signal: a large absolute area jump, rapid
+    # blanket fill-in from a low baseline, or coverage orphaned from all inferred
+    # towers (unattributed). This prevents flagging normal single-tower expansion.
+    min_county_frac = float(cfg.scoring.get("suspicious_same_site_min_county_frac", 0.15))
+    min_blanket = float(cfg.scoring.get("suspicious_same_site_min_blanket", 0.20))
+    min_unattributed = float(cfg.scoring.get("suspicious_same_site_min_unattributed", 0.20))
+
     # Magnitude gate (learned from FCC examples): only counties that actually
     # added meaningful in-county coverage are eligible to flag. This excludes
     # near-empty counties and non-area-increasing signal shifts.
     eligible = df["added_km2"].fillna(0.0) >= min_added
-    suspicious = (df["priority_score"] >= threshold) | (df["same_site_growth_share"] >= susp)
+
+    # "Same-site implausible": high same-site share AND at least one
+    # implausibility gate fires. A county where one tower modestly expanded its
+    # lobe (normal physics) will not meet any of the implausibility thresholds.
+    same_site_implausible = (
+        (df["same_site_growth_share"].fillna(0.0) >= susp)
+        & (
+            (df["added_frac_of_county"].fillna(0.0) >= min_county_frac)
+            | (df["blanket_fillin"].fillna(0.0) >= min_blanket)
+            | (df["unattributed_share"].fillna(0.0) >= min_unattributed)
+        )
+    )
+    suspicious = (df["priority_score"] >= threshold) | same_site_implausible
+
     # Growth explained by new towers outside this county is usually legitimate.
     cross_border_build = (
         (df["new_site_share"].fillna(0.0) >= 0.35)
@@ -162,4 +202,12 @@ def _reason(row: pd.Series, susp: float) -> str:
             reasons.append("coverage in previously-uncovered area")
         else:
             reasons.append(f"coverage up {pct:.0%}")
+    # Ground-truth corroboration reasons (only shown when GT data is loaded).
+    if row.get("asr_no_new_structure", 0) >= 0.5:
+        reasons.append("no new FCC-registered structure in county during this window (ASR)")
+    if row.get("measurement_gap", 0) >= 0.20:
+        reasons.append(
+            f"claimed coverage not reflected in field measurements "
+            f"(gap: {row['measurement_gap']:.0%})"
+        )
     return "; ".join(reasons) if reasons else "ranked by composite anomaly"
