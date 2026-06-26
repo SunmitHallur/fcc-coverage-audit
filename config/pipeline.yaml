@@ -56,21 +56,12 @@ analysis:
   # don't need to cut download volume (3G is being retired).
   services:
     - { label: "5G-NR 7/1",  desc: "5G-NR (7/1 Mbps)" }
-    - { label: "5G-NR 35/3", desc: "5G-NR (35/3 Mbps)" }
-    - { label: "4G LTE",     desc: "4G LTE" }
-    - { label: "3G",         desc: "3G" }
 
-  # Big 4 mobile providers (explicit list for reproducible national runs).
+  # Sample run: AT&T only (fastest for demo). Restore full list for production.
   providers:
     - { id: 130077, name: "AT&T" }
-    - { id: 130403, name: "T-Mobile" }
-    - { id: 131425, name: "Verizon" }
-    - { id: 130235, name: "UScellular" }
   known_providers:
     - { id: 130077, name: "AT&T" }
-    - { id: 130403, name: "T-Mobile" }
-    - { id: 131425, name: "Verizon" }
-    - { id: 130235, name: "UScellular" }
 
   # FCC mobile coverage files are per state. "all" pulls every state/territory;
   # or scope a first run with a FIPS list, e.g. ["48"] for Texas only.
