@@ -42,8 +42,8 @@ _METRIC_KEYS = [
 
 # Features shown in the flag-math tooltip, with display labels.
 _TOOLTIP_FEATURES = [
-    ("added_frac_of_county",        "+% of county covered"),
-    ("coverage_increase_magnitude", "coverage increase magnitude"),
+    ("added_frac_of_county",        "absolute area added (% of county)"),
+    ("coverage_increase_magnitude", "relative jump (absolute-gated)"),
     ("blanket_fillin",              "blanket fill-in"),
     ("same_site_growth_share",      "same-site growth share"),
     ("unattributed_share",          "unattributed share"),

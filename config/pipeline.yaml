@@ -153,8 +153,12 @@ scoring:
   # by new towers, and boundary snapping.
   feature_weights:
     # --- PRIMARY: magnitude of in-county 5G coverage-area increase ---
-    added_frac_of_county: 0.28          # added covered area / county area (absolute, normalized)
-    coverage_increase_magnitude: 0.20   # relative jump (D25/J25), capped
+    # ABSOLUTE area gained is the dominant driver. The RELATIVE jump is a minor
+    # corroborator AND is itself absolute-gated in build_features() so a huge
+    # percentage from a near-zero base (e.g. 0% -> 1% of county) cannot inflate
+    # the score.
+    added_frac_of_county: 0.36          # added covered area / county area (absolute, normalized)
+    coverage_increase_magnitude: 0.10   # relative jump (D25/J25), capped + absolute-gated
     # --- SECONDARY: implausibility / gaming signals ---
     blanket_fillin: 0.14                # low baseline -> near-complete fill (P5, rural)
     same_site_growth_share: 0.16        # growth claimed from EXISTING towers (P6)

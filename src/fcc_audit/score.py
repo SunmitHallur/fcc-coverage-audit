@@ -16,6 +16,12 @@ from .config import Config
 _EPS = 1e-9
 # Cap runaway percentages (e.g. coverage from 0 -> something => inf).
 _PCT_CAP = 5.0
+# A large RELATIVE jump only matters when the ABSOLUTE area gained is also
+# meaningful: going from 0% to 1% of a county is a huge percentage but a trivial
+# absolute change and is not a concern. The relative-jump feature is dampened by
+# a saturating ramp on the added fraction of county, reaching full strength once
+# a county gains this fraction of its area in new coverage.
+_REL_JUMP_ABS_REF = 0.05
 
 # Map config feature names to the columns built in build_features().
 # Order reflects the FCC-verified selection patterns (primary first).
@@ -60,9 +66,20 @@ def build_features(
     # PRIMARY drivers.
     df["added_frac_of_county"] = df.get("added_frac_of_county", 0.0)
     df["added_frac_of_county"] = df["added_frac_of_county"].clip(lower=0.0).fillna(0.0)
-    df["coverage_increase_magnitude"] = df["pct_increase"].replace(
-        [np.inf, -np.inf], _PCT_CAP
-    ).clip(upper=_PCT_CAP).fillna(0.0)
+    # Relative jump (D25/J25), capped, then ABSOLUTE-GATED: a near-zero-base
+    # percentage (e.g. 0% -> 1% of county) is huge in relative terms but trivial
+    # in absolute terms, so it must not inflate the score. Dampen by a saturating
+    # ramp on the added fraction of county; a county that adds a negligible
+    # absolute share contributes a near-zero relative-jump signal regardless of
+    # how large the percentage looks.
+    rel_jump = (
+        df["pct_increase"]
+        .replace([np.inf, -np.inf], _PCT_CAP)
+        .clip(upper=_PCT_CAP)
+        .fillna(0.0)
+    )
+    abs_damp = (df["added_frac_of_county"] / _REL_JUMP_ABS_REF).clip(upper=1.0)
+    df["coverage_increase_magnitude"] = rel_jump * abs_damp
 
     # SECONDARY: rural blanket fill-in (low prior fraction -> high current fraction).
     prior_frac = df.get("prior_cov_frac", pd.Series(np.nan, index=df.index)).fillna(0.0).clip(0, 1)
