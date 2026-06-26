@@ -120,7 +120,7 @@
     }
     .grad-bar {
       height: 10px; border-radius: 4px;
-      background: linear-gradient(to right, #8b0000, #dc2626, #f97316, #eab308, #84cc16, #22c55e, #14b8a6);
+      background: linear-gradient(to right, rgb(220,0,30), rgb(220,100,30), rgb(220,200,30), rgb(80,200,30));
       border: 1px solid rgba(255,255,255,.08);
     }
     .colorblind-note {
@@ -521,10 +521,14 @@
 
     /** FCC-style heat map colors (strong → fringe), similar to BDC map legend. */
     function signalColor(dbm) {
-      if (dbm >= -85) return '#a3e635';
-      if (dbm >= -95) return '#22c55e';
-      if (dbm >= -105) return '#f97316';
-      return '#dc2626';
+      // Continuous red→yellow→green gradient matching FCC broadbandmap.fcc.gov color scale.
+      // Clamp to [-120, -40] dBm range.
+      const t = Math.max(0, Math.min(1, (dbm - (-120)) / (-40 - (-120))));
+      // Interpolate: red(0) → orange → yellow → green(1)
+      const r = Math.round(t < 0.5 ? 220 : 220 - (t - 0.5) * 2 * 140);
+      const g = Math.round(t < 0.5 ? t * 2 * 200 : 200);
+      const b = Math.round(30);
+      return `rgb(${r},${g},${b})`;
     }
 
     function getCountyFeature(geoid) {
@@ -550,14 +554,11 @@
     }
 
     // Decode compact int8-encoded signal: dBm = raw - 100
-    // (float signals are auto-detected and passed through unchanged)
+    // Encoding: encoded = round(dBm) + 100, so typical FCC range (-40 to -140 dBm)
+    // maps to encoded values (+60 to -40). Real raw dBm floats are always ≤ -40,
+    // so anything > -40 is unambiguously an encoded int8 value.
     function decodeSignal(raw) {
-      if (typeof raw === 'number' && Number.isInteger(raw) && raw >= -128 && raw <= 127) {
-        // If it looks like an int8-encoded value (outside typical dBm float range), decode.
-        // Typical dBm values are -140 to 0; encoded values are -40 to 100.
-        // Heuristic: if raw > 0, it's almost certainly encoded.
-        if (raw > 0 || raw < -50) return raw - 100;
-      }
+      if (typeof raw === 'number' && raw > -40) return raw - 100;
       return raw;
     }
 
@@ -623,7 +624,7 @@
         document.getElementById(`map-${side}-raster`).style.display = useRaster ? 'flex' : 'none';
         document.getElementById(`map-${side}`).style.display = useRaster ? 'none' : 'block';
       });
-      document.getElementById('signal-gradient-legend').style.display = useRaster ? 'grid' : 'none';
+      document.getElementById('signal-gradient-legend').style.display = 'grid';
       if (useRaster) destroyCompareMaps();
     }
 
@@ -777,14 +778,17 @@
         style: {
           version: 8,
           sources: {
-            topo: {
+            carto: {
               type: 'raster',
-              tiles: ['https://tile.opentopomap.org/{z}/{x}/{y}.png'],
+              tiles: ['https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}@2x.png',
+                      'https://b.basemaps.cartocdn.com/light_all/{z}/{x}/{y}@2x.png',
+                      'https://c.basemaps.cartocdn.com/light_all/{z}/{x}/{y}@2x.png'],
               tileSize: 256,
-              maxzoom: 17
+              maxzoom: 19,
+              attribution: '© <a href="https://carto.com/">CARTO</a> © <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
             }
           },
-          layers: [{ id: 'topo', type: 'raster', source: 'topo', paint: { 'raster-opacity': 0.58 } }]
+          layers: [{ id: 'carto', type: 'raster', source: 'carto', paint: { 'raster-opacity': 1.0 } }]
         },
         center: [-98.5, 39.0],
         zoom: 8,
@@ -801,7 +805,13 @@
             id: 'county-fill',
             type: 'fill',
             source: 'county',
-            paint: { 'fill-color': '#f5f0e6', 'fill-opacity': 0.92 }
+            paint: { 'fill-color': '#e8f0fe', 'fill-opacity': 0.18 }
+          });
+          mapObj.addLayer({
+            id: 'county-outline',
+            type: 'line',
+            source: 'county',
+            paint: { 'line-color': '#2563eb', 'line-width': 1.5, 'line-opacity': 0.7 }
           });
         }
         mapObj.addSource('coverage', { type: 'geojson', data: geo });
@@ -812,7 +822,8 @@
           filter: ['!=', ['get', 'kind'], 'tower'],
           paint: {
             'fill-color': ['get', 'color'],
-            'fill-opacity': 0.88
+            'fill-opacity': 0.82,
+            'fill-outline-color': 'rgba(0,0,0,0.12)'
           }
         });
         mapObj.addLayer({
@@ -1294,6 +1305,7 @@
         document.getElementById('compare-toolbar').style.display = 'none';
         setCompareMode('map');
         document.getElementById('compare-maps').style.display = 'grid';
+        document.getElementById('signal-gradient-legend').style.display = 'grid';
         const countyFeature = resolveCountyFeature(rec.geoid, detail);
         const priorGeo = hexesToGeoJSON(detail.prior_hexes, detail.sites_prior);
         const currentGeo = hexesToGeoJSON(detail.current_hexes, detail.sites_current);
