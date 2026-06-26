@@ -120,7 +120,7 @@
     }
     .grad-bar {
       height: 10px; border-radius: 4px;
-      background: linear-gradient(to right, rgb(220,0,30), rgb(220,100,30), rgb(220,200,30), rgb(80,200,30));
+      background: linear-gradient(to right, rgb(140,0,0), rgb(214,40,40), rgb(240,110,36), rgb(250,166,40), rgb(250,214,48), rgb(176,214,64), rgb(58,188,92), rgb(28,178,178));
       border: 1px solid rgba(255,255,255,.08);
     }
     .colorblind-note {
@@ -446,9 +446,9 @@
             </div>
           </div>
           <div class="signal-gradient-legend" id="signal-gradient-legend" style="display:none">
-            <span class="grad-label">Weaker</span>
-            <div class="grad-bar" role="img" aria-label="Signal strength gradient from weak red to strong green, measured in dBm"></div>
-            <span class="grad-label">Stronger (dBm)</span>
+            <span class="grad-label">−120 dBm (weak)</span>
+            <div class="grad-bar" role="img" aria-label="Signal strength gradient from weak dark-red at -120 dBm to strong teal at -50 dBm"></div>
+            <span class="grad-label">−50 dBm (strong)</span>
             <p class="colorblind-note">Signal strength uses a red-to-green color scale; check tower markers and labels if colors are hard to distinguish.</p>
           </div>
         </div>
@@ -520,15 +520,35 @@
     }
 
     /** FCC-style heat map colors (strong → fringe), similar to BDC map legend. */
+    // FCC broadbandmap.fcc.gov RSRP color scale: dark-red (weak) → red → orange →
+    // yellow → green → teal (strong). Piecewise-linear over the published dBm stops
+    // so the common -100/-90 dBm band reads ORANGE (as on the FCC maps), not red,
+    // and strong tower cores (-60/-50) read green/teal.
+    const _SIGNAL_STOPS = [
+      [-120, [140, 0, 0]],
+      [-110, [214, 40, 40]],
+      [-100, [240, 110, 36]],
+      [-90,  [250, 166, 40]],
+      [-80,  [250, 214, 48]],
+      [-70,  [176, 214, 64]],
+      [-60,  [58, 188, 92]],
+      [-50,  [28, 178, 178]],
+    ];
     function signalColor(dbm) {
-      // Continuous red→yellow→green gradient matching FCC broadbandmap.fcc.gov color scale.
-      // Clamp to [-120, -40] dBm range.
-      const t = Math.max(0, Math.min(1, (dbm - (-120)) / (-40 - (-120))));
-      // Interpolate: red(0) → orange → yellow → green(1)
-      const r = Math.round(t < 0.5 ? 220 : 220 - (t - 0.5) * 2 * 140);
-      const g = Math.round(t < 0.5 ? t * 2 * 200 : 200);
-      const b = Math.round(30);
-      return `rgb(${r},${g},${b})`;
+      const stops = _SIGNAL_STOPS;
+      if (dbm <= stops[0][0]) return `rgb(${stops[0][1].join(',')})`;
+      if (dbm >= stops[stops.length - 1][0]) return `rgb(${stops[stops.length - 1][1].join(',')})`;
+      for (let i = 0; i < stops.length - 1; i++) {
+        const [d0, c0] = stops[i], [d1, c1] = stops[i + 1];
+        if (dbm >= d0 && dbm <= d1) {
+          const t = (dbm - d0) / (d1 - d0);
+          const r = Math.round(c0[0] + (c1[0] - c0[0]) * t);
+          const g = Math.round(c0[1] + (c1[1] - c0[1]) * t);
+          const b = Math.round(c0[2] + (c1[2] - c0[2]) * t);
+          return `rgb(${r},${g},${b})`;
+        }
+      }
+      return `rgb(${stops[0][1].join(',')})`;
     }
 
     function getCountyFeature(geoid) {
@@ -822,8 +842,10 @@
           filter: ['!=', ['get', 'kind'], 'tower'],
           paint: {
             'fill-color': ['get', 'color'],
-            'fill-opacity': 0.82,
-            'fill-outline-color': 'rgba(0,0,0,0.12)'
+            'fill-opacity': 0.85,
+            // Match the fill color on the outline so adjacent same-signal hexes
+            // blend into a smooth heatmap (no visible hex grid lines).
+            'fill-outline-color': ['get', 'color']
           }
         });
         mapObj.addLayer({
