@@ -605,11 +605,39 @@
       return raw;
     }
 
+    // Distance-weighted smoothing of per-hex signal over the 2-ring neighborhood.
+    // The FCC viewer renders a continuous interpolated RSRP raster; our res-9 hex
+    // signal is discretized into coarse bands (e.g. -100/-90/-80), which reads as
+    // hard color steps. Averaging each hex with its neighbors turns those steps
+    // into a smooth gradient that more closely resembles the FCC render, without
+    // changing the underlying data (raw values are still used for analysis).
+    function smoothHexSignal(cellSig) {
+      if (!h3lib?.gridDiskDistances) return cellSig;
+      const out = new Map();
+      for (const [cell, dbm] of cellSig) {
+        let num = 0, den = 0;
+        let rings;
+        try { rings = h3lib.gridDiskDistances(cell, 2); } catch { out.set(cell, dbm); continue; }
+        rings.forEach((ring, dist) => {
+          const w = 1 / (1 + dist);
+          ring.forEach(n => {
+            const v = cellSig.get(n);
+            if (v !== undefined) { num += v * w; den += w; }
+          });
+        });
+        out.set(cell, den ? num / den : dbm);
+      }
+      return out;
+    }
+
     function hexesToGeoJSON(hexes, sites) {
       const sorted = [...(hexes || [])].sort((a, b) => (a[1] || 0) - (b[1] || 0));
+      const cellSig = new Map();
+      sorted.forEach(([cell, rawSig]) => cellSig.set(cell, decodeSignal(rawSig)));
+      const smoothed = smoothHexSignal(cellSig);
       const features = [];
-      sorted.forEach(([cell, rawSig]) => {
-        const dbm = decodeSignal(rawSig);
+      sorted.forEach(([cell]) => {
+        const dbm = smoothed.get(cell);
         const ring = h3RingLngLat(cell);
         if (!ring) return;
         features.push({
