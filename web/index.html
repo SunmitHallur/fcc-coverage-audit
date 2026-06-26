@@ -192,11 +192,19 @@
     }
     .toolbar label { margin: 0; text-transform: none; letter-spacing: 0; display: flex; align-items: center; gap: 6px; color: var(--ink); }
     .legend {
-      position: absolute; bottom: 16px; right: 16px; background: rgba(18,24,32,.92); border: 1px solid var(--border);
-      border-radius: 10px; padding: 10px 12px; font-size: 11px;
+      position: absolute; bottom: 16px; right: 16px; background: rgba(18,24,32,.94); border: 1px solid var(--border);
+      border-radius: 10px; padding: 10px 12px; font-size: 11px; max-width: 240px;
     }
-    .legend div { display: flex; align-items: center; gap: 8px; margin: 3px 0; color: var(--muted); }
-    .swatch { width: 14px; height: 14px; border-radius: 3px; display: inline-block; }
+    .legend .legend-row { display: flex; align-items: center; gap: 8px; margin: 3px 0; color: var(--muted); }
+    .legend .legend-head {
+      font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: .08em;
+      color: #cbd5e1; margin: 8px 0 4px;
+    }
+    .legend .legend-head:first-child { margin-top: 0; }
+    .legend .legend-note { font-size: 10px; color: #64748b; margin: 4px 0 0; line-height: 1.35; }
+    .swatch { width: 14px; height: 14px; border-radius: 3px; display: inline-block; flex: none; }
+    .swatch-dot { width: 11px; height: 11px; border-radius: 50%; display: inline-block; flex: none; border: 1.5px solid #0f172a; }
+    .swatch-dot.ring { border-color: #f8fafc; }
     .err { padding: 18px; color: var(--flag); font-size: 13px; line-height: 1.5; }
 
     /* ── Triage decision bar ──────────────────────────────────────────── */
@@ -252,6 +260,12 @@
       font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .07em;
       color: var(--muted); margin-bottom: 10px; display: flex; align-items: center; gap: 8px;
     }
+    .fm-status {
+      margin-left: auto; font-size: 9px; font-weight: 700; letter-spacing: .04em;
+      padding: 2px 8px; border-radius: 999px; text-transform: uppercase; white-space: nowrap;
+    }
+    .fm-status.flagged     { background: rgba(239,68,68,.18); color: #f87171; }
+    .fm-status.not-flagged { background: rgba(148,163,184,.16); color: #94a3b8; }
     .fm-score-bar {
       display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 8px; margin-bottom: 10px;
     }
@@ -267,16 +281,18 @@
     }
     .fm-features { border-top: 1px solid var(--border); padding-top: 8px; }
     .fm-feat-row {
-      display: grid; grid-template-columns: 2fr 1fr 1fr 80px; gap: 6px;
+      display: grid; grid-template-columns: 2fr auto 90px; gap: 10px;
       padding: 3px 0; align-items: center; border-bottom: 1px solid rgba(255,255,255,.03);
     }
     .fm-feat-row:last-child { border-bottom: none; }
-    .fm-feat-name { color: #94a3b8; }
+    .fm-feat-head { font-size: 9px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+    .fm-feat-head span:last-child { text-align: left; }
+    .fm-feat-name { color: #cbd5e1; }
     .fm-feat-val  { font-variant-numeric: tabular-nums; text-align: right; color: var(--ink); }
-    .fm-feat-wt   { font-variant-numeric: tabular-nums; text-align: right; color: var(--muted); font-size: 10px; }
-    .fm-feat-bar  { height: 4px; background: var(--border); border-radius: 2px; }
-    .fm-feat-fill { height: 100%; border-radius: 2px; background: var(--accent); }
-    .fm-feat-fill.neg { background: var(--ok); }
+    .fm-feat-bar  { height: 5px; background: var(--border); border-radius: 3px; overflow: hidden; }
+    .fm-feat-fill { height: 100%; border-radius: 3px; background: var(--accent); }
+    .fm-feat-fill.hi { background: #f87171; }
+    .fm-foot { margin: 8px 0 0; font-size: 9px; color: #64748b; line-height: 1.4; }
     .fm-no-data { color: var(--muted); font-size: 11px; padding: 4px 0; }
 
     /* ── Threshold slider ────────────────────────────────────────────── */
@@ -449,7 +465,7 @@
             <span class="grad-label">−120 dBm (weak)</span>
             <div class="grad-bar" role="img" aria-label="Signal strength gradient from weak dark-red at -120 dBm to strong teal at -50 dBm"></div>
             <span class="grad-label">−50 dBm (strong)</span>
-            <p class="colorblind-note">Signal strength uses a red-to-green color scale; check tower markers and labels if colors are hard to distinguish.</p>
+            <p class="colorblind-note">Signal strength uses the FCC red→orange→yellow→green→teal scale; check tower markers and labels if colors are hard to distinguish.</p>
           </div>
         </div>
         <div class="section-label">Analysis</div>
@@ -461,7 +477,7 @@
         <div id="flag-math-panel" class="flag-math-panel" style="display:none">
           <div class="fm-title">
             <span>ⓘ Flagging math</span>
-            <span id="fm-gates" style="color:var(--flag);margin-left:auto;font-size:9px"></span>
+            <span id="fm-gates" class="fm-status not-flagged"></span>
           </div>
           <div class="fm-score-bar">
             <span class="lbl">Score</span>
@@ -472,11 +488,12 @@
             <span class="lbl" id="fm-score-label">—</span>
           </div>
           <div class="fm-features">
-            <div class="fm-feat-row" style="font-size:9px;color:var(--muted)">
-              <span>Feature</span><span style="text-align:right">Value</span><span style="text-align:right">Weight</span><span>Contribution</span>
+            <div class="fm-feat-row fm-feat-head">
+              <span>Signal feature</span><span style="text-align:right">Value</span><span>Level</span>
             </div>
             <div id="fm-features-list"></div>
           </div>
+          <p class="fm-foot">Score is an unsupervised anomaly rank (0–1) over these features; bars show each feature's level, not a linear weight.</p>
         </div>
         <button class="print-btn" onclick="window.print()">🖨 Print / export work order (PDF)</button>
       </div>
@@ -485,9 +502,15 @@
         <label><input type="checkbox" id="flagged-only" /> Flagged counties only</label>
       </div>
       <div class="legend">
-        <div><span class="swatch" style="background:#ef4444"></span> High priority / flagged</div>
-        <div><span class="swatch" style="background:#f59e0b"></span> Moderate change</div>
-        <div><span class="swatch" style="background:#334155"></span> No data / low change</div>
+        <div class="legend-head">County shading</div>
+        <div class="legend-row"><span class="swatch" style="background:#ef4444"></span> High priority / flagged</div>
+        <div class="legend-row"><span class="swatch" style="background:#f59e0b"></span> Moderate change</div>
+        <div class="legend-row"><span class="swatch" style="background:#334155"></span> No data / low change</div>
+        <div class="legend-head">Towers (dots)</div>
+        <div class="legend-row"><span class="swatch-dot" style="background:#22c55e"></span> New tower (built since prior)</div>
+        <div class="legend-row"><span class="swatch-dot" style="background:#a855f7"></span> Expanded existing tower</div>
+        <div class="legend-row"><span class="swatch-dot" style="background:#38bdf8"></span> Pre-existing tower</div>
+        <div class="legend-note"><span class="swatch-dot ring" style="background:#38bdf8;vertical-align:middle"></span> White ring = tower just outside the county whose coverage reaches in.</div>
       </div>
     </div>
   </div>
@@ -857,13 +880,13 @@
             'circle-radius': 6,
             'circle-color': [
               'match', ['get', 'site_class'],
-              'new_site', '#15803d',
-              'expanded_site', '#c2410c',
-              'prior_site', '#475569',
-              '#b91c1c'
+              'new_site', '#22c55e',
+              'expanded_site', '#a855f7',
+              'prior_site', '#38bdf8',
+              '#38bdf8'
             ],
             'circle-stroke-width': 2,
-            'circle-stroke-color': '#111827'
+            'circle-stroke-color': '#0f172a'
           }
         });
         mapObj.addLayer({
@@ -875,12 +898,12 @@
             'circle-radius': 7,
             'circle-color': [
               'match', ['get', 'site_class'],
-              'new_site', '#2563eb',
-              'expanded_site', '#7c3aed',
-              'prior_site', '#64748b',
-              '#334155'
+              'new_site', '#22c55e',
+              'expanded_site', '#a855f7',
+              'prior_site', '#38bdf8',
+              '#38bdf8'
             ],
-            'circle-stroke-width': 2.5,
+            'circle-stroke-width': 3,
             'circle-stroke-color': '#f8fafc'
           }
         });
@@ -1364,8 +1387,8 @@
         (!t.service || t.service === svc) && (!t.vintage || t.vintage === 'current')
       ).forEach(t => {
         const el = document.createElement('div');
-        const colors = { new_site: '#22c55e', expanded_site: '#f59e0b', stable_site: '#94a3b8' };
-        el.style.cssText = `width:8px;height:8px;border-radius:50%;background:${colors[t.site_class] || '#94a3b8'};border:1px solid #0006`;
+        const colors = { new_site: '#22c55e', expanded_site: '#a855f7', prior_site: '#38bdf8', stable_site: '#38bdf8' };
+        el.style.cssText = `width:9px;height:9px;border-radius:50%;background:${colors[t.site_class] || '#38bdf8'};border:1.5px solid #0f172a`;
         towerMarkers.push(new maplibregl.Marker({ element: el }).setLngLat([t.lng, t.lat]).addTo(map));
       });
     }
@@ -1520,35 +1543,41 @@
 
       const score = fm.priority_score ?? 0;
       const thresh = fm.flag_threshold ?? 0;
-      const maxScale = Math.max(score, thresh, 0.01);
-      const scorePct = Math.min(100, (score / maxScale) * 100);
-      const threshPct = Math.min(99, (thresh / maxScale) * 100);
-
-      document.getElementById('fm-score-fill').style.width = `${scorePct}%`;
-      document.getElementById('fm-threshold-line').style.left = `${threshPct}%`;
+      // Score and threshold are both on the same 0–1 priority scale; show them on
+      // a fixed 0–1 track so the bar and cutoff are directly comparable.
+      document.getElementById('fm-score-fill').style.width = `${Math.min(100, score * 100)}%`;
+      const threshLine = document.getElementById('fm-threshold-line');
+      if (thresh > 0.001) {
+        threshLine.style.display = '';
+        threshLine.style.left = `${Math.min(99, thresh * 100)}%`;
+      } else {
+        threshLine.style.display = 'none';
+      }
       document.getElementById('fm-score-label').textContent =
-        `${score.toFixed(3)} vs ${thresh.toFixed(3)}`;
+        `${score.toFixed(3)} vs ${thresh.toFixed(3)} cutoff`;
 
-      const gates = fm.flag ? '⚑ FLAGGED' : '◯ not flagged';
-      document.getElementById('fm-gates').textContent = gates;
+      const badge = document.getElementById('fm-gates');
+      badge.textContent = fm.flag ? 'Flagged' : 'Not flagged';
+      badge.className = `fm-status ${fm.flag ? 'flagged' : 'not-flagged'}`;
 
       const list = document.getElementById('fm-features-list');
       list.innerHTML = '';
       const feats = fm.features || [];
-      const maxContrib = Math.max(...feats.map(f => Math.abs(f.contribution ?? 0)), 0.001);
       feats.forEach(f => {
-        if (f.weight === 0 && !f.value) return;
+        if (f.value == null || f.value === 0) return;
         const row = document.createElement('div');
         row.className = 'fm-feat-row';
-        const val = f.value != null ? (typeof f.value === 'boolean' ? (f.value ? 'yes' : 'no') : f.value.toFixed(2)) : '—';
-        const contrib = f.contribution ?? 0;
-        const barPct = Math.min(100, (Math.abs(contrib) / maxContrib) * 100);
-        const isNeg = contrib < 0;
+        const isBool = typeof f.value === 'boolean';
+        const val = isBool ? (f.value ? 'yes' : 'no') : f.value.toFixed(2);
+        // Most features are 0–1 shares/fractions; clamp the bar to [0,1].
+        // "high" (red) when a share-type feature is elevated (≥0.5).
+        const level = isBool ? (f.value ? 1 : 0) : Math.max(0, Math.min(1, f.value));
+        const barPct = Math.round(level * 100);
+        const hi = level >= 0.5 ? ' hi' : '';
         row.innerHTML = `
           <span class="fm-feat-name">${f.label}</span>
           <span class="fm-feat-val">${val}</span>
-          <span class="fm-feat-wt">${f.weight.toFixed(2)}</span>
-          <div class="fm-feat-bar"><div class="fm-feat-fill${isNeg ? ' neg' : ''}" style="width:${barPct}%"></div></div>
+          <div class="fm-feat-bar"><div class="fm-feat-fill${hi}" style="width:${barPct}%"></div></div>
         `;
         list.appendChild(row);
       });
