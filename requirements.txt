@@ -38,7 +38,11 @@ mercantile==1.2.1
 redshift-connector==2.1.5
 
 # --- SHAP feature explanations (optional; used by validate.py when available) ---
-shap==0.47.2
+# Commented out by default: shap pulls in numba/llvmlite, which do NOT support
+# Python 3.14 (only >=3.10,<3.14). validate.py imports shap in a try/except and
+# degrades gracefully without it, so the pipeline (incl. `run` and `validate`)
+# works fine without it. To enable SHAP, use a Python 3.13 venv and `pip install shap`.
+# shap==0.47.2
 
 # --- dev / testing (optional) ---
 pytest==8.4.2
