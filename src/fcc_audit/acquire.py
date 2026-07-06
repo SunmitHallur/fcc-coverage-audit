@@ -56,16 +56,27 @@ TECHNOLOGY_CODES: dict[str, int] = {
 
 @dataclass(frozen=True)
 class CoverageFile:
-    """A downloaded per-(provider, technology) coverage file on local disk.
+    """A per-(provider, technology) coverage layer materialized on local disk.
 
-    One file holds all speed tiers and environments for that technology; the
-    normalize stage filters by tier (mindown/minup) and environment (environmnt).
+    Two shapes flow through the pipeline behind this one type:
+
+    * **Polygon coverage** (``is_hex=False``, the FCC/fixture backends): a
+      shapefile / GeoPackage / WKT table the normalize stage polyfills to H3.
+      One file holds all speed tiers and environments for that technology; the
+      normalize stage filters by tier (mindown/minup) and environment (environmnt).
+    * **Pre-indexed H3 hexes** (``is_hex=True``, the Redshift backend): a parquet
+      of columns ``h3`` (H3 cell id string) + ``signal_dbm`` for one already
+      resolved (provider, service, vintage). Because the warehouse already did
+      the H3 indexing, normalize SKIPS the (expensive) polygon polyfill and only
+      tags counties. ``hex_resolution`` records the H3 resolution of those cells.
     """
 
     provider_id: int
     technology: str
     vintage: str
     local_path: Path
+    is_hex: bool = False
+    hex_resolution: int | None = None
 
 
 class DataSource(ABC):
@@ -359,29 +370,62 @@ class FccDownloadSource(DataSource):
 # Redshift backend (enable once AWS access is granted)
 # ---------------------------------------------------------------------------
 class RedshiftSource(DataSource):
-    """Queries coverage polygons from Amazon Redshift.
+    """Reads coverage from the warehouse's pre-aggregated H3 res-9 hex tables.
 
-    Stubbed until access is granted. To enable:
-      1. ``pip install redshift-connector`` (uncomment in requirements.txt).
-      2. Fill ``source.redshift`` in config (host/db/user/password via env vars).
-      3. Adjust ``coverage_query`` to your warehouse schema.
-      4. Set ``source.backend: redshift``.
-    The query must return WKT geometry in EPSG:4326; this class writes it to a
-    local GeoPackage so the rest of the pipeline is identical to the FCC path.
+    The BDC data platform publishes national res-9 hex snapshots
+    (``<schema>.bbmap_mobile_bb_tech_hex9s_<build>``), one row per H3 cell with:
+
+    * ``h3index``  - the H3 res-9 cell id (string, same form the ``h3`` lib uses),
+    * ``state_fips`` - the cell's state,
+    * per (technology, speed tier, environment) a ``0/1`` coverage flag column
+      (e.g. ``tech5g_spd1_env0``) plus a companion ``..._prov`` column holding a
+      COMMA-DELIMITED list of the provider ids that cover the cell for that service.
+
+    The table suffix ``<build>`` is a monotonic build/process id and serves as
+    the **vintage token**: set ``analysis.vintages.current/prior`` to two builds.
+
+    Because the warehouse already did the H3 indexing, this backend returns the
+    covered cells for one (provider, service) directly and the pipeline SKIPS the
+    expensive polygon polyfill (see ``CoverageFile.is_hex``). These hex tables
+    carry only a 0/1 coverage flag (no modeled signal), so coverage is treated as
+    a flat band; tower inference then works from contiguous-coverage blobs.
+
+    To enable:
+      1. ``pip install -r requirements.txt`` (redshift-connector is included).
+      2. Fill ``source.redshift`` (host/db/user/password via env vars) + schema.
+      3. Set two build ids in ``analysis.vintages`` and ``source.backend: redshift``.
     """
+
+    # Map an analysis service (by its catalog `desc`) to the hex table's coverage
+    # column base. The environment suffix (`_env0`/`_env1`) is appended per config.
+    _DEFAULT_SERVICE_COLUMNS: dict[str, str] = {
+        "5G-NR (7/1 Mbps)": "tech5g_spd1",
+        "5G-NR (35/3 Mbps)": "tech5g_spd2",
+        "4G LTE": "tech4g",
+        "3G": "tech3g",
+    }
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.rs = cfg.redshift
         self.raw_dir = cfg.path("raw")
+        self.schema: str = self.rs.get("schema", "bdc_dataplatform")
+        self.hex_prefix: str = self.rs.get("hex_table_prefix", "bbmap_mobile_bb_tech_hex9s_")
+        self.merged_prefix: str = self.rs.get("merged_table_prefix", "bbmap_mobile_bb_merged_all_")
+        self.environment: int = int(self.rs.get("environment", 0))
+        self.hex_resolution: int = int(self.rs.get("hex_resolution", 9))
+        self.service_columns: dict[str, str] = {
+            **self._DEFAULT_SERVICE_COLUMNS,
+            **(self.rs.get("service_hex_columns") or {}),
+        }
 
+    # -- connection / query helpers --
     def _connect(self):  # pragma: no cover - requires live credentials
         try:
             import redshift_connector
         except ImportError as exc:
             raise RuntimeError(
-                "redshift-connector not installed. Uncomment it in requirements.txt "
-                "and `pip install -r requirements.txt`."
+                "redshift-connector not installed. Run `pip install -r requirements.txt`."
             ) from exc
         return redshift_connector.connect(
             host=self.rs["host"],
@@ -391,49 +435,117 @@ class RedshiftSource(DataSource):
             password=self.rs["password"],
         )
 
-    def list_vintages(self) -> list[str]:  # pragma: no cover - live only
-        with self._connect() as conn, conn.cursor() as cur:
-            cur.execute("SELECT DISTINCT as_of_date FROM bdc.mobile_coverage ORDER BY as_of_date DESC")
-            return [str(r[0]) for r in cur.fetchall()]
+    def _query_df(self, sql: str, params: tuple = ()):  # pragma: no cover - live only
+        import pandas as pd
 
-    def list_providers(self, vintage: str) -> list[Provider]:  # pragma: no cover - live only
         with self._connect() as conn, conn.cursor() as cur:
-            cur.execute(
-                "SELECT DISTINCT provider_id, provider_name FROM bdc.mobile_coverage "
-                "WHERE as_of_date = %s ORDER BY provider_id", (vintage,)
-            )
-            return [Provider(id=int(r[0]), name=str(r[1] or r[0])) for r in cur.fetchall()]
-
-    def fetch(self, provider_id, technology, vintage) -> CoverageFile:  # pragma: no cover
-        import geopandas as gpd
-        from shapely import wkt
-
-        out_dir = self.raw_dir / vintage / str(provider_id)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        dest = out_dir / f"{safe_service_name(technology)}.gpkg"
-        query = self.rs["coverage_query"].format(
-            vintage=vintage, provider_id=provider_id, tech=technology
-        )
-        with self._connect() as conn, conn.cursor() as cur:
-            cur.execute(query)
+            cur.execute(sql, params)
             try:
                 df = cur.fetch_dataframe()
-            except AttributeError:
-                import pandas as pd
+            except Exception:  # noqa: BLE001 - older connector lacks fetch_dataframe
                 cols = [d[0] for d in cur.description]
                 df = pd.DataFrame(cur.fetchall(), columns=cols)
+        return df
+
+    def _hex_table(self, vintage: str) -> str:
+        return f"{self.schema}.{self.hex_prefix}{vintage}"
+
+    def _service_column(self, service_desc: str) -> str:
+        base = self.service_columns.get(service_desc)
+        if base is None:
+            raise RuntimeError(
+                f"No Redshift hex column mapped for service {service_desc!r}. Add it "
+                f"under source.redshift.service_hex_columns (known: "
+                f"{sorted(self.service_columns)})."
+            )
+        return f"{base}_env{self.environment}"
+
+    # -- DataSource interface --
+    def list_vintages(self) -> list[str]:  # pragma: no cover - live only
+        """Available hex-snapshot build ids, newest (largest) first."""
+        df = self._query_df(
+            "SELECT table_name FROM svv_tables "
+            "WHERE table_schema = %s AND table_name LIKE %s",
+            (self.schema, self.hex_prefix + "%"),
+        )
+        builds: set[int] = set()
+        for name in df.iloc[:, 0].astype(str):
+            suffix = name[len(self.hex_prefix):]
+            if suffix.isdigit():
+                builds.add(int(suffix))
+        return [str(b) for b in sorted(builds, reverse=True)]
+
+    def list_providers(self, vintage: str) -> list[Provider]:  # pragma: no cover - live only
+        """Discover providers from the matching raw build (distinct providerid).
+
+        The hex tables encode providers only as delimited strings, so provider
+        discovery uses the companion ``bbmap_mobile_bb_merged_all_<build>`` table.
+        Falls back to the configured known providers if that table is absent.
+        """
+        known = {p.id: p.name for p in self.cfg.known_providers}
+        try:
+            df = self._query_df(
+                f"SELECT DISTINCT providerid, provider_name "
+                f"FROM {self.schema}.{self.merged_prefix}{vintage}"
+            )
+        except Exception as exc:  # noqa: BLE001 - fall back to configured providers
+            log.warning("provider discovery failed (%s); using known_providers", exc)
+            return [Provider(id=i, name=n) for i, n in sorted(known.items())]
+        out: dict[int, str] = {}
+        for _, row in df.iterrows():
+            pid = int(row["providerid"])
+            out[pid] = known.get(pid, str(row.get("provider_name") or pid))
+        return [Provider(id=i, name=n) for i, n in sorted(out.items())]
+
+    def fetch(self, provider_id, technology, vintage) -> CoverageFile:  # pragma: no cover
+        """Return the covered res-9 H3 cells for one (provider, service, build).
+
+        Result is cached to parquet under ``data/raw`` so runs are resumable, and
+        is flagged ``is_hex`` so normalize skips polyfill.
+        """
+        import pandas as pd
+
+        col = self._service_column(technology)
+        table = self._hex_table(vintage)
+        scope = self.cfg.states_scope_key()
+        out_dir = self.raw_dir / str(vintage) / str(provider_id)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        dest = out_dir / f"{safe_service_name(technology)}_{scope}_hex{self.hex_resolution}.parquet"
+        if dest.exists() and dest.stat().st_size > 0:
+            return CoverageFile(
+                provider_id, technology, vintage, dest,
+                is_hex=True, hex_resolution=self.hex_resolution,
+            )
+
+        # Delimiter-guarded membership so provider 130077 doesn't match 1300770 /
+        # 131310 etc. Read-only: the `||` concat only shapes the value for the
+        # LIKE comparison; it never modifies the table. The `_prov` list is
+        # comma-separated with no spaces (verified).
+        where = [
+            f"{col} = 1",
+            f"',' || {col}_prov || ',' LIKE %s",
+        ]
+        params: list = [f"%,{int(provider_id)},%"]
+        states = self.cfg.states
+        if states != "all":
+            where.append("TRIM(state_fips) IN (" + ",".join(["%s"] * len(states)) + ")")
+            params.extend(str(s).zfill(2) for s in states)
+        sql = f"SELECT h3index FROM {table} WHERE " + " AND ".join(where)
+
+        log.info("  redshift %s provider %s %s (%s)", vintage, provider_id, technology, col)
+        df = self._query_df(sql, tuple(params))
         if df.empty:
             raise FileNotFoundError(
-                f"No Redshift rows for provider {provider_id} {technology} @ {vintage}"
+                f"No covered hexes for provider {provider_id} {technology} in "
+                f"{table} (col {col}, states={states})."
             )
-        if "geometry_wkt" not in df.columns:
-            raise RuntimeError(
-                "coverage_query must return a geometry_wkt column (WKT, EPSG:4326)"
-            )
-        df["geometry"] = df["geometry_wkt"].apply(wkt.loads)
-        gdf = gpd.GeoDataFrame(df.drop(columns=["geometry_wkt"]), geometry="geometry", crs="EPSG:4326")
-        gdf.to_file(dest, driver="GPKG")
-        return CoverageFile(provider_id, technology, vintage, dest)
+        hexes = df["h3index"].astype(str)
+        # Flat band: these hex tables carry a 0/1 coverage flag, not signal.
+        pd.DataFrame({"h3": hexes, "signal_dbm": 0.0}).to_parquet(dest, index=False)
+        return CoverageFile(
+            provider_id, technology, vintage, dest,
+            is_hex=True, hex_resolution=self.hex_resolution,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -449,22 +561,36 @@ class FixtureSource(DataSource):
             return []
         return sorted((p.name for p in self.dir.iterdir() if p.is_dir()), reverse=True)
 
+    # Accepted local coverage formats, in priority order. CSV/TSV (WKT geometry)
+    # are the easiest to export by hand from DBeaver; geojson/gpkg also work.
+    _EXTS = (".geojson", ".gpkg", ".csv", ".tsv")
+
     def list_providers(self, vintage: str) -> list[Provider]:
         vdir = self.dir / vintage
         if not vdir.exists():
             return []
-        ids = sorted({int(p.name.split("_")[0]) for p in vdir.glob("*.geojson")})
+        ids: set[int] = set()
+        for ext in self._EXTS:
+            for p in vdir.glob(f"*{ext}"):
+                try:
+                    ids.add(int(p.name.split("_")[0]))
+                except ValueError:
+                    continue
         known = {p.id: p.name for p in self.cfg.known_providers}
-        return [Provider(id=i, name=known.get(i, str(i))) for i in ids]
+        return [Provider(id=i, name=known.get(i, str(i))) for i in sorted(ids)]
 
     def fetch(self, provider_id, technology, vintage) -> CoverageFile:
-        path = self.dir / vintage / f"{provider_id}_{safe_service_name(technology)}.geojson"
-        if not path.exists():
-            raise FileNotFoundError(
-                f"Fixture not found: {path}. Generate it with "
-                f"`python -m fcc_audit.cli make-fixtures`."
-            )
-        return CoverageFile(provider_id, technology, vintage, path)
+        stem = f"{provider_id}_{safe_service_name(technology)}"
+        vdir = self.dir / vintage
+        for ext in self._EXTS:
+            path = vdir / f"{stem}{ext}"
+            if path.exists():
+                return CoverageFile(provider_id, technology, vintage, path)
+        raise FileNotFoundError(
+            f"No local coverage file for {stem} in {vdir} "
+            f"(looked for {', '.join(self._EXTS)}). Export it from DBeaver, or "
+            f"generate synthetic data with `python -m fcc_audit.cli make-fixtures`."
+        )
 
 
 def get_source(cfg: Config) -> DataSource:

@@ -250,11 +250,20 @@ REDSHIFT_USER=...
 REDSHIFT_PASSWORD=...
 ```
 
-In DBeaver, find the mobile coverage table (schema/column names vary). Update
-`source.redshift.coverage_query` in `config/pipeline.yaml` so it returns
-`geometry_wkt` (EPSG:4326 WKT) plus the templated `{vintage}`, `{provider_id}`,
-`{tech}` filters. Set `analysis.vintages` to match your warehouse `as_of_date`
-format (usually `2025-12-31`, not the FCC filing label).
+The backend reads the warehouse's **pre-aggregated H3 res-9 hex snapshots**
+(`<schema>.bbmap_mobile_bb_tech_hex9s_<build>`) — one row per H3 cell with a
+`0/1` coverage flag per `(technology, speed tier, environment)` and a comma-
+delimited `..._prov` list of the providers covering that cell. Since the
+warehouse already did the H3 indexing, the pipeline **skips polygon polyfill**
+and only pulls back the covered cell ids (tiny), instead of the tens of millions
+of raw polygons per layer. Coverage is a flat band (these tables carry no
+modeled signal), so tower inference works from contiguous-coverage blobs.
+
+Configure `source.redshift` in `config/pipeline.yaml`: `schema`,
+`hex_table_prefix`, `environment` (0/1), and the `service_hex_columns` map (e.g.
+`"5G-NR (7/1 Mbps)" -> tech5g_spd1`). The table-name suffix is a **build id** and
+serves as the vintage token — set `analysis.vintages.current/prior` to two build
+ids (e.g. `175` and `140`) that are ~6 months apart.
 
 Run the pipeline and serve locally:
 
@@ -311,8 +320,9 @@ The data layer is pluggable. Once your AWS Redshift access is granted:
 
 1. `pip install -r requirements.txt` (`redshift-connector` is included).
 2. Copy `.env.example` → `.env` and fill `REDSHIFT_*` (same values as your DBeaver connection).
-3. In DBeaver, locate the mobile coverage table and edit `source.redshift.coverage_query`
-   in `config/pipeline.yaml`. Set `analysis.vintages` to your warehouse date format.
+3. Set `source.redshift.schema` / `hex_table_prefix` / `environment` /
+   `service_hex_columns` in `config/pipeline.yaml`, and set two build ids in
+   `analysis.vintages` (the numeric suffix on the `..._tech_hex9s_<build>` tables).
 4. Set `source.backend: redshift` (or run with `--backend redshift`).
 
 Nothing else in the pipeline changes. **This is the recommended path for an

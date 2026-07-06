@@ -31,12 +31,46 @@ _SIGNAL_COLUMNS = ["minsignal", "min_signal", "signal", "sig_strength", "signals
 _BAND_CODE_TO_DBM = {1: -105.0, 2: -95.0, 3: -85.0}
 
 
+# Column names a WKT geometry might arrive under (e.g. DBeaver CSV exports).
+_WKT_COLUMNS = ["geometry_wkt", "wkt", "geom_wkt", "the_geom", "geometry", "geom", "shape"]
+
+
+def _read_wkt_table(path: Path) -> gpd.GeoDataFrame:
+    """Read a CSV/TSV whose geometry is stored as WKT text (EPSG:4326).
+
+    Lets you export a Redshift coverage query straight from DBeaver to CSV and
+    feed it to the pipeline without a live database connection. One column must
+    hold WKT polygons (e.g. ``geometry_wkt``); all other columns are kept as
+    attributes (a ``minsignal`` column, if present, drives the signal heatmap).
+    """
+    from shapely import wkt
+
+    sep = "\t" if path.suffix.lower() in (".tsv", ".tab") else ","
+    df = pd.read_csv(path, sep=sep)
+    lower = {c.lower(): c for c in df.columns}
+    geom_col = next((lower[c] for c in _WKT_COLUMNS if c in lower), None)
+    if geom_col is None:
+        raise RuntimeError(
+            f"{path.name}: no WKT geometry column found. Expected one of "
+            f"{_WKT_COLUMNS}. Alias your geometry as `geometry_wkt` in the query."
+        )
+    geom = df[geom_col].map(lambda v: wkt.loads(v) if isinstance(v, str) and v else None)
+    gdf = gpd.GeoDataFrame(df.drop(columns=[geom_col]), geometry=geom, crs="EPSG:4326")
+    return gdf[~gdf.geometry.isna()].reset_index(drop=True)
+
+
 def load_coverage_gdf(path: Path) -> gpd.GeoDataFrame:
-    """Read a coverage layer (zipped shapefile / gpkg / geojson) in EPSG:4326."""
+    """Read a coverage layer in EPSG:4326.
+
+    Supports zipped shapefiles, GeoPackage, GeoJSON, and CSV/TSV exports that
+    carry geometry as WKT text (the easiest format to export from DBeaver).
+    """
     suffix = path.suffix.lower()
     if suffix == ".zip":
         # geopandas/pyogrio can read a zipped shapefile directly.
         gdf = gpd.read_file(f"zip://{path}")
+    elif suffix in (".csv", ".tsv", ".tab"):
+        gdf = _read_wkt_table(path)
     else:
         gdf = gpd.read_file(path)
     if gdf.crs is None:
@@ -278,6 +312,32 @@ def _derive_parent_hexes(
     return pd.DataFrame({"h3": out_h3, "signal_dbm": out_sig})
 
 
+def _hex_layer_at_resolution(cov: CoverageFile, resolution: int) -> pd.DataFrame:
+    """Read a pre-indexed hex coverage file and return it at ``resolution``.
+
+    The source parquet (written by the Redshift backend) holds columns
+    ``h3`` + ``signal_dbm`` at ``cov.hex_resolution``. If the requested
+    resolution differs, roll cells up to their H3 parents (strongest signal
+    wins) or expand down to their children (signal carried unchanged). When the
+    resolution matches, the cells are used as-is.
+    """
+    base = pd.read_parquet(cov.local_path)
+    src_res = cov.hex_resolution or resolution
+    if resolution == src_res:
+        return base[["h3", "signal_dbm"]].copy()
+    if resolution > src_res:
+        child_h3: list[str] = []
+        child_sig: list[float] = []
+        for cell, sig in zip(base["h3"], base["signal_dbm"]):
+            for child in h3.cell_to_children(cell, resolution):
+                child_h3.append(child)
+                child_sig.append(sig)
+        return pd.DataFrame({"h3": child_h3, "signal_dbm": child_sig})
+    parents = base["h3"].map(lambda c: h3.cell_to_parent(c, resolution))
+    rolled = pd.DataFrame({"h3": parents, "signal_dbm": base["signal_dbm"]})
+    return rolled.groupby("h3", as_index=False)["signal_dbm"].max()
+
+
 def normalize_layers(
     cfg: Config,
     cov: CoverageFile,
@@ -303,6 +363,16 @@ def normalize_layers(
     cache_s = cfg.path("interim") / f"hex_{cov.vintage}_{cov.provider_id}_{safe_svc}_{scope}_r{site_res}.parquet"
     if cache_c.exists() and cache_s.exists():
         return pd.read_parquet(cache_c), pd.read_parquet(cache_s)
+
+    # Pre-indexed hex source (Redshift): the warehouse already resolved coverage
+    # to H3 cells, so there is nothing to polyfill. Build each resolution's
+    # county-tagged table directly from the hex list (normalize_layer handles
+    # any resolution change via H3 parent/child rollup).
+    if getattr(cov, "is_hex", False):
+        return (
+            normalize_layer(cfg, cov, counties, county_res, service_label),
+            normalize_layer(cfg, cov, counties, site_res, service_label),
+        )
 
     # Parent rollup requires site_res to be strictly finer than county_res.
     # Otherwise fall back to indexing each resolution independently.
@@ -361,6 +431,15 @@ def normalize_layer(
     )
     if cache.exists():
         return pd.read_parquet(cache)
+
+    if getattr(cov, "is_hex", False):
+        hex_df = _hex_layer_at_resolution(cov, resolution)
+        hex_df = assign_counties(hex_df, counties)
+        hex_df["provider_id"] = cov.provider_id
+        hex_df["technology"] = service_label
+        hex_df["vintage"] = cov.vintage
+        hex_df.to_parquet(cache, index=False)
+        return hex_df
 
     gdf = load_coverage_gdf(cov.local_path)
     signal_col = detect_signal_column(gdf)

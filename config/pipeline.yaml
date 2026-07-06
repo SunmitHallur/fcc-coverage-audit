@@ -27,19 +27,33 @@ source:
     min_seconds_between_requests: 6.5
 
   redshift:
-    # Filled in once access is granted (read from env / secrets, not committed).
+    # Connection (read from env / secrets, not committed).
     host: "${REDSHIFT_HOST}"
     port: 5439
     database: "${REDSHIFT_DB}"
     user: "${REDSHIFT_USER}"
     password: "${REDSHIFT_PASSWORD}"
-    # SQL template must return columns: provider_id, geometry (WKT, EPSG:4326),
-    # technology, speed_tier, environment. {vintage} {provider_id} {tech} are bound.
-    coverage_query: >-
-      SELECT provider_id, geometry_wkt, technology, speed_tier, environment
-      FROM bdc.mobile_coverage
-      WHERE as_of_date = '{vintage}' AND provider_id = {provider_id}
-        AND technology = '{tech}'
+    # The backend reads the warehouse's PRE-AGGREGATED H3 res-9 hex snapshots
+    # (`<schema>.<hex_table_prefix><build>`), one row per H3 cell with a 0/1
+    # coverage flag per (technology, speed tier, environment) and a comma-
+    # delimited `..._prov` list of the providers covering that cell. Because H3
+    # indexing is already done in the warehouse, the pipeline SKIPS polygon
+    # polyfill — only the covered cell ids come back to the laptop.
+    schema: "bdc_dataplatform"
+    hex_table_prefix: "bbmap_mobile_bb_tech_hex9s_"
+    hex_resolution: 9
+    # Companion raw table (per-provider polygons) used only for provider
+    # discovery when analysis.providers is "all".
+    merged_table_prefix: "bbmap_mobile_bb_merged_all_"
+    # FCC mobile environment code to read (0 or 1). Pick one consistently.
+    environment: 0
+    # Map each analysis service (by its `desc`) to the hex coverage column base;
+    # the environment suffix (_env0/_env1) is appended automatically.
+    service_hex_columns:
+      "5G-NR (7/1 Mbps)": "tech5g_spd1"
+      "5G-NR (35/3 Mbps)": "tech5g_spd2"
+      "4G LTE": "tech4g"
+      "3G": "tech3g"
 
   fixture:
     # Synthetic offline data for development / CI. See fcc_audit/fixtures.py
@@ -67,11 +81,19 @@ analysis:
   # or scope a first run with a FIPS list, e.g. ["48"] for Texas only.
   states: all
 
-  # Vintages to compare, given as the FCC `filing_subtype` label. Leave null to
-  # auto-pick the two most recent published filings.
+  # Vintages to compare. Meaning depends on the backend:
+  #   fcc      -> FCC `filing_subtype` label, e.g. "December 31, 2025".
+  #   redshift -> hex-snapshot BUILD id (the table-name suffix), e.g. "175".
+  # Leave null to auto-pick the two most recent (for redshift this is the two
+  # largest build ids, which may be only days apart — set them explicitly to
+  # compare two 6-month vintages).
   vintages:
-    current: null                  # e.g. "December 31, 2025"
-    prior: null                    # e.g. "June 30, 2025"
+    # Redshift build ids (tech_hex9s suffix). Both are D25-vs-J25 (the FCC
+    # benchmark pair). 277 and 279 are accessible today; switch current to "283"
+    # (a newer D25 reprocessing) once that build's permissions land. For the `fcc`
+    # backend, swap these for the filing labels ("December 31, 2025" / "June 30, 2025").
+    current: "277"                 # D25 (as-of 2025-12-31); use "283" when accessible
+    prior: "279"                   # J25 (as-of 2025-06-30)
 
 # ---------------------------------------------------------------------------
 # Geography / indexing
@@ -178,8 +200,10 @@ scoring:
 # Used by `python -m fcc_audit.cli benchmark` to check the pipeline reproduces
 # the FCC's own selected / not-selected decisions once real data is available.
 # ---------------------------------------------------------------------------
-benchmark:
-  vintages: { current: "December 31, 2025", prior: "June 30, 2025" }   # D25 vs J25
+  # Redshift build ids: 277 = D25 (use "283" once accessible), 279 = J25. For the
+  # `fcc` backend instead use the filing labels:
+  # { current: "December 31, 2025", prior: "June 30, 2025" }.
+  vintages: { current: "277", prior: "279" }   # D25 vs J25
   service_label: "5G-NR 7/1"
   # Optional per-county provider_id: when set, the check looks at whether THAT
   # provider was flagged in the county; when null, any provider counts.
