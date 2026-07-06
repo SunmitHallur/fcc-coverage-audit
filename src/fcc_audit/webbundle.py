@@ -425,67 +425,85 @@ def write_county_details(
     if scored.empty:
         return 0
 
+    # Pre-index scored rows and county boundaries by key so the per-county loop
+    # below never rescans a large frame. Without this, a nationwide run rescans
+    # the ~10^8-row coverage table (and the county GeoDataFrame) once PER county,
+    # which is O(counties x rows) and takes hours.
+    scored_by_key: dict[tuple[int, str, str], dict[str, Any]] = {}
+    for r in scored.assign(county_geoid=scored["county_geoid"].astype(str)).to_dict("records"):
+        scored_by_key[(int(r["provider_id"]), str(r["technology"]), str(r["county_geoid"]))] = r
+
+    counties_by_geoid: dict[str, gpd.GeoDataFrame] = {}
+    if counties is not None and not counties.empty:
+        for i, g in enumerate(counties["county_geoid"].astype(str)):
+            counties_by_geoid.setdefault(g, counties.iloc[[i]])
+
     keys = scored[["provider_id", "technology", "county_geoid"]].drop_duplicates()
     n = 0
-    for key_row in keys.to_dict("records"):
-        pid = int(key_row["provider_id"])
-        svc = str(key_row["technology"])
-        geoid = str(key_row["county_geoid"])
+    # Filter the big coverage/sites tables ONCE per (provider, service), then
+    # group coverage by county so each county is an O(1) dict lookup.
+    for (pid_raw, svc_raw), key_grp in keys.groupby(["provider_id", "technology"], sort=False):
+        pid = int(pid_raw)
+        svc = str(svc_raw)
         svc_dir = details_dir / str(pid) / _safe_service_key(svc)
-        geoid_dir = svc_dir / geoid
-        geoid_dir.mkdir(parents=True, exist_ok=True)
 
-        cov = coverage
+        cov_ps = coverage
         if not coverage.empty and "provider_id" in coverage.columns:
-            cov = coverage[coverage["provider_id"] == pid]
+            cov_ps = cov_ps[cov_ps["provider_id"] == pid]
         if not coverage.empty and "technology" in coverage.columns:
-            cov = cov[cov["technology"] == svc]
+            cov_ps = cov_ps[cov_ps["technology"] == svc]
+        cov_by_county: dict[str, pd.DataFrame] = {}
+        if not cov_ps.empty:
+            for g, sub in cov_ps.groupby(cov_ps["county_geoid"].astype(str), sort=False):
+                cov_by_county[str(g)] = sub
+        empty_cov = cov_ps.iloc[0:0]
 
         st = sites
         if not sites.empty and "provider_id" in sites.columns:
-            st = sites[sites["provider_id"] == pid]
+            st = st[st["provider_id"] == pid]
         if not sites.empty and "technology" in sites.columns:
             st = st[st["technology"] == svc]
 
-        detail = build_county_detail(geoid, cov, st, meta, counties=counties)
-        sr = scored[
-            (scored["provider_id"] == pid)
-            & (scored["technology"] == svc)
-            & (scored["county_geoid"].astype(str) == geoid)
-        ]
-        if not sr.empty:
-            row = sr.iloc[0]
-            detail["towers_prior"] = int(row.get("prior_towers", len(detail["sites_prior"])))
-            detail["towers_current"] = int(row.get("current_towers", len(detail["sites_current"])))
-            detail["new_towers"] = int(row.get("new_towers", 0))
-            detail["prior_towers_cross_border"] = int(row.get("prior_towers_cross_border", 0))
-            detail["current_towers_cross_border"] = int(row.get("current_towers_cross_border", 0))
-            detail["new_towers_cross_border"] = int(row.get("new_towers_cross_border", 0))
-        else:
-            detail["towers_prior"] = len(detail["sites_prior"])
-            detail["towers_current"] = len(detail["sites_current"])
-            detail["new_towers"] = max(0, detail["towers_current"] - detail["towers_prior"])
+        for geoid in key_grp["county_geoid"].astype(str):
+            geoid_dir = svc_dir / geoid
+            geoid_dir.mkdir(parents=True, exist_ok=True)
 
-        # Render server-side PNGs only when explicitly requested (--render-pngs).
-        # By default the cockpit renders hexes client-side via deck.gl H3HexagonLayer,
-        # which is ~1.4 MB/county cheaper and works at res 9/10.
-        if render_pngs:
-            all_sites_list = (detail.get("sites_prior") or []) + (detail.get("sites_current") or [])
-            render_extent = map_render.compute_render_extent(
-                detail.get("county_boundary"), all_sites_list,
-            )
-            context: dict[str, list] = {}
-            if render_extent is not None:
-                context = {
-                    "prior_hexes": _context_hexes_for_bbox(cov, render_extent, "prior"),
-                    "current_hexes": _context_hexes_for_bbox(cov, render_extent, "current"),
-                }
-            map_refs = map_render.render_county_compare_maps(detail, geoid_dir, context=context)
-            detail.update(map_refs)
+            cov = cov_by_county.get(geoid, empty_cov)
+            cty = counties_by_geoid.get(geoid)
+            detail = build_county_detail(geoid, cov, st, meta, counties=cty)
+            row = scored_by_key.get((pid, svc, geoid))
+            if row is not None:
+                detail["towers_prior"] = int(row.get("prior_towers", len(detail["sites_prior"])))
+                detail["towers_current"] = int(row.get("current_towers", len(detail["sites_current"])))
+                detail["new_towers"] = int(row.get("new_towers", 0))
+                detail["prior_towers_cross_border"] = int(row.get("prior_towers_cross_border", 0))
+                detail["current_towers_cross_border"] = int(row.get("current_towers_cross_border", 0))
+                detail["new_towers_cross_border"] = int(row.get("new_towers_cross_border", 0))
+            else:
+                detail["towers_prior"] = len(detail["sites_prior"])
+                detail["towers_current"] = len(detail["sites_current"])
+                detail["new_towers"] = max(0, detail["towers_current"] - detail["towers_prior"])
 
-        out = svc_dir / f"{geoid}.json"
-        out.write_text(json.dumps(detail, allow_nan=False), encoding="utf-8")
-        n += 1
+            # Render server-side PNGs only when explicitly requested (--render-pngs).
+            # By default the cockpit renders hexes client-side via deck.gl H3HexagonLayer,
+            # which is ~1.4 MB/county cheaper and works at res 9/10.
+            if render_pngs:
+                all_sites_list = (detail.get("sites_prior") or []) + (detail.get("sites_current") or [])
+                render_extent = map_render.compute_render_extent(
+                    detail.get("county_boundary"), all_sites_list,
+                )
+                context: dict[str, list] = {}
+                if render_extent is not None:
+                    context = {
+                        "prior_hexes": _context_hexes_for_bbox(cov, render_extent, "prior"),
+                        "current_hexes": _context_hexes_for_bbox(cov, render_extent, "current"),
+                    }
+                map_refs = map_render.render_county_compare_maps(detail, geoid_dir, context=context)
+                detail.update(map_refs)
+
+            out = svc_dir / f"{geoid}.json"
+            out.write_text(json.dumps(detail, allow_nan=False), encoding="utf-8")
+            n += 1
     log.info("wrote %d county detail files under %s", n, details_dir)
     return n
 
