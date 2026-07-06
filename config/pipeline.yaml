@@ -6,7 +6,7 @@
 # Redshift (enable once your AWS access is granted). Nothing downstream changes.
 # ---------------------------------------------------------------------------
 source:
-  backend: fcc            # "fcc" | "redshift" | "fixture"
+  backend: redshift       # "fcc" | "redshift" | "fixture"
 
   fcc:
     # Public (no-auth) catalog + download API used by the website itself. Requires
