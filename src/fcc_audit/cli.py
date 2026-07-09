@@ -365,6 +365,7 @@ def cmd_run(cfg: Config, args) -> int:
         web_meta.update(_demo_web_defaults(cfg, scored))
         web_paths = report.write_web_bundle(
             scored, sites, counties, web_dir, web_meta, coverage=coverage,
+            top_n=getattr(args, "top_n", 250),
         )
         paths.update({f"web_{k}": v for k, v in web_paths.items()})
 
@@ -425,9 +426,11 @@ def cmd_build_web(cfg: Config, args) -> int:
     web_meta = dict(meta)
     web_meta.update(_demo_web_defaults(cfg, scored))
     render_pngs = getattr(args, "render_pngs", False)
+    top_n = getattr(args, "top_n", 250)
     paths = report.write_web_bundle(
         scored, sites, counties, web_dir, web_meta, coverage=coverage,
         render_pngs=render_pngs,
+        top_n=top_n,
     )
     flagged = int(scored["flag_for_review"].sum()) if "flag_for_review" in scored.columns else 0
     log.info("web bundle ready: %d records, %d flagged", len(scored), flagged)
@@ -607,6 +610,10 @@ def main(argv: list[str] | None = None) -> int:
         help="also rebuild the static web bundle after this batch",
     )
     p_run.add_argument(
+        "--top-n", type=int, default=250,
+        help="max counties per provider×service with detail JSON and tier coloring (default 250)",
+    )
+    p_run.add_argument(
         "--workers", type=int, default=1,
         help="parallel worker processes for provider analysis (CPU-bound). "
              "Best used after `download` has cached the raw files, so workers "
@@ -630,6 +637,10 @@ def main(argv: list[str] | None = None) -> int:
     p_bw.add_argument(
         "--render-pngs", dest="render_pngs", action="store_true",
         help="also render server-side prior/current PNG maps (large; client-side hex rendering is the default)",
+    )
+    p_bw.add_argument(
+        "--top-n", type=int, default=250,
+        help="max counties per provider×service with detail JSON and tier coloring (default 250)",
     )
     p_bw.set_defaults(func=cmd_build_web)
     sub.add_parser("make-fixtures", help="generate synthetic offline data").set_defaults(

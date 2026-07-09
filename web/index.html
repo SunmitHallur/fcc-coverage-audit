@@ -120,7 +120,7 @@
     }
     .grad-bar {
       height: 10px; border-radius: 4px;
-      background: linear-gradient(to right, rgb(200,55,45), rgb(235,120,40), rgb(245,185,52), rgb(220,215,58), rgb(140,200,72), rgb(60,185,95), rgb(30,180,155), rgb(28,178,178));
+      background: linear-gradient(to right, rgb(200,55,45), rgb(235,120,40), rgb(245,185,52), rgb(220,215,58), rgb(140,200,72), rgb(60,185,95), rgb(22,163,74));
       border: 1px solid rgba(255,255,255,.08);
     }
     .colorblind-note {
@@ -463,9 +463,10 @@
           </div>
           <div class="signal-gradient-legend" id="signal-gradient-legend" style="display:none">
             <span class="grad-label">−120 dBm (weak)</span>
-            <div class="grad-bar" role="img" aria-label="Signal strength gradient from weak dark-red at -120 dBm to strong teal at -50 dBm"></div>
-            <span class="grad-label">−50 dBm (strong)</span>
-            <p class="colorblind-note">Signal strength uses a red→orange→yellow→green→teal scale (shifted toward green for visibility, since most coverage sits at the weak end); check tower markers if colors are hard to distinguish.</p>
+            <div class="grad-bar" role="img" aria-label="Signal strength gradient from weak red at -120 dBm to strong green at -70 dBm"></div>
+            <span class="grad-label">−70 dBm (strong)</span>
+            <p class="colorblind-note">Signal strength uses a red→orange→yellow→green scale (shifted toward green for visibility, since most coverage sits at the weak end); check tower markers if colors are hard to distinguish.</p>
+            <p class="colorblind-note" id="signal-estimated-note" style="display:none">⚠ This source reports coverage as a yes/no flag with no signal values; the gradient shown is <strong>estimated from distance to the nearest inferred tower</strong> and is for orientation only.</p>
           </div>
         </div>
         <div class="section-label">Analysis</div>
@@ -502,10 +503,11 @@
         <label><input type="checkbox" id="flagged-only" /> Flagged counties only</label>
       </div>
       <div class="legend">
-        <div class="legend-head">County shading</div>
-        <div class="legend-row"><span class="swatch" style="background:#ef4444"></span> High priority / flagged</div>
-        <div class="legend-row"><span class="swatch" style="background:#f59e0b"></span> Moderate change</div>
-        <div class="legend-row"><span class="swatch" style="background:#334155"></span> No data / low change</div>
+        <div class="legend-head">County shading (priority rank)</div>
+        <div class="legend-row"><span class="swatch" style="background:#ef4444"></span> Top 50</div>
+        <div class="legend-row"><span class="swatch" style="background:#f59e0b"></span> 51–100</div>
+        <div class="legend-row"><span class="swatch" style="background:#eab308"></span> 101–150</div>
+        <div class="legend-row"><span class="swatch" style="background:#22c55e"></span> All others</div>
         <div class="legend-head">Towers (dots)</div>
         <div class="legend-row"><span class="swatch-dot" style="background:#22c55e"></span> New tower (built since prior)</div>
         <div class="legend-row"><span class="swatch-dot" style="background:#a855f7"></span> Expanded existing tower</div>
@@ -542,11 +544,11 @@
       return String(service).replace(/\//g, '-').replace(/\s/g, '');
     }
 
-    /** Heat-map color scale (weak → strong), shifted toward green/yellow. */
+    /** Heat-map color scale: weak = red → strong = green (capped at green). */
     // Real FCC mobile coverage clusters at the weak end (-100 to -120 dBm), so the
     // strict RSRP scale (green only at -60/-50) renders almost everything red. This
-    // ramp is shifted ~20 dB warmer for visibility: the common mid band (-85 to
-    // -100) reads yellow/green and red is reserved for the very weakest fringe.
+    // ramp is shifted ~20 dB warmer for visibility, and the strong end saturates
+    // at green (no teal/blue) so any signal at/above -70 dBm reads as full green.
     const _SIGNAL_STOPS = [
       [-125, [200, 55, 45]],
       [-118, [235, 120, 40]],
@@ -554,8 +556,7 @@
       [-102, [220, 215, 58]],
       [-94,  [140, 200, 72]],
       [-85,  [60, 185, 95]],
-      [-72,  [30, 180, 155]],
-      [-55,  [28, 178, 178]],
+      [-70,  [22, 163, 74]],
     ];
     function signalColor(dbm) {
       const stops = _SIGNAL_STOPS;
@@ -1093,15 +1094,14 @@
     }
 
     function colorForRecord(rec) {
-      if (!rec) return '#334155';
-      const p = rec.priority || 0;
-      const ch = rec.metrics?.pct_increase || rec.metrics?.added_frac_of_county || 0;
-      const v = metricMode === 'change' ? Math.min(ch || 0, 1) : p;
-      if (rec.flag) return '#ef4444';
-      if (v >= 0.7) return '#ef4444';
-      if (v >= 0.4) return '#f59e0b';
-      if (v >= 0.15) return '#64748b';
-      return '#334155';
+      const tierColors = {
+        red: '#ef4444',
+        orange: '#f59e0b',
+        yellow: '#eab308',
+        green: '#22c55e',
+      };
+      if (!rec) return '#22c55e';
+      return tierColors[rec.tier] || '#22c55e';
     }
 
     function applyFeatureStates() {
@@ -1117,7 +1117,7 @@
           { source: 'counties', id: geoid },
           {
             hasData: show,
-            flag: rec?.flag || false,
+            flag: rec?.tier === 'red',
             priority: rec?.priority || 0,
             color: colorForRecord(rec)
           }
@@ -1379,6 +1379,8 @@
         setCompareMode('map');
         document.getElementById('compare-maps').style.display = 'grid';
         document.getElementById('signal-gradient-legend').style.display = 'grid';
+        document.getElementById('signal-estimated-note').style.display =
+          detail.signal_estimated ? 'block' : 'none';
         const countyFeature = resolveCountyFeature(rec.geoid, detail);
         const priorGeo = hexesToGeoJSON(detail.prior_hexes, detail.sites_prior);
         const currentGeo = hexesToGeoJSON(detail.current_hexes, detail.sites_current);

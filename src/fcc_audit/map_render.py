@@ -17,13 +17,14 @@ from shapely.geometry import Polygon, box, shape
 
 log = logging.getLogger(__name__)
 
-# FCC-style: weak (red) → strong (green/teal), dBm -120 .. -50.
+# FCC-style: weak (red) → strong (green), dBm -120 .. -70. Capped at green —
+# no teal/blue at the strong end so saturated data still reads green.
 _CMAP = LinearSegmentedColormap.from_list(
     "fcc_signal",
-    ["#8b0000", "#dc2626", "#f97316", "#eab308", "#84cc16", "#22c55e", "#14b8a6"],
+    ["#8b0000", "#dc2626", "#f97316", "#eab308", "#84cc16", "#22c55e", "#16a34a"],
     N=256,
 )
-_NORM = Normalize(vmin=-120, vmax=-50)
+_NORM = Normalize(vmin=-120, vmax=-70)
 
 _TOWER_IN = {
     "new_site": "#15803d",

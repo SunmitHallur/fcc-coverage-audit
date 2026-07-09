@@ -68,6 +68,37 @@ def _safe_service_key(service: str) -> str:
     return service.replace("/", "-").replace(" ", "")
 
 
+def _tier_for_rank(rank: int, top_n: int = 250) -> str | None:
+    """Map 1-based rank within a provider×service group to a display tier."""
+    if rank < 1 or rank > top_n:
+        return None
+    if rank <= 50:
+        return "red"
+    if rank <= 100:
+        return "orange"
+    if rank <= 150:
+        return "yellow"
+    return "green"
+
+
+def assign_record_tiers(scored: pd.DataFrame, top_n: int = 250) -> pd.DataFrame:
+    """Rank counties per provider×service and attach a ``tier`` for the top *top_n*."""
+    if scored.empty:
+        return scored
+    out = scored.copy()
+    tiers = pd.Series([None] * len(out), index=out.index, dtype=object)
+    for (_pid, _svc), grp in out.groupby(["provider_id", "technology"], sort=False):
+        ranked = grp.sort_values(
+            ["priority_score", "added_km2"],
+            ascending=[False, False],
+            na_position="last",
+        )
+        for rank, idx in enumerate(ranked.index[:top_n], start=1):
+            tiers.loc[idx] = _tier_for_rank(rank, top_n)
+    out["tier"] = tiers
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Flag-math tooltip export
 # ---------------------------------------------------------------------------
@@ -166,7 +197,7 @@ def _record_from_dict(r: dict[str, Any], threshold: float, weights: dict[str, fl
             metrics[k] = _finite_or_none(r[k]) if k in r else None
     if "pct_increase" in r:
         metrics["pct_increase"] = _finite_or_none(r["pct_increase"])
-    return {
+    rec: dict[str, Any] = {
         "geoid": str(r["county_geoid"]),
         "name": str(r.get("county_name", "")),
         "state_fips": str(r.get("state_fips", "")),
@@ -179,6 +210,10 @@ def _record_from_dict(r: dict[str, Any], threshold: float, weights: dict[str, fl
         "explanation": expl,
         "flag_math": _build_flag_math(row_series, threshold, weights),
     }
+    tier = r.get("tier")
+    if tier is not None and not (isinstance(tier, float) and math.isnan(tier)):
+        rec["tier"] = str(tier)
+    return rec
 
 
 def build_web_records(
@@ -387,6 +422,45 @@ def _sites_serving_county(
     return out
 
 
+def _estimate_signal_from_sites(
+    hexes: list[list],
+    site_list: list[dict[str, Any]],
+) -> tuple[list[list], bool]:
+    """Replace a FLAT per-hex signal with a distance-to-tower estimate.
+
+    Binary coverage sources (the Redshift 0/1 hex snapshots) carry no signal,
+    so every hex encodes the same value and the heat map renders one solid
+    color. For display only, synthesize a plausible RSRP via log-distance path
+    loss from the nearest inferred site: −65 dBm at the tower falling to
+    −120 dBm at the far fringe. Analysis never sees these values.
+
+    Returns ``(hexes, estimated)`` — untouched when signal already varies or
+    when there are no sites to measure distance from.
+    """
+    if not hexes or not site_list:
+        return hexes, False
+    values = {enc for _cell, enc in hexes}
+    if len(values) > 1:
+        return hexes, False
+
+    site_lat = np.array([float(s["lat"]) for s in site_list])
+    site_lng = np.array([float(s["lng"]) for s in site_list])
+    out: list[list] = []
+    for cell, _enc in hexes:
+        try:
+            lat, lng = h3.cell_to_latlng(str(cell))
+        except Exception:
+            out.append([cell, _encode_signal(-95.0)])
+            continue
+        # Equirectangular distance is plenty accurate at county scale.
+        dx = (site_lng - lng) * 111.32 * math.cos(math.radians(lat))
+        dy = (site_lat - lat) * 110.57
+        d_km = float(np.min(np.hypot(dx, dy)))
+        dbm = max(-120.0, -65.0 - 25.0 * math.log10(1.0 + d_km))
+        out.append([cell, _encode_signal(dbm)])
+    return out, True
+
+
 def build_county_detail(
     geoid: str,
     coverage: pd.DataFrame,
@@ -403,6 +477,14 @@ def build_county_detail(
         "sites_prior": _sites_serving_county(sites, coverage, geoid, "prior"),
         "sites_current": _sites_serving_county(sites, coverage, geoid, "current"),
     }
+    detail["prior_hexes"], est_p = _estimate_signal_from_sites(
+        detail["prior_hexes"], detail["sites_prior"],
+    )
+    detail["current_hexes"], est_c = _estimate_signal_from_sites(
+        detail["current_hexes"], detail["sites_current"],
+    )
+    if est_p or est_c:
+        detail["signal_estimated"] = True
     if counties is not None:
         boundary = _county_boundary_feature(counties, geoid)
         if boundary:
@@ -438,7 +520,11 @@ def write_county_details(
         for i, g in enumerate(counties["county_geoid"].astype(str)):
             counties_by_geoid.setdefault(g, counties.iloc[[i]])
 
-    keys = scored[["provider_id", "technology", "county_geoid"]].drop_duplicates()
+    # Only emit per-county detail JSON for tiered (top-N) counties — main storage win.
+    detail_scored = scored
+    if "tier" in scored.columns:
+        detail_scored = scored[scored["tier"].notna()]
+    keys = detail_scored[["provider_id", "technology", "county_geoid"]].drop_duplicates()
     n = 0
     # Filter the big coverage/sites tables ONCE per (provider, service), then
     # group coverage by county so each county is an O(1) dict lookup.
@@ -546,6 +632,7 @@ def write_web_bundle(
     threshold: float = 0.0,
     weights: dict[str, float] | None = None,
     render_pngs: bool = False,
+    top_n: int = 250,
 ) -> dict[str, Path]:
     """Write static web data bundle under ``web/public/data/``."""
     data_dir = web_dir / "public" / "data"
@@ -554,8 +641,9 @@ def write_web_bundle(
     towers_dir.mkdir(parents=True, exist_ok=True)
 
     counties_path = data_dir / "counties.geojson"
-    records_path = data_dir / "records.json"
     meta_path = data_dir / "meta.json"
+
+    scored = assign_record_tiers(scored, top_n=top_n)
 
     geoids = set(scored["county_geoid"].astype(str).unique()) if not scored.empty else None
     geo = build_counties_geojson(counties, simplify_tolerance, geoids=geoids)
@@ -568,9 +656,8 @@ def write_web_bundle(
     counties_path.write_text(json.dumps(geo), encoding="utf-8")
 
     records = build_web_records(scored, threshold=threshold, weights=weights or {})
-    records_path.write_text(json.dumps(records, allow_nan=False), encoding="utf-8")
 
-    # Also write per-provider split files for lazy loading:
+    # Per-provider split files for lazy loading (monolithic records.json omitted):
     # data/records/<pid>/<svc_key>.json — tiny index per provider+service
     records_split_dir = data_dir / "records"
     records_split_dir.mkdir(parents=True, exist_ok=True)
@@ -582,6 +669,8 @@ def write_web_bundle(
             svc_path.write_text(json.dumps(geoid_map, allow_nan=False), encoding="utf-8")
 
     web_meta = build_web_meta(scored, meta)
+    web_meta["top_n"] = top_n
+    web_meta["use_split_records"] = True
     meta_path.write_text(json.dumps(web_meta, indent=2), encoding="utf-8")
 
     towers_by_provider = build_towers_by_provider(sites)
@@ -604,7 +693,7 @@ def write_web_bundle(
     )
     return {
         "counties": counties_path,
-        "records": records_path,
+        "records_dir": records_split_dir,
         "meta": meta_path,
         "towers_dir": towers_dir,
     }
