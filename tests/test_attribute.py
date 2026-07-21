@@ -68,6 +68,23 @@ def test_new_tower_in_neighbor_counted_for_growth():
     assert row["new_towers_cross_border"] == 1
 
 
+def test_gain_without_inferred_sites_is_fully_unattributed():
+    cells = h3.grid_disk(h3.latlng_to_cell(39.05, -98.80, 8), 1)
+    change = pd.DataFrame([
+        {"h3": cell, "county_geoid": CHARLIE, "status": "new"}
+        for cell in cells
+    ])
+
+    attr = attribute.attribute_changes(change, pd.DataFrame(), resolution=8)
+
+    assert len(attr) == 1
+    row = attr.iloc[0]
+    assert row["added_km2_unattributed"] > 0
+    assert row["added_km2_new_site"] == 0
+    assert row["added_km2_expanded_site"] == 0
+    assert row["new_towers"] == 0
+
+
 def test_cross_border_build_not_flagged_when_growth_explained():
     cfg = load_config()
     county_change = pd.DataFrame([{

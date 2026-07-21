@@ -18,7 +18,7 @@ duckdb==1.5.4            # out-of-core joins for nationwide data
 pyarrow==24.0.0          # parquet engine for interim caching
 
 # --- machine learning (all local; no external API) ---
-scikit-learn==1.9.0      # HDBSCAN (site inference) + IsolationForest (anomaly ranking)
+scikit-learn==1.9.0      # validation models and local analytical utilities
 scipy==1.18.0
 
 # --- HTTP / config ---

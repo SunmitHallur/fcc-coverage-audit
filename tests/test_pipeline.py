@@ -44,7 +44,10 @@ def scored() -> pd.DataFrame:
     all_sites = []
     all_coverage = []
     for provider in _resolve_providers(cfg, source, current):
-        feats, sites, coverage = process_provider(cfg, source, provider, current, prior, counties, areas)
+        feats, sites, coverage, completed = process_provider(
+            cfg, source, provider, current, prior, counties, areas,
+        )
+        assert completed
         if not feats.empty:
             all_feats.append(feats)
         if not sites.empty:

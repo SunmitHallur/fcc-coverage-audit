@@ -3,7 +3,8 @@ REM ============================================================================
 REM  FCC Coverage-Change Audit - one-command launcher (Windows / work laptop)
 REM
 REM  Double-click this file, or from a terminal:
-REM     run.bat                     ->  download + analyze ALL providers/techs
+REM     run.bat                     ->  full national batched run + final web build
+REM     run.bat build-web           ->  rebuild web from completed national batches
 REM     run.bat download            ->  only pre-fetch raw data from the FCC API
 REM     run.bat run --current 2025-12-31 --prior 2025-06-30
 REM
@@ -24,11 +25,11 @@ if not exist ".venv\Scripts\python.exe" (
 
 set "PYTHONPATH=src"
 
-REM 2) Run. With no arguments, do a full national run that deletes each raw file
-REM    after processing so disk usage stays bounded.
+REM 2) Run. With no arguments, use the crash-safe geographic batch runner.
+REM    It validates all 50 states + DC, then builds the final web bundle once.
 if "%~1"=="" (
-    echo [run] full pipeline: all providers, all configured technologies
-    ".venv\Scripts\python.exe" -m fcc_audit.cli run --cleanup-raw
+    echo [run] full national pipeline: geographic batches + validated web build
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0run_overnight.ps1"
 ) else (
     ".venv\Scripts\python.exe" -m fcc_audit.cli %*
 )

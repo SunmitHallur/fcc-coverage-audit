@@ -51,7 +51,7 @@ foreach ($b in $batches) {
   # Quote the batch string so commas stay in ONE --states arg. Unquoted, some
   # shells/arg parsers split "20,19,49" into argv tokens and only the first FIPS
   # (Kansas for this batch) is honored — looks "national" in the log, one state in results.
-  & $py -m fcc_audit.cli run --states "$b"
+  & $py -m fcc_audit.cli run --states "$b" --cleanup-raw
   if ($LASTEXITCODE -ne 0) {
     $failedBatches += $b
     Write-Warning "Batch failed or was incomplete: $b (exit $LASTEXITCODE)"

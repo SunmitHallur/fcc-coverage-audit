@@ -310,8 +310,11 @@ def infer_sites(hex_df: pd.DataFrame, cfg: Config, label_prefix: str = "S") -> p
             # strong core, so attribution scales this up by a margin.
             reach = float(np.max(np.hypot(xs - cx, ys - cy)))
             lng, lat = _INV.transform(cx, cy)
-            counties = pd.Series([county_by_cell.get(c) for c in lobe]).dropna()
-            county = counties.mode().iloc[0] if not counties.empty else None
+            # Assign home geography from the cell nearest the inferred tower
+            # centroid. A modal lobe county can put a border tower in the wrong
+            # state merely because most of its propagation footprint crosses it.
+            nearest_cell = lobe[int(np.argmin(np.hypot(xs - cx, ys - cy)))]
+            county = county_by_cell.get(nearest_cell)
             sites.append(
                 {
                     "site_id": f"{label_prefix}{site_idx}",

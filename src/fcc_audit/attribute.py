@@ -224,7 +224,7 @@ def attribute_changes(
     gained = change_df[change_df["status"].isin(["new", "upgraded"])].dropna(
         subset=["county_geoid"]
     ).copy()
-    if gained.empty or current_sites.empty:
+    if gained.empty:
         return pd.DataFrame(
             columns=[
                 "county_geoid", "added_km2_new_site",
@@ -232,6 +232,20 @@ def attribute_changes(
                 "new_towers", "new_towers_in_county", "new_towers_cross_border",
             ]
         )
+    if current_sites.empty:
+        # A thin/small full-gain layer may not meet tower-inference thresholds.
+        # Those gained cells did not disappear analytically: with no inferred
+        # site, all of their area is explicitly unattributed.
+        counts = gained.groupby("county_geoid").size()
+        return pd.DataFrame({
+            "county_geoid": counts.index.astype(str),
+            "added_km2_new_site": 0.0,
+            "added_km2_expanded_site": 0.0,
+            "added_km2_unattributed": counts.to_numpy(dtype=float) * hex_km2,
+            "new_towers": 0,
+            "new_towers_in_county": 0,
+            "new_towers_cross_border": 0,
+        })
 
     site_idx, _, attribution = attribute_hexes_to_sites(gained, current_sites)
     gained["attributed_site_idx"] = site_idx

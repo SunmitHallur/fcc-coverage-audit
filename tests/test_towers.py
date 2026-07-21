@@ -56,6 +56,23 @@ def test_binary_single_lobe_yields_one_site(cfg):
     assert _km_to(sites.iloc[0]["lat"], sites.iloc[0]["lng"], center) < 1.0
 
 
+def test_site_home_county_comes_from_centroid_not_lobe_majority(cfg):
+    center = h3.latlng_to_cell(38.50, -98.50, 9)
+    cells = list(h3.grid_disk(center, 15))
+    df = pd.DataFrame({
+        "h3": cells,
+        "signal_dbm": 0.0,
+        # Simulate a border-crossing lobe: almost all coverage cells are across
+        # the border, but the inferred tower centroid is in county 20001.
+        "county_geoid": ["20001" if cell == center else "29001" for cell in cells],
+    })
+
+    sites = infer_sites(df, cfg, "T")
+
+    assert len(sites) == 1
+    assert sites.iloc[0]["county_geoid"] == "20001"
+
+
 def test_adaptive_core_for_strong_bands_only_provider():
     """A provider filing only strong bands (-80/-85) must not have its entire
     footprint treated as 'core' — the threshold tightens to its own top band."""

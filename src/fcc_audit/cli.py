@@ -68,6 +68,38 @@ def _target_rows(df: pd.DataFrame, states: list[str]) -> pd.DataFrame:
     return df.loc[state.isin(wanted)].reset_index(drop=True)
 
 
+def _sites_relevant_to_coverage(
+    sites: pd.DataFrame,
+    coverage: pd.DataFrame,
+    target_states: list[str],
+) -> pd.DataFrame:
+    """Keep target-home sites and cross-border sites that serve target coverage."""
+    if sites.empty or not target_states:
+        return sites
+    wanted = set(target_states)
+    keep: set[int] = set(
+        sites.index[
+            sites["county_geoid"].astype(str).str[:2].isin(wanted)
+        ].tolist()
+    )
+    keys = ["provider_id", "technology", "vintage"]
+    if coverage.empty or any(key not in sites or key not in coverage for key in keys):
+        return sites.loc[sorted(keep)].reset_index(drop=True)
+    for values, site_group in sites.groupby(keys, sort=False):
+        mask = pd.Series(True, index=coverage.index)
+        for key, value in zip(keys, values):
+            mask &= coverage[key] == value
+        cov_group = coverage.loc[mask]
+        if cov_group.empty:
+            continue
+        local_indices, _, _ = attribute.attribute_hexes_to_sites(
+            cov_group, site_group.reset_index(drop=True),
+        )
+        valid = sorted(set(int(i) for i in local_indices if i >= 0))
+        keep.update(site_group.index[valid].tolist())
+    return sites.loc[sorted(keep)].reset_index(drop=True)
+
+
 def _context_states(counties, target_states: list[str], buffer_m: float = 50_000) -> list[str]:
     """Add states within *buffer_m* of target states for cross-border tower context."""
     if not target_states:
@@ -249,11 +281,12 @@ def process_provider(
     counties,
     county_area_km2: dict | None = None,
     cleanup_raw: bool = False,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, set[tuple[int, str]]]:
     log = logging.getLogger(__name__)
     log.info("=== %s (id=%s) ===", provider.name, provider.id)
 
     feats_parts, sites_parts, coverage_parts = [], [], []
+    completed_units: set[tuple[int, str]] = set()
     for svc in cfg.services:
         label, desc = svc["label"], svc["desc"]
         try:
@@ -270,6 +303,7 @@ def process_provider(
         feats, sites, coverage = _analyze_unit(
             cfg, provider, label, cur_file, pri_file, counties, county_area_km2,
         )
+        completed_units.add((int(provider.id), str(label)))
         if not feats.empty:
             feats_parts.append(feats)
         if not sites.empty:
@@ -288,10 +322,12 @@ def process_provider(
     feats = pd.concat(feats_parts, ignore_index=True) if feats_parts else pd.DataFrame()
     sites = pd.concat(sites_parts, ignore_index=True) if sites_parts else pd.DataFrame()
     coverage = pd.concat(coverage_parts, ignore_index=True) if coverage_parts else pd.DataFrame()
-    return feats, sites, coverage
+    return feats, sites, coverage, completed_units
 
 
-def _provider_worker(payload: dict) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def _provider_worker(
+    payload: dict,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, set[tuple[int, str]]]:
     """Process one provider in a separate process (for ``run --workers N``).
 
     Each worker rebuilds its own config/source/counties so nothing large needs
@@ -386,12 +422,17 @@ def _save_batch_results(
         "current": meta["current"],
         "prior": meta["prior"],
         "states": states or ["all"],
+        "query_states": meta.get("query_states", states or ["all"]),
         "analysis_units": meta.get("analysis_units", []),
+        "completed_analysis_units": meta.get("completed_analysis_units", []),
+        "missing_analysis_units": meta.get("missing_analysis_units", []),
+        "status": "complete" if not meta.get("missing_analysis_units") else "incomplete",
         "completed_at": batch_ts,
     }
-    (manifests_dir / f"batch_{states_key}.json").write_text(
-        json.dumps(manifest, indent=2), encoding="utf-8",
-    )
+    manifest_path = manifests_dir / f"batch_{states_key}.json"
+    manifest_tmp = manifest_path.with_suffix(".json.part")
+    manifest_tmp.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    manifest_tmp.replace(manifest_path)
 
 
 def cmd_run(cfg: Config, args) -> int:
@@ -408,6 +449,16 @@ def cmd_run(cfg: Config, args) -> int:
     target_key = "-".join(sorted(target_states)) if target_states else "all"
     run_dir = cfg.path("processed") / _run_key(cfg, current, prior)
     (run_dir / "manifests" / f"batch_{target_key}.json").unlink(missing_ok=True)
+    for stale in (run_dir / "scored").glob(f"scored_*_{target_key}.parquet"):
+        stale.unlink()
+    (run_dir / "sites" / f"sites_{target_key}.parquet").unlink(missing_ok=True)
+    coverage_dir = run_dir / "coverage"
+    stale_coverage = (
+        [coverage_dir / f"coverage_{state}.parquet" for state in target_states]
+        if target_states else list(coverage_dir.glob("coverage_*.parquet"))
+    )
+    for stale in stale_coverage:
+        stale.unlink(missing_ok=True)
 
     counties = normalize.load_counties(cfg)
     county_area_km2 = normalize.county_areas_km2(counties, cfg.geography["equal_area_crs"])
@@ -421,12 +472,19 @@ def cmd_run(cfg: Config, args) -> int:
             cfg.set_states(context_states)
 
     providers = _resolve_providers(cfg, source, current)
+    expected_units = {
+        (int(provider.id), str(service["label"]))
+        for provider in providers
+        for service in cfg.services
+    }
     cleanup_raw = bool(getattr(args, "cleanup_raw", False)) and cfg.raw["source"]["backend"] != "fixture"
     workers = max(1, int(getattr(args, "workers", 1) or 1))
     all_feats, all_sites, all_coverage = [], [], []
+    completed_units: set[tuple[int, str]] = set()
 
     def _collect(result):
-        feats, sites, coverage = result
+        feats, sites, coverage, completed = result
+        completed_units.update(completed)
         feats = _target_rows(feats, target_states)
         coverage = _target_rows(coverage, target_states)
         if not feats.empty:
@@ -463,16 +521,17 @@ def cmd_run(cfg: Config, args) -> int:
                 cfg, source, provider, current, prior, counties, county_area_km2, cleanup_raw
             ))
 
-    if not all_feats:
-        log.error("no features produced; nothing to score")
-        return 1
+    missing_units = sorted(expected_units - completed_units)
+    if missing_units:
+        log.error(
+            "incomplete batch: %d provider/service units did not complete: %s",
+            len(missing_units),
+            "; ".join(f"{provider_id}/{service}" for provider_id, service in missing_units),
+        )
+        return 2
 
-    features = pd.concat(all_feats, ignore_index=True)
-    scored = score.score(features, cfg)
-    scored = explain.add_explanations(scored)
     sites = pd.concat(all_sites, ignore_index=True) if all_sites else pd.DataFrame()
     coverage = pd.concat(all_coverage, ignore_index=True) if all_coverage else pd.DataFrame()
-
     states_label = ",".join(target_states) if target_states else "all"
     meta = {
         "current": current,
@@ -485,7 +544,28 @@ def cmd_run(cfg: Config, args) -> int:
             for provider in providers
             for service in cfg.services
         ],
+        "completed_analysis_units": [
+            {"provider_id": provider_id, "technology": service}
+            for provider_id, service in sorted(completed_units)
+        ],
+        "missing_analysis_units": [],
+        "query_states": _states_list(cfg) or ["all"],
     }
+
+    sites = _sites_relevant_to_coverage(sites, coverage, target_states)
+    if not all_feats:
+        # A successful all-empty query is complete, not a failed batch. Persist
+        # its success manifest so national completeness can distinguish zero
+        # coverage from a skipped/erroring provider-service unit.
+        _save_batch_results(
+            cfg, pd.DataFrame(), sites, meta, coverage, states=target_states,
+        )
+        log.info("batch complete: all provider/service layers were valid but produced no rows")
+        return 0
+
+    features = pd.concat(all_feats, ignore_index=True)
+    scored = score.score(features, cfg)
+    scored = explain.add_explanations(scored)
     _save_batch_results(cfg, scored, sites, meta, coverage, states=target_states)
 
     dashboard_dir = cfg.project_root / "dashboard"
@@ -543,11 +623,19 @@ def cmd_build_web(cfg: Config, args) -> int:
                 continue
             if str(manifest.get("current")) != current or str(manifest.get("prior")) != prior:
                 continue
+            if manifest.get("status", "complete") != "complete":
+                continue
             states = manifest.get("states") or []
             units = frozenset(
                 (int(unit["provider_id"]), str(unit["technology"]))
                 for unit in manifest.get("analysis_units", [])
             )
+            completed = frozenset(
+                (int(unit["provider_id"]), str(unit["technology"]))
+                for unit in manifest.get("completed_analysis_units", manifest.get("analysis_units", []))
+            )
+            if completed != units or manifest.get("missing_analysis_units"):
+                continue
             if units:
                 unit_sets.add(units)
             if "all" in states:
@@ -684,7 +772,7 @@ def cmd_download(cfg: Config, args) -> int:
             for svc in services:
                 try:
                     cov = source.fetch(provider.id, svc["desc"], vintage)
-                except (FileNotFoundError, RuntimeError) as exc:
+                except FileNotFoundError as exc:
                     log.warning("skip %s %s @ %s: %s", provider.name, svc["label"], vintage, exc)
                     n_skipped += 1
                     continue
@@ -750,7 +838,7 @@ def cmd_benchmark(cfg: Config, args) -> int:
     county_area_km2 = normalize.county_areas_km2(counties, cfg.geography["equal_area_crs"])
     all_feats = []
     for provider in _resolve_providers(cfg, source, current):
-        feats, _, _ = process_provider(
+        feats, _, _, _ = process_provider(
             cfg, source, provider, current, prior, counties, county_area_km2
         )
         if not feats.empty:

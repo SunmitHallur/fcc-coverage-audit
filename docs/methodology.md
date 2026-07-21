@@ -52,7 +52,7 @@ BDC hex files
     ├─ attribute.py     Attribution: assign gained hexes to nearest site; classify as
     │                   same-site / new-site / unattributed
     │
-    ├─ score.py         Feature engineering → IsolationForest anomaly score → flag
+    ├─ score.py         Feature engineering → monotone bounded score → flag
     │
     ├─ groundtruth_asr.py + groundtruth_measured.py   (optional corroboration)
     │
@@ -105,9 +105,13 @@ BDC hex files
 
 ## 5. Flagging logic
 
-### 5a. Anomaly score (IsolationForest)
+### 5a. Deterministic monotone priority score
 
-All numeric features are passed through scikit-learn's `IsolationForest` (unsupervised). The output is a `priority_score` in [0, 1]; higher = more anomalous.
+Each configured feature is mapped to a fixed [0, 1] scale and combined with
+auditable weights. Suspicious features can only increase the score, while
+legitimacy features can only decrease it. Each feature's maximum possible score
+swing is 0.25, and the score for a county does not change when unrelated
+counties are added to or removed from the run.
 
 Flagging threshold: the `flag_percentile` percentile of all priority scores across the run (default: top 10%). This is intentionally conservative: we prefer fewer high-confidence flags over many uncertain ones.
 
@@ -199,7 +203,10 @@ The BDC is filed semi-annually. One large jump may represent two half-year build
 
 ### 8e. No supervised labels (yet)
 
-The IsolationForest is unsupervised. Once the `validate` subcommand has accumulated enough human-reviewed accept/reject decisions, a supervised model can be trained and benchmarked against it. Until then, precision/recall are estimated against ASR/measurement ground truth only.
+The monotone score is deterministic rather than learned. Once the `validate`
+subcommand has accumulated enough human-reviewed accept/reject decisions, a
+supervised model can be trained and benchmarked against it. Until then,
+precision/recall are estimated against ASR/measurement ground truth only.
 
 ---
 

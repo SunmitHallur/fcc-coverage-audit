@@ -1,21 +1,19 @@
 """Gaming-risk feature engineering, anomaly ranking, and prioritization.
 
-Produces one row per (provider, county) with interpretable risk features, an
-IsolationForest anomaly score, a composite priority score, and a flag for the
-counties the FCC should manually test. Designed so a reviewer can see *why* a
-county was flagged, not just that it was.
+Produces one row per (provider, county) with interpretable risk features, a
+deterministic monotone priority score, and a flag for the counties the FCC
+should manually test. Designed so a reviewer can see *why* a county was
+flagged, not just that it was.
 """
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import IsolationForest
 
 from .config import Config
 
 _EPS = 1e-9
-# Cap runaway percentages (e.g. coverage from 0 -> something => inf).
-_PCT_CAP = 5.0
+_MAX_FEATURE_INFLUENCE = 0.25
 # A large RELATIVE jump only matters when the ABSOLUTE area gained is also
 # meaningful: going from 0% to 1% of a county is a huge percentage but a trivial
 # absolute change and is not a concern. The relative-jump feature is dampened by
@@ -66,18 +64,17 @@ def build_features(
     # PRIMARY drivers.
     df["added_frac_of_county"] = df.get("added_frac_of_county", 0.0)
     df["added_frac_of_county"] = df["added_frac_of_county"].clip(lower=0.0).fillna(0.0)
-    # Relative jump (D25/J25), capped, then ABSOLUTE-GATED: a near-zero-base
+    # Relative jump (D25/J25), bounded, then ABSOLUTE-GATED: a near-zero-base
     # percentage (e.g. 0% -> 1% of county) is huge in relative terms but trivial
     # in absolute terms, so it must not inflate the score. Dampen by a saturating
     # ramp on the added fraction of county; a county that adds a negligible
     # absolute share contributes a near-zero relative-jump signal regardless of
     # how large the percentage looks.
-    rel_jump = (
-        df["pct_increase"]
-        .replace([np.inf, -np.inf], _PCT_CAP)
-        .clip(upper=_PCT_CAP)
-        .fillna(0.0)
-    )
+    raw_rel_jump = df["pct_increase"].clip(lower=0.0).fillna(0.0)
+    # x/(1+x) is strictly increasing and bounded, unlike a hard cap. Positive
+    # infinity (zero prior coverage -> positive current coverage) maps to 1.
+    rel_jump = raw_rel_jump / (1.0 + raw_rel_jump)
+    rel_jump = rel_jump.mask(np.isposinf(raw_rel_jump), 1.0).fillna(0.0)
     abs_damp = (df["added_frac_of_county"] / _REL_JUMP_ABS_REF).clip(upper=1.0)
     df["coverage_increase_magnitude"] = rel_jump * abs_damp
 
@@ -121,40 +118,54 @@ def build_features(
     return df
 
 
-def _minmax(s: pd.Series) -> pd.Series:
-    lo, hi = float(s.min()), float(s.max())
-    if hi - lo < _EPS:
-        return pd.Series(np.zeros(len(s)), index=s.index)
-    return (s - lo) / (hi - lo)
+def _bounded_feature(s: pd.Series) -> pd.Series:
+    """Map risk inputs to a fixed [0, 1] scale without cohort dependence."""
+    numeric = pd.to_numeric(s, errors="coerce").fillna(0.0)
+    return numeric.replace(np.inf, 1.0).replace(-np.inf, 0.0).clip(0.0, 1.0)
 
 
 def score(features: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    """Add anomaly score, composite priority score, and review flag."""
+    """Add a cohort-invariant monotone priority score and review flag.
+
+    Every feature is put on a fixed [0, 1] scale. Positive weights are
+    monotonically suspicious; negative weights are monotonically exculpatory.
+    No configured feature may move the final score by more than 0.25.
+    """
     if features.empty:
         return features
     df = features.copy()
     weights: dict[str, float] = cfg.scoring["feature_weights"]
 
     present = [f for f in _RISK_FEATURES if f in df and f in weights]
-    norm = pd.DataFrame({f: _minmax(df[f]) for f in present})
+    excessive = {f: float(weights[f]) for f in present if abs(float(weights[f])) > _MAX_FEATURE_INFLUENCE}
+    if excessive:
+        raise ValueError(
+            "feature weights exceed the 0.25 maximum influence: "
+            + ", ".join(f"{name}={weight:g}" for name, weight in excessive.items())
+        )
 
-    # Composite weighted risk (rescaled to 0..1 over the positive weight range).
-    weighted = sum(norm[f] * weights[f] for f in present)
-    df["risk_score"] = _minmax(weighted)
+    bounded = pd.DataFrame({f: _bounded_feature(df[f]) for f in present})
+    total_abs_weight = sum(abs(float(weights[f])) for f in present)
+    denominator = max(1.0, total_abs_weight)
+    risk = pd.Series(0.0, index=df.index)
+    for feature in present:
+        weight = float(weights[feature])
+        # For an exculpatory feature, absence contributes risk and increasing
+        # evidence lowers it. This keeps the score in [0, 1] without clipping
+        # away monotonic changes near either endpoint.
+        contribution = (
+            weight * bounded[feature]
+            if weight >= 0.0
+            else abs(weight) * (1.0 - bounded[feature])
+        ) / denominator
+        df[f"score_contribution_{feature}"] = contribution
+        risk = risk + contribution
 
-    # Unsupervised anomaly score over the same features (robust to weighting).
-    if len(df) >= 8 and present:
-        iso = IsolationForest(random_state=0, contamination="auto")
-        iso.fit(norm[present].to_numpy())
-        anom = -iso.score_samples(norm[present].to_numpy())  # higher = more anomalous
-        df["anomaly_score"] = _minmax(pd.Series(anom, index=df.index))
-    else:
-        df["anomaly_score"] = df["risk_score"]
-
-    # Rescale to [0, 1] so the score is always on a consistent absolute scale
-    # regardless of how compressed the input features are (small batches in
-    # particular can produce a weighted sum that only spans e.g. 0.00–0.10).
-    df["priority_score"] = _minmax(0.7 * df["risk_score"] + 0.3 * df["anomaly_score"])
+    df["risk_score"] = risk
+    # Retain the legacy column for downstream schemas; it is deliberately the
+    # same deterministic score rather than a non-monotone Isolation Forest term.
+    df["anomaly_score"] = df["risk_score"]
+    df["priority_score"] = df["risk_score"]
 
     flag_pct = float(cfg.scoring["flag_percentile"])
     threshold = df["priority_score"].quantile(flag_pct) if len(df) > 1 else 0.0

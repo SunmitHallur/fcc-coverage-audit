@@ -357,6 +357,13 @@ def normalize_layers(
 
     Returns ``(county_res_df, site_res_df)``.
     """
+    if site_res == county_res:
+        # This must precede the two-cache fast path and the pre-indexed branch:
+        # both cache paths are identical at one resolution, and reading each
+        # separately doubles national Redshift memory for no analytical benefit.
+        df = normalize_layer(cfg, cov, counties, county_res, service_label)
+        return df, df
+
     safe_svc = safe(service_label)
     scope = cfg.states_scope_key()
     backend = cfg.backend
@@ -384,11 +391,6 @@ def normalize_layers(
 
     # Parent rollup requires site_res to be strictly finer than county_res.
     # Otherwise fall back to indexing each resolution independently.
-    if site_res == county_res:
-        # Same grid for county + site work: index ONCE and reuse (avoids a second
-        # full polyfill). This is the fast configuration for large national runs.
-        df = normalize_layer(cfg, cov, counties, county_res, service_label)
-        return df, df
     if site_res < county_res:
         return (
             normalize_layer(cfg, cov, counties, county_res, service_label),

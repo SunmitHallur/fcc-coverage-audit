@@ -480,17 +480,16 @@ class RedshiftSource(DataSource):
 
         The hex tables encode providers only as delimited strings, so provider
         discovery uses the companion ``bbmap_mobile_bb_merged_all_<build>`` table.
-        Falls back to the configured known providers if that table is absent.
+        Discovery failures propagate: silently substituting a provider list can
+        make a credential/schema failure look like a successful partial run.
         """
         known = {p.id: p.name for p in self.cfg.known_providers}
-        try:
-            df = self._query_df(
-                f"SELECT DISTINCT providerid, provider_name "
-                f"FROM {self.schema}.{self.merged_prefix}{vintage}"
-            )
-        except Exception as exc:  # noqa: BLE001 - fall back to configured providers
-            log.warning("provider discovery failed (%s); using known_providers", exc)
-            return [Provider(id=i, name=n) for i, n in sorted(known.items())]
+        df = self._query_df(
+            f"SELECT DISTINCT providerid, provider_name "
+            f"FROM {self.schema}.{self.merged_prefix}{vintage}"
+        )
+        if df.empty:
+            raise RuntimeError(f"Redshift provider discovery returned no providers for {vintage}")
         out: dict[int, str] = {}
         for _, row in df.iterrows():
             pid = int(row["providerid"])
@@ -548,9 +547,19 @@ class RedshiftSource(DataSource):
             )
             hexes = pd.Series(dtype="string")
         else:
+            if "h3index" not in df.columns:
+                raise RuntimeError(
+                    f"Redshift query for {table}.{col} did not return required h3index column"
+                )
             hexes = df["h3index"].astype(str)
         # Flat band: these hex tables carry a 0/1 coverage flag, not signal.
-        pd.DataFrame({"h3": hexes, "signal_dbm": 0.0}).to_parquet(dest, index=False)
+        cached = pd.DataFrame({
+            "h3": hexes,
+            "signal_dbm": pd.Series(0.0, index=hexes.index, dtype="float64"),
+        })
+        tmp = dest.with_suffix(dest.suffix + ".part")
+        cached.to_parquet(tmp, index=False)
+        tmp.replace(dest)
         return CoverageFile(
             provider_id, technology, vintage, dest,
             is_hex=True, hex_resolution=self.hex_resolution,

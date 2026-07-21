@@ -32,9 +32,10 @@ So the pipeline analyzes the actual geometry/signal data (accurate), and only
 uses the rendered green tiles as a **cross-check**, falling back to computer
 vision on the image where the two disagree.
 
-All machine learning is **local** (connected-component site inference +
-scikit-learn IsolationForest for anomaly ranking). There are **no external
-LLM/API calls**, which keeps approvals minimal.
+All analysis is **local**. Site inference uses coverage geometry, and ranking
+uses a deterministic monotone score with a maximum 0.25 influence from any
+single feature. There are **no external LLM/API calls**, which keeps approvals
+minimal.
 
 ```
 acquire ─► normalize ─► (reconcile) ─► change-detect ─► infer sites

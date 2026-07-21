@@ -9,7 +9,7 @@ produces a full suite of metrics:
   - False-positive driver analysis by flag_reason
   - Calibration (reliability diagram) + cost-weighted optimal threshold
   - Per-feature SHAP / contribution analysis
-  - Supervised vs. IsolationForest vs. dumb baseline comparison
+  - Supervised vs. monotone score vs. dumb baseline comparison
   - Sensitivity sweeps over key hyperparameters
   - Feature ablation table
 
@@ -364,7 +364,7 @@ def _baseline_comparison(
     label_col: str,
     score_col: str,
 ) -> dict[str, Any]:
-    """Compare IsolationForest scores vs. dumb top-N-by-added_km2 baseline."""
+    """Compare monotone priority scores vs. dumb top-N-by-added_km2 baseline."""
     from sklearn.metrics import average_precision_score, f1_score
 
     results: dict[str, Any] = {}
@@ -382,13 +382,13 @@ def _baseline_comparison(
             "description": "flag top 10% by added_km2",
         }
 
-    # IsolationForest model score
+    # Deterministic monotone model score
     if score_col in merged.columns:
         y_score = merged[score_col].fillna(0.0).to_numpy()
         if len(np.unique(y_score)) > 1:
-            results["isolation_forest"] = {
+            results["monotone_priority"] = {
                 "auprc": float(average_precision_score(y_true, y_score)),
-                "description": "IsolationForest composite priority_score",
+                "description": "deterministic monotone priority_score",
             }
 
     return results

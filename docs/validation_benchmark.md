@@ -50,8 +50,8 @@ scoring baseline in `scoring.feature_weights`:
 
 | Pattern | Feature | Type | Weight |
 |---------|---------|------|:------:|
-| Large in-county coverage-area increase (absolute, normalized by county size) | `added_frac_of_county` | PRIMARY | 0.28 |
-| Large relative jump (D25 / J25) | `coverage_increase_magnitude` | PRIMARY | 0.20 |
+| Large in-county coverage-area increase (absolute, normalized by county size) | `added_frac_of_county` | PRIMARY | 0.25 |
+| Large relative jump (D25 / J25) | `coverage_increase_magnitude` | PRIMARY | 0.10 |
 | Rapid blanket fill-in from a low baseline (rural implausibility, P5) | `blanket_fillin` | secondary | 0.14 |
 | Growth claimed from existing towers, not new builds (P6) | `same_site_growth_share` | secondary | 0.16 |
 | Coverage far from any inferred tower / flat polygons (P6) | `unattributed_share` | secondary | 0.10 |
