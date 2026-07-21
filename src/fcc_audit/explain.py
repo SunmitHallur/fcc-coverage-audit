@@ -120,6 +120,11 @@ def explain_row(row: pd.Series | dict[str, Any]) -> dict[str, Any]:
             f"{provider} reported a modest {service} coverage change in {county} "
             f"that does not raise major red flags."
         )
+    elif added_km2 < -0.01:
+        headline = (
+            f"{provider}'s reported {service} coverage footprint in {county} "
+            f"decreased by approximately {_km2(abs(added_km2))} since the prior filing."
+        )
     else:
         headline = f"No meaningful {service} coverage change detected for {provider} in {county}."
 
@@ -127,6 +132,10 @@ def explain_row(row: pd.Series | dict[str, Any]) -> dict[str, Any]:
     bullets: list[str] = []
     if added_km2 > 0:
         bullets.append(f"New coverage area: approximately {_km2(added_km2)} ({_pct(added_frac)} of the county).")
+    elif added_km2 < -0.01:
+        bullets.append(
+            f"Reported coverage area decreased by approximately {_km2(abs(added_km2))}."
+        )
     if pct_inc is not None and math.isfinite(float(pct_inc)) and float(pct_inc) > 0.05:
         bullets.append(f"Relative increase vs. prior map: {_pct(pct_inc)}.")
     if prior_towers or current_towers:

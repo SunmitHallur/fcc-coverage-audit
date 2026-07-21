@@ -11,7 +11,12 @@ SRC = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC))
 
 from fcc_audit.report import build_county_detail, write_county_details  # noqa: E402
-from fcc_audit.webbundle import assign_record_tiers, build_web_records, write_web_bundle  # noqa: E402
+from fcc_audit.webbundle import (  # noqa: E402
+    assign_record_tiers,
+    build_web_meta,
+    build_web_records,
+    write_web_bundle,
+)
 
 
 @pytest.fixture
@@ -76,6 +81,68 @@ def test_build_web_records_includes_tier():
     records = build_web_records(scored)
     rec = records["130403"]["5G-NR 7/1"]["20001"]
     assert rec["tier"] == "red"
+
+
+def test_write_web_bundle_removes_stale_snapshot_files(tmp_path):
+    import geopandas as gpd
+    import pandas as pd
+    from shapely.geometry import box
+
+    web_dir = tmp_path / "web"
+    data_dir = web_dir / "public" / "data"
+    (data_dir / "records" / "old-provider").mkdir(parents=True)
+    (data_dir / "records" / "old-provider" / "old-service.json").write_text("{}")
+    (data_dir / "details" / "old-provider").mkdir(parents=True)
+    (data_dir / "details" / "old-provider" / "old.json").write_text("{}")
+    (data_dir / "towers").mkdir(parents=True)
+    (data_dir / "towers" / "old-provider.json").write_text("[]")
+    (data_dir / "records.json").write_text('{"stale": true}')
+
+    scored = pd.DataFrame([{
+        "provider_id": 130077,
+        "provider_name": "AT&T",
+        "technology": "5G-NR 7/1",
+        "county_geoid": "20001",
+        "county_name": "Allen",
+        "state_fips": "20",
+        "priority_score": 0.5,
+        "flag_for_review": False,
+        "added_km2": 0.0,
+    }])
+    counties = gpd.GeoDataFrame([{
+        "county_geoid": "20001",
+        "county_name": "Allen",
+        "state_fips": "20",
+        "geometry": box(-96.0, 37.5, -95.5, 38.0),
+    }], crs="EPSG:4326")
+
+    write_web_bundle(
+        scored, pd.DataFrame(), counties, web_dir,
+        {"current": "277", "prior": "279", "states_processed": "20"},
+    )
+
+    assert not (data_dir / "records.json").exists()
+    assert not (data_dir / "records" / "old-provider").exists()
+    assert not (data_dir / "details" / "old-provider").exists()
+    assert not (data_dir / "towers" / "old-provider.json").exists()
+    assert (data_dir / "records" / "130077" / "5G-NR7-1.json").exists()
+    meta = json.loads((data_dir / "meta.json").read_text())
+    assert meta["provider_services"] == {"130077": ["5G-NR 7/1"]}
+
+
+def test_build_web_meta_lists_services_by_provider():
+    import pandas as pd
+
+    scored = pd.DataFrame([
+        {"provider_id": 1, "provider_name": "One", "technology": "5G-NR 7/1", "flag_for_review": False},
+        {"provider_id": 1, "provider_name": "One", "technology": "5G-NR 35/3", "flag_for_review": False},
+        {"provider_id": 2, "provider_name": "Two", "technology": "5G-NR 7/1", "flag_for_review": False},
+    ])
+    meta = build_web_meta(scored, {"current": "277", "prior": "279"})
+    assert meta["provider_services"] == {
+        "1": ["5G-NR 35/3", "5G-NR 7/1"],
+        "2": ["5G-NR 7/1"],
+    }
 
 
 def test_estimate_signal_from_sites_flat_only():

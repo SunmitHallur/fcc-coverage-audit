@@ -99,18 +99,26 @@ class Config:
         return "-".join(sorted(s))
 
     def set_states(self, states: str | list[str] | None) -> None:
-        """Override analysis.states at runtime (e.g. from --states CLI flag)."""
+        """Override analysis.states at runtime (e.g. from --states CLI flag).
+
+        Accepts ``"all"``, a comma-separated string (``"20,19,49"``), or a list of
+        tokens that may themselves contain commas (``["20", "19,49"]``). The list
+        form covers shells that split on commas before Python sees argv.
+        """
         if states is None:
             return
         if isinstance(states, str):
-            if states.lower() == "all":
-                self.raw["analysis"]["states"] = "all"
-            else:
-                self.raw["analysis"]["states"] = [
-                    s.strip().zfill(2) for s in states.split(",") if s.strip()
-                ]
+            tokens = [s.strip() for s in states.split(",") if s.strip()]
         else:
-            self.raw["analysis"]["states"] = [str(s).zfill(2) for s in states]
+            tokens = []
+            for item in states:
+                tokens.extend(s.strip() for s in str(item).split(",") if s.strip())
+        if not tokens:
+            return
+        if len(tokens) == 1 and tokens[0].lower() == "all":
+            self.raw["analysis"]["states"] = "all"
+        else:
+            self.raw["analysis"]["states"] = [t.zfill(2) for t in tokens]
 
     def set_providers_big4(self) -> None:
         """Restrict to the Big 4 known providers."""

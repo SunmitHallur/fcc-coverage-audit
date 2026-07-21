@@ -11,7 +11,13 @@ if not exist ".venv\Scripts\python.exe" (
 set PYTHONPATH=src
 
 echo === Processing states: %STATES% ===
-".venv\Scripts\python.exe" -m fcc_audit.cli run --states %STATES% --cleanup-raw --build-web
+REM Quotes keep comma-separated FIPS as a single --states value (cmd can otherwise
+REM split on commas and only the first state is processed).
+".venv\Scripts\python.exe" -m fcc_audit.cli run --states "%STATES%" --cleanup-raw --build-web
+if errorlevel 1 (
+  echo ERROR: batch failed or was incomplete; web bundle was not rebuilt.
+  exit /b 1
+)
 
 echo === Done. View the website locally ===
 echo   cd web

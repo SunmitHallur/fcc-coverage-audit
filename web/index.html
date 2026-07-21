@@ -65,6 +65,7 @@
       max-height: calc(100% - 32px);
       background: rgba(18,24,32,.96); backdrop-filter: blur(8px); border: 1px solid var(--border);
       border-radius: 14px; padding: 16px; overflow-y: auto; display: none; box-shadow: 0 12px 40px rgba(0,0,0,.35);
+      z-index: 2;
     }
     #detail.visible { display: block; }
     #detail h2 { margin: 0 0 6px; font-size: 16px; }
@@ -193,8 +194,19 @@
     .toolbar label { margin: 0; text-transform: none; letter-spacing: 0; display: flex; align-items: center; gap: 6px; color: var(--ink); }
     .legend {
       position: absolute; bottom: 16px; right: 16px; background: rgba(18,24,32,.94); border: 1px solid var(--border);
-      border-radius: 10px; padding: 10px 12px; font-size: 11px; max-width: 240px;
+      border-radius: 10px; padding: 10px 12px; font-size: 11px; max-width: 240px; z-index: 1;
     }
+    .legend-toggle {
+      width: 100%; display: flex; justify-content: space-between; align-items: center; gap: 12px;
+      padding: 0; border: 0; background: transparent; color: #cbd5e1; cursor: pointer;
+      font: inherit; font-weight: 700; text-align: left;
+    }
+    .legend-toggle:hover { color: var(--ink); }
+    .legend-toggle-icon { color: var(--muted); transition: transform .15s ease; }
+    .legend.collapsed { padding: 8px 10px; }
+    .legend.collapsed .legend-body { display: none; }
+    .legend.collapsed .legend-toggle-icon { transform: rotate(-90deg); }
+    .legend-body { padding-top: 4px; }
     .legend .legend-row { display: flex; align-items: center; gap: 8px; margin: 3px 0; color: var(--muted); }
     .legend .legend-head {
       font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: .08em;
@@ -502,17 +514,22 @@
         <label><input type="checkbox" id="show-towers" /> Show inferred towers</label>
         <label><input type="checkbox" id="flagged-only" /> Flagged counties only</label>
       </div>
-      <div class="legend">
-        <div class="legend-head">County shading (priority rank)</div>
-        <div class="legend-row"><span class="swatch" style="background:#ef4444"></span> Top 50</div>
-        <div class="legend-row"><span class="swatch" style="background:#f59e0b"></span> 51–100</div>
-        <div class="legend-row"><span class="swatch" style="background:#eab308"></span> 101–150</div>
-        <div class="legend-row"><span class="swatch" style="background:#22c55e"></span> All others</div>
-        <div class="legend-head">Towers (dots)</div>
-        <div class="legend-row"><span class="swatch-dot" style="background:#22c55e"></span> New tower (built since prior)</div>
-        <div class="legend-row"><span class="swatch-dot" style="background:#a855f7"></span> Expanded existing tower</div>
-        <div class="legend-row"><span class="swatch-dot" style="background:#38bdf8"></span> Pre-existing tower</div>
-        <div class="legend-note"><span class="swatch-dot ring" style="background:#38bdf8;vertical-align:middle"></span> White ring = tower just outside the county whose coverage reaches in.</div>
+      <div class="legend" id="map-legend">
+        <button class="legend-toggle" id="legend-toggle" type="button" aria-expanded="true" aria-controls="legend-body">
+          <span>Map legend</span><span class="legend-toggle-icon" aria-hidden="true">▾</span>
+        </button>
+        <div class="legend-body" id="legend-body">
+          <div class="legend-head">County shading (priority rank)</div>
+          <div class="legend-row"><span class="swatch" style="background:#ef4444"></span> Top 50</div>
+          <div class="legend-row"><span class="swatch" style="background:#f59e0b"></span> 51–100</div>
+          <div class="legend-row"><span class="swatch" style="background:#eab308"></span> 101–150</div>
+          <div class="legend-row"><span class="swatch" style="background:#22c55e"></span> All others</div>
+          <div class="legend-head">Towers (dots)</div>
+          <div class="legend-row"><span class="swatch-dot" style="background:#22c55e"></span> New tower (built since prior)</div>
+          <div class="legend-row"><span class="swatch-dot" style="background:#a855f7"></span> Expanded existing tower</div>
+          <div class="legend-row"><span class="swatch-dot" style="background:#38bdf8"></span> Pre-existing tower</div>
+          <div class="legend-note"><span class="swatch-dot ring" style="background:#38bdf8;vertical-align:middle"></span> White ring = tower just outside the county whose coverage reaches in.</div>
+        </div>
       </div>
     </div>
   </div>
@@ -538,6 +555,13 @@
       if (!m) return v;
       const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
       return `${months[+m[2] - 1]} ${+m[3]}, ${m[1]}`;
+    }
+
+    function formatScope(scope) {
+      const text = String(scope || 'all').trim();
+      if (!text || text.toLowerCase() === 'all') return 'National scope';
+      const codes = [...new Set(text.split(',').map(s => s.trim()).filter(Boolean))];
+      return codes.length === 1 ? `State FIPS ${codes[0]}` : `${codes.length} states/DC`;
     }
 
     function safeServiceKey(service) {
@@ -1001,12 +1025,12 @@
       }
       meta = await metaRes.json();
       countiesGeo = await geoRes.json();
-      if (recRes.ok) {
-        records = await recRes.json();
-      } else {
-        // records.json unavailable — use lazy per-provider loading
+      // Newer build-web writes only split records (no monolithic records.json).
+      if (meta.use_split_records || !recRes.ok) {
         useSplitRecords = true;
         records = {};
+      } else {
+        records = await recRes.json();
       }
     }
 
@@ -1068,9 +1092,32 @@
       map.fitBounds([[-125.0, 24.5], [-66.5, 49.5]], { padding: 32, duration: 600 });
     }
 
+    function servicesForProvider(pid) {
+      const declared = meta.provider_services?.[String(pid)];
+      if (Array.isArray(declared) && declared.length) return declared;
+      const loaded = records[String(pid)];
+      if (loaded && Object.keys(loaded).length) return Object.keys(loaded);
+      return meta.services || [];
+    }
+
+    function fillServiceDropdown(pid, preferredService = null) {
+      const sSel = document.getElementById('service');
+      const services = servicesForProvider(pid);
+      sSel.innerHTML = '';
+      services.forEach(s => {
+        const o = document.createElement('option');
+        o.value = s;
+        o.textContent = s;
+        sSel.appendChild(o);
+      });
+      if (preferredService && services.includes(preferredService)) {
+        sSel.value = preferredService;
+      }
+      return sSel.value;
+    }
+
     function fillDropdowns() {
       const pSel = document.getElementById('provider');
-      const sSel = document.getElementById('service');
       pSel.innerHTML = '';
       (meta.providers || []).forEach(p => {
         const o = document.createElement('option');
@@ -1078,18 +1125,11 @@
         o.textContent = p.name;
         pSel.appendChild(o);
       });
-      sSel.innerHTML = '';
-      (meta.services || []).forEach(s => {
-        const o = document.createElement('option');
-        o.value = s;
-        o.textContent = s;
-        sSel.appendChild(o);
-      });
       pSel.value = preferredProviderId();
       currentProvider = pSel.value;
-      currentService = sSel.value;
+      currentService = fillServiceDropdown(currentProvider);
       document.getElementById('vintage-label').textContent =
-        `${formatVintage(meta.current_vintage) || meta.current_vintage || '?'} vs ${formatVintage(meta.prior_vintage) || meta.prior_vintage || '?'}`;
+        `${formatVintage(meta.current_vintage) || meta.current_vintage || '?'} vs ${formatVintage(meta.prior_vintage) || meta.prior_vintage || '?'} · ${formatScope(meta.states_processed)}`;
       document.getElementById('n-providers').textContent = (meta.providers || []).length;
     }
 
@@ -1424,7 +1464,11 @@
     }
 
     async function onSelectionChange() {
-      currentProvider = document.getElementById('provider').value;
+      const nextProvider = document.getElementById('provider').value;
+      if (nextProvider !== currentProvider) {
+        fillServiceDropdown(nextProvider, currentService);
+      }
+      currentProvider = nextProvider;
       currentService = document.getElementById('service').value;
       currentDetailRec = null;
       document.getElementById('detail').classList.remove('visible');
@@ -1444,6 +1488,11 @@
     document.getElementById('search').addEventListener('input', renderList);
     document.getElementById('flagged-only').addEventListener('change', () => { applyFeatureStates(); });
     document.getElementById('show-towers').addEventListener('change', e => loadTowers(e.target.checked));
+    document.getElementById('legend-toggle').addEventListener('click', () => {
+      const legend = document.getElementById('map-legend');
+      const collapsed = legend.classList.toggle('collapsed');
+      document.getElementById('legend-toggle').setAttribute('aria-expanded', String(!collapsed));
+    });
     document.getElementById('detail-close').addEventListener('click', () => {
       document.getElementById('detail').classList.remove('visible');
       destroyCompareMaps();
@@ -1682,6 +1731,9 @@
         await loadData();
         fillDropdowns();
         setupMapLayers();
+        if (useSplitRecords) {
+          await ensureProviderRecordsLoaded(currentProvider, currentService);
+        }
         initThresholdSlider();
         renderList();
         fitMapToUS();

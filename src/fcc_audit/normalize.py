@@ -359,8 +359,16 @@ def normalize_layers(
     """
     safe_svc = safe(service_label)
     scope = cfg.states_scope_key()
-    cache_c = cfg.path("interim") / f"hex_{cov.vintage}_{cov.provider_id}_{safe_svc}_{scope}_r{county_res}.parquet"
-    cache_s = cfg.path("interim") / f"hex_{cov.vintage}_{cov.provider_id}_{safe_svc}_{scope}_r{site_res}.parquet"
+    backend = cfg.backend
+    # Include backend so fixture caches never poison fcc/redshift national runs.
+    cache_c = (
+        cfg.path("interim")
+        / f"hex_{backend}_{cov.vintage}_{cov.provider_id}_{safe_svc}_{scope}_r{county_res}.parquet"
+    )
+    cache_s = (
+        cfg.path("interim")
+        / f"hex_{backend}_{cov.vintage}_{cov.provider_id}_{safe_svc}_{scope}_r{site_res}.parquet"
+    )
     if cache_c.exists() and cache_s.exists():
         return pd.read_parquet(cache_c), pd.read_parquet(cache_s)
 
@@ -425,9 +433,10 @@ def normalize_layer(
     hex); otherwise coverage is treated as a flat band. Cached to parquet.
     """
     scope = cfg.states_scope_key()
+    backend = cfg.backend
     cache = (
         cfg.path("interim")
-        / f"hex_{cov.vintage}_{cov.provider_id}_{safe(service_label)}_{scope}_r{resolution}.parquet"
+        / f"hex_{backend}_{cov.vintage}_{cov.provider_id}_{safe(service_label)}_{scope}_r{resolution}.parquet"
     )
     if cache.exists():
         return pd.read_parquet(cache)

@@ -343,7 +343,7 @@ class FccDownloadSource(DataSource):
         out_dir.mkdir(parents=True, exist_ok=True)
         safe = safe_service_name(technology)
         scope = self.cfg.states_scope_key()
-        merged = out_dir / f"{safe}_{scope}_merged.gpkg"
+        merged = out_dir / f"{safe}_{self.cfg.backend}_{scope}_merged.gpkg"
         if merged.exists() and merged.stat().st_size > 0:
             return CoverageFile(provider_id, technology, vintage, merged)
 
@@ -510,7 +510,10 @@ class RedshiftSource(DataSource):
         scope = self.cfg.states_scope_key()
         out_dir = self.raw_dir / str(vintage) / str(provider_id)
         out_dir.mkdir(parents=True, exist_ok=True)
-        dest = out_dir / f"{safe_service_name(technology)}_{scope}_hex{self.hex_resolution}.parquet"
+        dest = (
+            out_dir
+            / f"{safe_service_name(technology)}_{self.cfg.backend}_{scope}_hex{self.hex_resolution}.parquet"
+        )
         if dest.exists() and dest.stat().st_size > 0:
             return CoverageFile(
                 provider_id, technology, vintage, dest,
@@ -535,11 +538,17 @@ class RedshiftSource(DataSource):
         log.info("  redshift %s provider %s %s (%s)", vintage, provider_id, technology, col)
         df = self._query_df(sql, tuple(params))
         if df.empty:
-            raise FileNotFoundError(
-                f"No covered hexes for provider {provider_id} {technology} in "
-                f"{table} (col {col}, states={states})."
+            # No covered cells is a valid layer, especially for sparse carriers
+            # in a state batch. Persist an empty parquet so the opposite vintage
+            # can still be analyzed as a complete gain/loss and retries remain
+            # resumable. Query/permission errors still propagate from _query_df.
+            log.info(
+                "  no covered hexes for provider %s %s in %s (states=%s)",
+                provider_id, technology, table, states,
             )
-        hexes = df["h3index"].astype(str)
+            hexes = pd.Series(dtype="string")
+        else:
+            hexes = df["h3index"].astype(str)
         # Flat band: these hex tables carry a 0/1 coverage flag, not signal.
         pd.DataFrame({"h3": hexes, "signal_dbm": 0.0}).to_parquet(dest, index=False)
         return CoverageFile(

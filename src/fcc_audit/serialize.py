@@ -45,15 +45,25 @@ def write_selected_list(scored: pd.DataFrame, path: Path) -> Path:
 
 def write_summary_md(scored: pd.DataFrame, path: Path, meta: dict[str, Any]) -> Path:
     flagged = scored[scored["flag_for_review"]] if "flag_for_review" in scored else scored
+    missing_units = meta.get("missing_analysis_units") or []
     lines = [
         "# FCC Mobile Coverage-Change Audit - Priority Review",
         "",
         f"- Current vintage: **{meta.get('current')}**",
         f"- Prior vintage: **{meta.get('prior')}**",
+        f"- Geographic scope: **{meta.get('states_processed', 'all')}**",
+        f"- Run status: **{'INCOMPLETE' if missing_units else 'complete'}**",
         f"- Providers analyzed: {meta.get('providers')}",
         f"- Services analyzed: {meta.get('technologies', '')}",
         f"- Provider-county-service rows scored: **{len(scored)}**",
         f"- Flagged for manual review: **{len(flagged)}**",
+    ]
+    if missing_units:
+        missing = ", ".join(
+            f"{unit.get('provider_id')} / {unit.get('technology')}" for unit in missing_units
+        )
+        lines.append(f"- Missing provider/service units: **{missing}**")
+    lines += [
         "",
         "## Top priorities for on-the-ground testing",
         "",

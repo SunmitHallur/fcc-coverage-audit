@@ -131,6 +131,37 @@ def test_plain_language_explanation(scored):
     assert expl["severity"] in ("Critical", "High", "Moderate", "Low")
 
 
+def test_plain_language_explanation_distinguishes_coverage_loss():
+    from fcc_audit.explain import explain_row
+
+    expl = explain_row({
+        "provider_name": "T-Mobile",
+        "technology": "5G-NR 7/1",
+        "county_name": "Graham",
+        "added_km2": -7.37,
+        "flag_for_review": False,
+        "priority_score": 0.13,
+    })
+
+    assert "decreased" in expl["headline"]
+    assert "7.37 km²" in expl["headline"]
+    assert "No meaningful" not in expl["headline"]
+    assert any("decreased" in bullet for bullet in expl["bullets"])
+
+
+def test_real_bundle_filter_removes_fixture_geographies():
+    from fcc_audit.cli import _drop_fixture_geographies
+
+    rows = pd.DataFrame([
+        {"county_geoid": "20001", "provider_id": 1},
+        {"county_geoid": "90003", "provider_id": 1},
+        {"county_geoid": None, "state_fips": "90", "provider_id": 1},
+    ])
+    filtered = _drop_fixture_geographies(rows)
+
+    assert filtered["county_geoid"].tolist() == ["20001"]
+
+
 def test_web_bundle_build(scored):
     import json
     from fcc_audit.report import build_web_records, build_web_meta

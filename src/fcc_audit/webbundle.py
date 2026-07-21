@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -242,10 +243,14 @@ def build_web_records(
 def build_web_meta(scored: pd.DataFrame, meta: dict[str, Any]) -> dict[str, Any]:
     from datetime import datetime, timezone
     providers = []
+    provider_services: dict[str, list[str]] = {}
     if not scored.empty and "provider_id" in scored.columns:
         for pid in sorted(scored["provider_id"].unique()):
             name = scored.loc[scored["provider_id"] == pid, "provider_name"].iloc[0]
             providers.append({"id": int(pid), "name": str(name)})
+            provider_services[str(int(pid))] = sorted(
+                scored.loc[scored["provider_id"] == pid, "technology"].astype(str).unique().tolist()
+            )
     services = sorted(scored["technology"].unique().tolist()) if "technology" in scored.columns else []
     flagged = int(scored["flag_for_review"].sum()) if "flag_for_review" in scored.columns else 0
     web_meta = {
@@ -254,6 +259,7 @@ def build_web_meta(scored: pd.DataFrame, meta: dict[str, Any]) -> dict[str, Any]
         "prior_vintage": meta.get("prior"),
         "providers": providers,
         "services": services,
+        "provider_services": provider_services,
         "total_records": len(scored),
         "flagged_count": flagged,
         "states_processed": meta.get("states_processed", "all"),
@@ -594,6 +600,41 @@ def write_county_details(
     return n
 
 
+def write_county_details_from_parquets(
+    scored: pd.DataFrame,
+    coverage_paths: list[Path],
+    sites: pd.DataFrame,
+    data_dir: Path,
+    meta: dict[str, Any],
+    counties: gpd.GeoDataFrame | None = None,
+    *,
+    render_pngs: bool = False,
+) -> int:
+    """Stream state coverage partitions when building national county details."""
+    total = 0
+    for path in coverage_paths:
+        coverage = pd.read_parquet(path)
+        if coverage.empty:
+            continue
+        coverage = coverage[
+            ~coverage["county_geoid"].astype(str).str.startswith("90")
+        ].reset_index(drop=True)
+        geoids = set(coverage["county_geoid"].astype(str))
+        state_scored = scored[scored["county_geoid"].astype(str).isin(geoids)]
+        if state_scored.empty:
+            continue
+        total += write_county_details(
+            state_scored,
+            coverage,
+            sites,
+            data_dir,
+            meta,
+            counties=counties,
+            render_pngs=render_pngs,
+        )
+    return total
+
+
 # ---------------------------------------------------------------------------
 # Tower overlay per provider
 # ---------------------------------------------------------------------------
@@ -629,6 +670,7 @@ def write_web_bundle(
     *,
     simplify_tolerance: float = 0.001,
     coverage: pd.DataFrame | None = None,
+    coverage_paths: list[Path] | None = None,
     threshold: float = 0.0,
     weights: dict[str, float] | None = None,
     render_pngs: bool = False,
@@ -638,6 +680,17 @@ def write_web_bundle(
     data_dir = web_dir / "public" / "data"
     towers_dir = data_dir / "towers"
     data_dir.mkdir(parents=True, exist_ok=True)
+
+    # A build is a snapshot, not an append. Remove generated data from older
+    # snapshots so a partial run cannot leave stale provider/service records or
+    # county details behind. In particular, older bundles wrote records.json;
+    # if it remains, the browser can load that stale monolith instead of the
+    # current split files.
+    for generated_dir in (data_dir / "records", data_dir / "details", towers_dir):
+        if generated_dir.exists():
+            shutil.rmtree(generated_dir)
+    (data_dir / "records.json").unlink(missing_ok=True)
+
     towers_dir.mkdir(parents=True, exist_ok=True)
 
     counties_path = data_dir / "counties.geojson"
@@ -681,7 +734,12 @@ def write_web_bundle(
         tower_paths[str(pid)] = tp
 
     detail_count = 0
-    if coverage is not None and not coverage.empty:
+    if coverage_paths:
+        detail_count = write_county_details_from_parquets(
+            scored, coverage_paths, sites, data_dir, meta, counties=counties,
+            render_pngs=render_pngs,
+        )
+    elif coverage is not None and not coverage.empty:
         detail_count = write_county_details(
             scored, coverage, sites, data_dir, meta, counties=counties,
             render_pngs=render_pngs,

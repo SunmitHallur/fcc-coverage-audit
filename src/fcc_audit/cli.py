@@ -10,8 +10,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import re
 import sys
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -19,6 +23,14 @@ import pandas as pd
 from . import attribute, changedetect, explain, normalize, report, score, towers
 from .acquire import DataSource, get_source
 from .config import Config, Provider, load_config
+
+_NATIONAL_STATE_FIPS = {
+    "01", "02", "04", "05", "06", "08", "09", "10", "11", "12", "13",
+    "15", "16", "17", "18", "19", "20", "21", "22", "23", "24", "25",
+    "26", "27", "28", "29", "30", "31", "32", "33", "34", "35", "36",
+    "37", "38", "39", "40", "41", "42", "44", "45", "46", "47", "48",
+    "49", "50", "51", "53", "54", "55", "56",
+}
 
 
 def setup_logging(verbose: bool) -> None:
@@ -32,6 +44,73 @@ def setup_logging(verbose: bool) -> None:
 def _states_list(cfg: Config) -> list[str]:
     s = cfg.states
     return [] if s == "all" else list(s)
+
+
+def _run_key(cfg: Config, current: str, prior: str) -> str:
+    """Stable directory key isolating one backend/vintage comparison."""
+    def safe(value: str) -> str:
+        return re.sub(r"[^A-Za-z0-9._-]+", "-", str(value)).strip("-")
+
+    return f"{safe(cfg.backend)}_{safe(current)}_vs_{safe(prior)}"
+
+
+def _target_rows(df: pd.DataFrame, states: list[str]) -> pd.DataFrame:
+    """Keep requested-state outputs after analysis with neighboring-state context."""
+    if df.empty or not states:
+        return df
+    wanted = set(states)
+    if "state_fips" in df.columns:
+        state = df["state_fips"].astype(str).str.zfill(2)
+    elif "county_geoid" in df.columns:
+        state = df["county_geoid"].astype(str).str[:2]
+    else:
+        return df
+    return df.loc[state.isin(wanted)].reset_index(drop=True)
+
+
+def _context_states(counties, target_states: list[str], buffer_m: float = 50_000) -> list[str]:
+    """Add states within *buffer_m* of target states for cross-border tower context."""
+    if not target_states:
+        return []
+    state_col = counties["state_fips"].astype(str).str.zfill(2)
+    target = counties.loc[state_col.isin(target_states)]
+    if target.empty:
+        return sorted(set(target_states))
+    projected = counties.to_crs("EPSG:5070")
+    projected_states = projected["state_fips"].astype(str).str.zfill(2)
+    target_geom = projected.loc[projected_states.isin(target_states)].geometry.union_all()
+    nearby = projected.loc[projected.geometry.intersects(target_geom.buffer(buffer_m))]
+    return sorted(set(target_states) | set(nearby["state_fips"].astype(str).str.zfill(2)))
+
+
+def _states_processed_label(scored: pd.DataFrame) -> str:
+    """Human-readable state scope from batch metadata or county GEOIDs."""
+    if "batch_states" in scored.columns:
+        tokens: set[str] = set()
+        for raw in scored["batch_states"].dropna().unique():
+            text = str(raw).strip()
+            if text.lower() == "all":
+                return "all"
+            tokens.update(t.strip().zfill(2) for t in text.split(",") if t.strip())
+        if tokens:
+            return ",".join(sorted(tokens))
+    if "county_geoid" in scored.columns:
+        prefs = sorted({str(g)[:2] for g in scored["county_geoid"].astype(str) if str(g)[:2].isdigit()})
+        if prefs:
+            return ",".join(prefs)
+    return "all"
+
+
+def _drop_fixture_geographies(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove synthetic state-90 rows before assembling a real web bundle."""
+    if df.empty:
+        return df
+    mask = pd.Series(False, index=df.index)
+    if "county_geoid" in df.columns:
+        mask |= df["county_geoid"].astype(str).str.startswith("90")
+    if "state_fips" in df.columns:
+        mask |= df["state_fips"].astype(str).str.zfill(2).eq("90")
+    return df.loc[~mask].reset_index(drop=True)
 
 
 def _demo_web_defaults(cfg: Config, scored: pd.DataFrame) -> dict[str, Any]:
@@ -180,8 +259,12 @@ def process_provider(
         try:
             cur_file = source.fetch(provider.id, desc, current)
             pri_file = source.fetch(provider.id, desc, prior)
-        except (FileNotFoundError, RuntimeError) as exc:
-            log.warning("skip %s %s: %s", provider.name, label, exc)
+        except FileNotFoundError as exc:
+            # FCC/fixture backends may legitimately have no filing for a
+            # provider/service. Redshift represents no coverage as an empty
+            # layer; RuntimeError is therefore a real query/permission failure
+            # and must abort the batch rather than silently publishing partial data.
+            log.warning("no source layer for %s %s: %s", provider.name, label, exc)
             continue
 
         feats, sites, coverage = _analyze_unit(
@@ -248,20 +331,37 @@ def _save_batch_results(
     sites: pd.DataFrame,
     meta: dict[str, Any],
     coverage: pd.DataFrame | None = None,
+    *,
+    states: list[str] | None = None,
 ) -> None:
     """Persist scored rows (and optional sites/coverage) for incremental web builds."""
-    states = _states_list(cfg)
-    scored_dir = cfg.path("processed") / "scored"
-    sites_dir = cfg.path("processed") / "sites"
-    coverage_dir = cfg.path("processed") / "coverage"
+    states = list(states or [])
+    run_dir = cfg.path("processed") / _run_key(cfg, meta["current"], meta["prior"])
+    scored_dir = run_dir / "scored"
+    sites_dir = run_dir / "sites"
+    coverage_dir = run_dir / "coverage"
+    states_key = "-".join(sorted(states)) if states else "all"
+
+    # A rerun replaces the whole target batch, including units/states that are
+    # now legitimately empty. Remove old partitions before writing new results.
+    if scored_dir.exists():
+        for stale in scored_dir.glob(f"scored_*_{states_key}.parquet"):
+            stale.unlink()
+    (sites_dir / f"sites_{states_key}.parquet").unlink(missing_ok=True)
+    if coverage_dir.exists():
+        stale_coverage = (
+            [coverage_dir / f"coverage_{state}.parquet" for state in states]
+            if states else list(coverage_dir.glob("coverage_*.parquet"))
+        )
+        for stale in stale_coverage:
+            stale.unlink(missing_ok=True)
 
     if not scored.empty and "technology" in scored.columns:
         for svc in scored["technology"].unique():
             svc_rows = scored[scored["technology"] == svc]
             report.save_batch_scored(svc_rows, scored_dir, service_label=str(svc), states=states, meta=meta)
 
-    states_key = "-".join(sorted(states)) if states else "all"
-    batch_ts = meta.get("generated_at", "")
+    batch_ts = datetime.now(timezone.utc).isoformat()
 
     if not sites.empty:
         sites_dir.mkdir(parents=True, exist_ok=True)
@@ -272,25 +372,53 @@ def _save_batch_results(
 
     if coverage is not None and not coverage.empty:
         coverage_dir.mkdir(parents=True, exist_ok=True)
-        cov_path = coverage_dir / f"coverage_{states_key}.parquet"
         batch_cov = coverage.copy()
         batch_cov["batch_ts"] = batch_ts
-        batch_cov.to_parquet(cov_path, index=False)
+        # State partitions bound peak RAM during the final web build.
+        state_key = batch_cov["county_geoid"].astype(str).str[:2]
+        for state, state_cov in batch_cov.groupby(state_key, sort=True):
+            state_cov.to_parquet(coverage_dir / f"coverage_{state}.parquet", index=False)
+
+    manifests_dir = run_dir / "manifests"
+    manifests_dir.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "backend": cfg.backend,
+        "current": meta["current"],
+        "prior": meta["prior"],
+        "states": states or ["all"],
+        "analysis_units": meta.get("analysis_units", []),
+        "completed_at": batch_ts,
+    }
+    (manifests_dir / f"batch_{states_key}.json").write_text(
+        json.dumps(manifest, indent=2), encoding="utf-8",
+    )
 
 
 def cmd_run(cfg: Config, args) -> int:
     log = logging.getLogger(__name__)
     if getattr(args, "states", None):
         cfg.set_states(args.states)
+    target_states = _states_list(cfg)
 
     source = get_source(cfg)
     current, prior = source.resolve_vintages(
         args.current or cfg.vintage_current, args.prior or cfg.vintage_prior
     )
     log.info("comparing current=%s vs prior=%s (states=%s)", current, prior, cfg.states)
+    target_key = "-".join(sorted(target_states)) if target_states else "all"
+    run_dir = cfg.path("processed") / _run_key(cfg, current, prior)
+    (run_dir / "manifests" / f"batch_{target_key}.json").unlink(missing_ok=True)
 
     counties = normalize.load_counties(cfg)
     county_area_km2 = normalize.county_areas_km2(counties, cfg.geography["equal_area_crs"])
+    if cfg.backend == "redshift" and target_states:
+        context_states = _context_states(counties, target_states)
+        if context_states != sorted(target_states):
+            log.info(
+                "adding cross-border tower context: target=%s query=%s",
+                target_states, context_states,
+            )
+            cfg.set_states(context_states)
 
     providers = _resolve_providers(cfg, source, current)
     cleanup_raw = bool(getattr(args, "cleanup_raw", False)) and cfg.raw["source"]["backend"] != "fixture"
@@ -299,6 +427,8 @@ def cmd_run(cfg: Config, args) -> int:
 
     def _collect(result):
         feats, sites, coverage = result
+        feats = _target_rows(feats, target_states)
+        coverage = _target_rows(coverage, target_states)
         if not feats.empty:
             all_feats.append(feats)
         if not sites.empty:
@@ -343,15 +473,20 @@ def cmd_run(cfg: Config, args) -> int:
     sites = pd.concat(all_sites, ignore_index=True) if all_sites else pd.DataFrame()
     coverage = pd.concat(all_coverage, ignore_index=True) if all_coverage else pd.DataFrame()
 
-    states_label = ",".join(_states_list(cfg)) if _states_list(cfg) else "all"
+    states_label = ",".join(target_states) if target_states else "all"
     meta = {
         "current": current,
         "prior": prior,
         "providers": ", ".join(p.name for p in providers),
         "technologies": ", ".join(s["label"] for s in cfg.services),
         "states_processed": states_label,
+        "analysis_units": [
+            {"provider_id": int(provider.id), "technology": str(service["label"])}
+            for provider in providers
+            for service in cfg.services
+        ],
     }
-    _save_batch_results(cfg, scored, sites, meta, coverage)
+    _save_batch_results(cfg, scored, sites, meta, coverage, states=target_states)
 
     dashboard_dir = cfg.project_root / "dashboard"
     dashboard_dir.mkdir(exist_ok=True)
@@ -382,16 +517,92 @@ def cmd_run(cfg: Config, args) -> int:
 def cmd_build_web(cfg: Config, args) -> int:
     """Assemble the static web bundle from accumulated batch parquet files."""
     log = logging.getLogger(__name__)
-    scored_dir = cfg.path("processed") / "scored"
-    sites_dir = cfg.path("processed") / "sites"
-    coverage_dir = cfg.path("processed") / "coverage"
+    current = str(cfg.vintage_current)
+    prior = str(cfg.vintage_prior)
+    run_dir = cfg.path("processed") / _run_key(cfg, current, prior)
+    scored_dir = run_dir / "scored"
+    sites_dir = run_dir / "sites"
+    coverage_dir = run_dir / "coverage"
+    manifests_dir = run_dir / "manifests"
+
+    manifests = []
+    if manifests_dir.exists():
+        manifests = [
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in sorted(manifests_dir.glob("batch_*.json"))
+        ]
+    if (
+        cfg.backend != "fixture"
+        and cfg.states == "all"
+        and not getattr(args, "allow_incomplete", False)
+    ):
+        completed_states: set[str] = set()
+        unit_sets: set[frozenset[tuple[int, str]]] = set()
+        for manifest in manifests:
+            if manifest.get("backend") != cfg.backend:
+                continue
+            if str(manifest.get("current")) != current or str(manifest.get("prior")) != prior:
+                continue
+            states = manifest.get("states") or []
+            units = frozenset(
+                (int(unit["provider_id"]), str(unit["technology"]))
+                for unit in manifest.get("analysis_units", [])
+            )
+            if units:
+                unit_sets.add(units)
+            if "all" in states:
+                completed_states = set(_NATIONAL_STATE_FIPS)
+                break
+            completed_states.update(str(state).zfill(2) for state in states)
+        missing_states = sorted(_NATIONAL_STATE_FIPS - completed_states)
+        if missing_states:
+            log.error(
+                "national build incomplete for %s: missing successful batch manifests for %s "
+                "(use --allow-incomplete only for a deliberate preview)",
+                run_dir.name, ",".join(missing_states),
+            )
+            return 1
+        if len(unit_sets) > 1:
+            log.error(
+                "national build has inconsistent provider/service units across batches in %s",
+                run_dir,
+            )
+            return 1
+        if not cfg.providers_all:
+            expected_units = frozenset(
+                (int(provider.id), str(service["label"]))
+                for provider in cfg.providers
+                for service in cfg.services
+            )
+            if unit_sets != {expected_units}:
+                log.error(
+                    "national build manifests do not match configured provider/service units"
+                )
+                return 1
+
     scored = report.load_accumulated_scored(scored_dir)
 
     if scored.empty:
         log.error("no accumulated scored data in %s — run batches first", scored_dir)
         return 1
 
+    current_values = set(scored.get("batch_current", pd.Series(dtype=str)).dropna().astype(str))
+    prior_values = set(scored.get("batch_prior", pd.Series(dtype=str)).dropna().astype(str))
+    if current_values - {current} or prior_values - {prior}:
+        log.error(
+            "refusing mixed-vintage build: current=%s prior=%s in %s",
+            sorted(current_values), sorted(prior_values), run_dir,
+        )
+        return 1
+
+    # Batch scores are relative to each batch. Recompute over the accumulated
+    # national feature frame so priority ranks and percentile flags are comparable.
+    scored = score.score(scored, cfg)
     scored = explain.add_explanations(scored)
+    fixture_bundle = (
+        "county_geoid" in scored.columns
+        and scored["county_geoid"].astype(str).str.startswith("90").all()
+    )
 
     # Merge all site batches (dedupe on lat/lng/provider/service).
     sites = pd.DataFrame()
@@ -399,16 +610,14 @@ def cmd_build_web(cfg: Config, args) -> int:
         site_parts = [pd.read_parquet(p) for p in sorted(sites_dir.glob("sites_*.parquet"))]
         if site_parts:
             sites = pd.concat(site_parts, ignore_index=True)
-            dedup_cols = [c for c in ["lat", "lng", "provider_id", "technology"] if c in sites.columns]
+            if not fixture_bundle:
+                sites = _drop_fixture_geographies(sites)
+            dedup_cols = [
+                c for c in ["lat", "lng", "provider_id", "technology", "vintage"]
+                if c in sites.columns
+            ]
             if dedup_cols:
                 sites = sites.drop_duplicates(subset=dedup_cols, keep="last")
-
-    # Infer vintages from batch metadata or config.
-    current = scored["batch_current"].dropna().iloc[-1] if "batch_current" in scored.columns else cfg.vintage_current
-    prior = scored["batch_prior"].dropna().iloc[-1] if "batch_prior" in scored.columns else cfg.vintage_prior
-    states_processed = "all"
-    if "batch_states" in scored.columns:
-        states_processed = ",".join(sorted(set(scored["batch_states"].dropna().unique())))
 
     meta = {
         "current": current,
@@ -417,18 +626,23 @@ def cmd_build_web(cfg: Config, args) -> int:
             scored.drop_duplicates("provider_id")["provider_name"].astype(str).tolist()
         ),
         "technologies": ", ".join(sorted(scored["technology"].unique())),
-        "states_processed": states_processed,
+        "states_processed": _states_processed_label(scored),
     }
 
-    coverage = report.load_accumulated_coverage(coverage_dir)
     counties = normalize.load_counties(cfg)
+    dashboard_dir = cfg.project_root / "dashboard"
+    dashboard_dir.mkdir(exist_ok=True)
+    report.write_outputs(
+        scored, sites, counties, cfg.path("outputs"), dashboard_dir, meta,
+    )
     web_dir = cfg.project_root / "web"
     web_meta = dict(meta)
     web_meta.update(_demo_web_defaults(cfg, scored))
     render_pngs = getattr(args, "render_pngs", False)
     top_n = getattr(args, "top_n", 250)
+    coverage_paths = sorted(coverage_dir.glob("coverage_*.parquet"))
     paths = report.write_web_bundle(
-        scored, sites, counties, web_dir, web_meta, coverage=coverage,
+        scored, sites, counties, web_dir, web_meta, coverage_paths=coverage_paths,
         render_pngs=render_pngs,
         top_n=top_n,
     )
@@ -536,7 +750,7 @@ def cmd_benchmark(cfg: Config, args) -> int:
     county_area_km2 = normalize.county_areas_km2(counties, cfg.geography["equal_area_crs"])
     all_feats = []
     for provider in _resolve_providers(cfg, source, current):
-        feats, _ = process_provider(
+        feats, _, _ = process_provider(
             cfg, source, provider, current, prior, counties, county_area_km2
         )
         if not feats.empty:
@@ -598,8 +812,8 @@ def main(argv: list[str] | None = None) -> int:
     p_run.add_argument("--current", default=None)
     p_run.add_argument("--prior", default=None)
     p_run.add_argument(
-        "--states", default=None,
-        help='comma-separated state FIPS codes to scope this batch (e.g. "01,02,48")',
+        "--states", default=None, nargs="+",
+        help='state FIPS to scope this batch: "01,02,48" and/or 01 02 48 (or "all")',
     )
     p_run.add_argument(
         "--cleanup-raw", action="store_true",
@@ -630,7 +844,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_dl.add_argument("--current", default=None)
     p_dl.add_argument("--prior", default=None)
-    p_dl.add_argument("--states", default=None, help="comma-separated state FIPS codes")
+    p_dl.add_argument(
+        "--states", default=None, nargs="+",
+        help='state FIPS: "01,02,48" and/or 01 02 48 (or "all")',
+    )
     p_dl.set_defaults(func=cmd_download)
 
     p_bw = sub.add_parser("build-web", help="assemble static web bundle from accumulated batches")
@@ -641,6 +858,10 @@ def main(argv: list[str] | None = None) -> int:
     p_bw.add_argument(
         "--top-n", type=int, default=250,
         help="max counties per provider×service with detail JSON and tier coloring (default 250)",
+    )
+    p_bw.add_argument(
+        "--allow-incomplete", action="store_true",
+        help="build a deliberate partial preview without all 51 state batch manifests",
     )
     p_bw.set_defaults(func=cmd_build_web)
     sub.add_parser("make-fixtures", help="generate synthetic offline data").set_defaults(

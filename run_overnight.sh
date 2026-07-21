@@ -1,43 +1,47 @@
 #!/usr/bin/env bash
-# Process all state batches unattended. Each batch: run -> build-web -> commit -> push.
+# Process all state batches unattended, then publish one validated national bundle.
 set -euo pipefail
 cd "$(dirname "$0")"
 export PYTHONPATH=src
 PY=".venv/bin/python"
-LOG="/tmp/fcc_overnight.log"
+LOG="overnight_$(date +%Y%m%d_%H%M%S).log"
+if [[ ! -x "$PY" ]]; then
+  python3 -m venv .venv
+  "$PY" -m pip install --upgrade pip
+  "$PY" -m pip install -r requirements.txt
+fi
 
 BATCHES=(
-  "01,02,03,04,05"
-  "06,08,09,10,11"
-  "12,13,15,16,17"
-  "18,19,20,21,22"
-  "23,24,25,26,27"
-  "28,29,30,31,32"
-  "33,34,35,36,37"
-  "38,39,40,41,42"
-  "44,45,46,47,48"
-  "49,50,51,53,54"
-  "55,56"
+  "04,06,15,32"
+  "02,16,41,53"
+  "08,30,35,49,56"
+  "20,31,38,40,46"
+  "05,22,28,48"
+  "17,19,27,29,55"
+  "18,21,26,39,47"
+  "01,12,13,37,45"
+  "10,11,24,51,54"
+  "09,23,25,33,34,36,42,44,50"
 )
 
 echo "=== Overnight run started $(date) ===" | tee -a "$LOG"
 
+FAILED_BATCHES=()
 for STATES in "${BATCHES[@]}"; do
   echo "" | tee -a "$LOG"
   echo "=== BATCH $STATES @ $(date) ===" | tee -a "$LOG"
-  if ! $PY -m fcc_audit.cli run --states "$STATES" --cleanup-raw --build-web 2>&1 | tee -a "$LOG"; then
+  if ! $PY -m fcc_audit.cli run --states "$STATES" --cleanup-raw 2>&1 | tee -a "$LOG"; then
     echo "BATCH FAILED: $STATES (continuing)" | tee -a "$LOG"
+    FAILED_BATCHES+=("$STATES")
     continue
   fi
-  git add web/public/data src/fcc_audit/
-  if git diff --cached --quiet; then
-    echo "No web data changes for $STATES" | tee -a "$LOG"
-    continue
-  fi
-  git commit -m "Add batch results for states $STATES" || true
-  git push origin HEAD 2>&1 | tee -a "$LOG" || echo "push failed for $STATES" | tee -a "$LOG"
-  echo "=== Pushed $STATES @ $(date) ===" | tee -a "$LOG"
+  echo "=== Completed $STATES @ $(date) ===" | tee -a "$LOG"
 done
+
+if ((${#FAILED_BATCHES[@]})); then
+  echo "NATIONAL RUN INCOMPLETE: refusing final web build; failed batches: ${FAILED_BATCHES[*]}" | tee -a "$LOG"
+  exit 1
+fi
 
 echo "=== Overnight run finished $(date) ===" | tee -a "$LOG"
 $PY -m fcc_audit.cli build-web 2>&1 | tee -a "$LOG"

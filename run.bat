@@ -32,6 +32,11 @@ if "%~1"=="" (
 ) else (
     ".venv\Scripts\python.exe" -m fcc_audit.cli %*
 )
+if errorlevel 1 (
+    echo.
+    echo ERROR: pipeline failed or produced an incomplete provider/service set.
+    exit /b 1
+)
 
 echo.
 echo Done. Outputs are in data\outputs\  Open web\index.html via a local server:
