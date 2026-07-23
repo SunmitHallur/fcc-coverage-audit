@@ -193,7 +193,7 @@ and **0.5–1 TB** of raw files. **Redshift backend (default):** shared
 under ~10 hours. Options, in order of preference:
 
 1. **Redshift (best).** Query server-side and never download raw geometry.
-   Use `./run.sh` / `run_overnight.sh` (10 geo batches + `--workers 4`).
+   Use `./run.sh` / `run_overnight.sh` (national `download` once, then 10 geo batches + `--workers 6 --skip-prefetch`).
 2. **`--cleanup-raw` + scope down (FCC only).** Deletes big raw files after each
    service so peak disk stays small. Do **not** use on Redshift overnight
    (neighbor-state caches must persist).

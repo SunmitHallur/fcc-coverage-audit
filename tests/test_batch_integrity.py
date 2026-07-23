@@ -17,7 +17,8 @@ sys.path.insert(0, str(SRC))
 from fcc_audit import cli
 from fcc_audit.acquire import CoverageFile, RedshiftSource
 from fcc_audit.cli import (
-    _context_states, _run_key, _save_batch_results, _target_rows, process_provider,
+    _context_states, _coverage_geoids_to_persist, _filter_coverage_for_persist,
+    _run_key, _save_batch_results, _target_rows, process_provider,
 )
 from fcc_audit.config import Provider, load_config
 
@@ -309,6 +310,93 @@ def test_batch_persistence_isolated_and_replaces_empty_state_partition(tmp_path)
     assert manifest["analysis_units"] == meta["analysis_units"]
 
 
+def test_redshift_prefetch_all_expands_to_national_fips(tmp_path, monkeypatch):
+    """SHARED prefetch with states='all' must warm per-state caches (not one national)."""
+    cfg = load_config()
+    cfg.project_root = tmp_path
+    cfg.raw["source"]["backend"] = "redshift"
+    cfg.raw["analysis"]["services"] = [
+        {"label": "5G-NR 7/1", "desc": "5G-NR (7/1 Mbps)"},
+    ]
+    cfg.raw["analysis"]["providers"] = [
+        {"id": 130077, "name": "AT&T"},
+        {"id": 130403, "name": "T-Mobile"},
+    ]
+    source = RedshiftSource(cfg)
+    seen_states: list[str | None] = []
+
+    def fake_query(sql, params=()):
+        # state_fips param is first when present
+        state = params[0] if params else None
+        seen_states.append(state)
+        return pd.DataFrame({
+            "h3index": ["8928308280fffff"],
+            "tech5g_spd1_env0": [1],
+            "tech5g_spd1_env0_prov": ["130077,130403"],
+        })
+
+    monkeypatch.setattr(source, "_query_df", fake_query)
+    source.prefetch(["277"], "all", [130077, 130403], max_workers=1)
+
+    assert set(seen_states) == NATIONAL_STATE_FIPS
+    assert source.caches_ready(["277"], "all", [130077, 130403])
+
+
+def test_redshift_prefetch_parallel_shared_scans(tmp_path, monkeypatch):
+    cfg = load_config()
+    cfg.project_root = tmp_path
+    cfg.raw["source"]["backend"] = "redshift"
+    cfg.raw["source"]["redshift"]["prefetch_workers"] = 2
+    cfg.raw["analysis"]["services"] = [
+        {"label": "5G-NR 7/1", "desc": "5G-NR (7/1 Mbps)"},
+    ]
+    cfg.raw["analysis"]["providers"] = [
+        {"id": 130077, "name": "AT&T"},
+        {"id": 130403, "name": "T-Mobile"},
+    ]
+    source = RedshiftSource(cfg)
+    calls: list[tuple] = []
+
+    def fake_query(sql, params=()):
+        calls.append(params)
+        return pd.DataFrame({
+            "h3index": ["8928308280fffff"],
+            "tech5g_spd1_env0": [1],
+            "tech5g_spd1_env0_prov": ["130077"],
+        })
+
+    # Each parallel worker creates its own RedshiftSource; patch the class method.
+    monkeypatch.setattr(RedshiftSource, "_query_df", lambda self, sql, params=(): fake_query(sql, params))
+    source.prefetch(["277"], ["20", "31"], [130077, 130403], max_workers=2)
+    assert len(calls) == 2
+    assert {c[0] for c in calls} == {"20", "31"}
+
+
+def test_coverage_persist_keeps_flagged_and_top_n():
+    scored = pd.DataFrame([
+        {"provider_id": 1, "technology": "5G", "county_geoid": "20001",
+         "priority_score": 0.9, "flag_for_review": True},
+        {"provider_id": 1, "technology": "5G", "county_geoid": "20003",
+         "priority_score": 0.5, "flag_for_review": False},
+        {"provider_id": 1, "technology": "5G", "county_geoid": "20005",
+         "priority_score": 0.8, "flag_for_review": False},
+        {"provider_id": 1, "technology": "5G", "county_geoid": "20007",
+         "priority_score": 0.1, "flag_for_review": False},
+    ])
+    keep = _coverage_geoids_to_persist(scored, top_n=2)
+    # flagged 20001 + top-2 by score (20001, 20005) → {20001, 20005}
+    assert keep == {"20001", "20005"}
+
+    coverage = pd.DataFrame([
+        {"county_geoid": "20001", "h3": "a"},
+        {"county_geoid": "20003", "h3": "b"},
+        {"county_geoid": "20005", "h3": "c"},
+        {"county_geoid": "20007", "h3": "d"},
+    ])
+    trimmed = _filter_coverage_for_persist(coverage, scored, top_n=2)
+    assert set(trimmed["county_geoid"]) == {"20001", "20005"}
+
+
 def test_windows_launcher_runs_exact_national_batches_and_final_build():
     root = Path(__file__).resolve().parents[1]
     powershell = (root / "run_overnight.ps1").read_text(encoding="utf-8")
@@ -324,7 +412,9 @@ def test_windows_launcher_runs_exact_national_batches_and_final_build():
     ]
     assert run_lines, "expected a cli run invocation in run_overnight.ps1"
     assert all("--cleanup-raw" not in line for line in run_lines)
-    assert any("--workers 4" in line for line in run_lines)
+    assert any("--workers 6" in line for line in run_lines)
+    assert any("--skip-prefetch" in line for line in run_lines)
+    assert "-m fcc_audit.cli download" in powershell
     assert "-m fcc_audit.cli build-web" in powershell
     # Default overnight must not auto-push; only -Publish does.
     assert "param(" in powershell and "$Publish" in powershell
@@ -348,16 +438,18 @@ def test_unix_launchers_match_national_contract():
     assert "web/index.html" in run_sh or "http.server 8000" in run_sh
     assert "dashboard/index.html" not in run_sh
 
-    assert "--workers 4" in overnight
+    assert "--workers 6" in overnight
+    assert "--skip-prefetch" in overnight
+    assert "fcc_audit.cli download" in overnight
     assert "build-web" in overnight
     assert "--publish" in overnight
     # git push only inside the PUBLISH branch
     assert 'PUBLISH=1' in overnight or 'PUBLISH=0' in overnight
     assert 'if [[ "$PUBLISH" -eq 1 ]]' in overnight
 
-    assert "--workers 4" in process
+    assert "--workers 6" in process
     # process_batch must not invoke --build-web (would wipe national site).
     assert re.search(r"fcc_audit\.cli run[^\n]*--build-web", process) is None
     assert re.search(r"fcc_audit\.cli run[^\n]*--build-web", process_bat) is None
     assert "fcc_audit.cli run" in process
-    assert "--workers 4" in process
+    assert "--workers 6" in process

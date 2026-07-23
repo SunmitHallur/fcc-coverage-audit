@@ -33,11 +33,22 @@ from __future__ import annotations
 import logging
 import time
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import requests
+
+# 50 states + DC. Used when Redshift prefetch expands ``states: all`` into
+# per-state caches (overnight batches compose from these, not one national slice).
+NATIONAL_STATE_FIPS: frozenset[str] = frozenset({
+    "01", "02", "04", "05", "06", "08", "09", "10", "11", "12", "13",
+    "15", "16", "17", "18", "19", "20", "21", "22", "23", "24", "25",
+    "26", "27", "28", "29", "30", "31", "32", "33", "34", "35", "36",
+    "37", "38", "39", "40", "41", "42", "44", "45", "46", "47", "48",
+    "49", "50", "51", "53", "54", "55", "56",
+})
 
 from .config import Config, Provider
 
@@ -547,12 +558,16 @@ class RedshiftSource(DataSource):
         token = "all" if state is None else f"st{str(state).zfill(2)}"
         return out_dir / f"{safe}_{self.cfg.backend}_{token}_hex{self.hex_resolution}.parquet"
 
-    def _shared_slice_path(self, vintage: str, state: str | None) -> Path:
+    def _shared_slice_path(
+        self,
+        vintage: str,
+        state: str | None,
+        service_descs: list[str] | None = None,
+    ) -> Path:
         """One Redshift scan per (vintage, state, service-set) shared across providers."""
         token = "all" if state is None else f"st{str(state).zfill(2)}"
-        svc_token = "-".join(
-            sorted(safe_service_name(d) for d in self._configured_service_descs())
-        ) or "none"
+        descs = list(service_descs) if service_descs is not None else self._configured_service_descs()
+        svc_token = "-".join(sorted(safe_service_name(d) for d in descs)) or "none"
         return (
             self.raw_dir / str(vintage) / "_shared"
             / f"services_{svc_token}_{self.cfg.backend}_{token}_hex{self.hex_resolution}.parquet"
@@ -594,9 +609,14 @@ class RedshiftSource(DataSource):
         return ("," + filled + ",").str.contains(needle, regex=False)
 
     def _provider_state_caches_complete(
-        self, vintage: str, state: str | None, provider_ids: list[int],
+        self,
+        vintage: str,
+        state: str | None,
+        provider_ids: list[int],
+        service_descs: list[str] | None = None,
     ) -> bool:
-        for desc in self._configured_service_descs():
+        descs = list(service_descs) if service_descs is not None else self._configured_service_descs()
+        for desc in descs:
             for pid in provider_ids:
                 dest = self._state_cache_path(
                     self.raw_dir / str(vintage) / str(pid), desc, state,
@@ -605,7 +625,32 @@ class RedshiftSource(DataSource):
                     return False
         return True
 
-    def _ensure_shared_slice(self, vintage: str, state: str | None) -> Path:
+    def caches_ready(
+        self,
+        vintages: list[str],
+        states: list[str] | str,
+        provider_ids: list[int] | None = None,
+        service_descs: list[str] | None = None,
+    ) -> bool:
+        """True when every requested (vintage, state, provider, service) parquet exists."""
+        if states == "all":
+            state_list: list[str | None] = sorted(NATIONAL_STATE_FIPS)
+        else:
+            state_list = [str(s).zfill(2) for s in states]
+        pids = [int(p) for p in (provider_ids or self._configured_provider_ids())]
+        descs = list(service_descs or self._configured_service_descs())
+        for vintage in vintages:
+            for state in state_list:
+                if not self._provider_state_caches_complete(vintage, state, pids, descs):
+                    return False
+        return True
+
+    def _ensure_shared_slice(
+        self,
+        vintage: str,
+        state: str | None,
+        service_descs: list[str] | None = None,
+    ) -> Path:
         """Pull every configured service's flags+provider lists for one state in ONE query.
 
         Avoids per-provider ``LIKE`` scans. Downstream fan-out writes the existing
@@ -613,7 +658,11 @@ class RedshiftSource(DataSource):
         """
         import pandas as pd
 
-        dest = self._shared_slice_path(vintage, state)
+        descs = list(service_descs) if service_descs is not None else self._configured_service_descs()
+        if not descs:
+            raise RuntimeError("No analysis.services configured for Redshift fetch")
+
+        dest = self._shared_slice_path(vintage, state, descs)
         if self._cache_ready(dest):
             return dest
 
@@ -639,10 +688,6 @@ class RedshiftSource(DataSource):
         try:
             if self._cache_ready(dest):
                 return dest
-
-            descs = self._configured_service_descs()
-            if not descs:
-                raise RuntimeError("No analysis.services configured for Redshift fetch")
 
             table = self._hex_table(vintage)
             select_parts = ["h3index"]
@@ -784,33 +829,12 @@ class RedshiftSource(DataSource):
         descs = list(service_descs or self._configured_service_descs())
         if not descs:
             return
-        # Completeness check only for the requested subset.
-        complete = True
-        for desc in descs:
-            for pid in pids:
-                dest = self._state_cache_path(
-                    self.raw_dir / str(vintage) / str(pid), desc, state,
-                )
-                if not self._cache_ready(dest):
-                    complete = False
-                    break
-            if not complete:
-                break
-        if complete:
+        if self._provider_state_caches_complete(vintage, state, pids, descs):
             return
 
-        # Temporarily narrow configured services so the shared cache key / SELECT
-        # match the requested subset (avoids pulling unused tiers).
-        saved = self.cfg.raw["analysis"]["services"]
-        try:
-            if service_descs is not None:
-                self.cfg.raw["analysis"]["services"] = [
-                    s for s in saved if str(s["desc"]) in set(descs)
-                ] or [{"label": d, "desc": d} for d in descs]
-            shared_path = self._ensure_shared_slice(vintage, state)
-            shared = pd.read_parquet(shared_path)
-        finally:
-            self.cfg.raw["analysis"]["services"] = saved
+        # Pass service_descs explicitly (thread-safe; do not mutate cfg.services).
+        shared_path = self._ensure_shared_slice(vintage, state, descs)
+        shared = pd.read_parquet(shared_path)
 
         for desc in descs:
             col = self._service_column(desc)
@@ -831,38 +855,73 @@ class RedshiftSource(DataSource):
                 mask = covered & self._provider_mask(shared[prov_col], int(pid))
                 self._write_hex_cache(dest, shared.loc[mask, "h3"])
 
+    def _prefetch_shared_job(
+        self,
+        vintage: str,
+        state: str | None,
+        provider_ids: list[int],
+        service_descs: list[str],
+    ) -> None:
+        """One (vintage, state) shared scan on a dedicated warehouse connection."""
+        worker = RedshiftSource(self.cfg)
+        try:
+            worker._fanout_shared_to_provider_caches(
+                vintage, state, provider_ids, service_descs,
+            )
+        finally:
+            worker.close()
+
     def prefetch(
         self,
         vintages: list[str],
         states: list[str] | str,
         provider_ids: list[int] | None = None,
         service_descs: list[str] | None = None,
+        *,
+        max_workers: int | None = None,
     ) -> None:
         """Materialize raw caches before parallel analyze.
 
         * **Multi-provider:** one shared scan per (vintage, state) then local fan-out
-          (best for overnight Big-4).
+          (best for overnight Big-4). ``states="all"`` expands to all 51 FIPS so
+          overnight batches compose from per-state caches.
         * **Single provider:** direct per-(provider, service, state) queries so a
           1×1×1 unit only transfers that provider's hexes (sub-minute target).
+        * **max_workers:** parallel shared scans (default from
+          ``source.redshift.prefetch_workers``, capped at 3 for WLM safety).
         """
-        state_list: list[str | None]
-        if states == "all":
-            state_list = [None]
-        else:
-            state_list = [str(s).zfill(2) for s in states]
         pids = [int(p) for p in (provider_ids or self._configured_provider_ids())]
         descs = list(service_descs or self._configured_service_descs())
         use_direct = len(pids) <= 1
+        if states == "all":
+            # Shared mode: per-state caches (overnight batches). Direct mode keeps
+            # one national slice for a single-provider smoke.
+            state_list: list[str | None] = (
+                [None] if use_direct else sorted(NATIONAL_STATE_FIPS)
+            )
+        else:
+            state_list = [str(s).zfill(2) for s in states]
+
+        if max_workers is None:
+            try:
+                max_workers = int(self.rs.get("prefetch_workers", 3))
+            except (TypeError, ValueError):
+                max_workers = 3
+        # Cap concurrency: Redshift WLM thrash hurts more than serial scans.
+        max_workers = max(1, min(int(max_workers), 3))
+
         mode = "DIRECT" if use_direct else "SHARED"
         total = len(vintages) * len(state_list) * (len(pids) * len(descs) if use_direct else 1)
-        done = 0
         log.info(
-            "prefetch mode=%s vintages=%d states=%d providers=%d services=%d",
+            "prefetch mode=%s vintages=%d states=%d providers=%d services=%d workers=%d",
             mode, len(vintages), len(state_list), len(pids), len(descs),
+            1 if use_direct else max_workers,
         )
-        for vintage in vintages:
-            for state in state_list:
-                if use_direct:
+
+        if use_direct:
+            done = 0
+            for vintage in vintages:
+                for state in state_list:
                     for pid in pids:
                         for desc in descs:
                             done += 1
@@ -876,15 +935,33 @@ class RedshiftSource(DataSource):
                             self._fetch_direct_state_slice(
                                 pid, desc, vintage, state, dest,
                             )
-                else:
-                    done += 1
-                    log.info(
-                        "prefetch [%d/%d] SHARED vintage=%s state=%s providers=%d",
-                        done, total, vintage, state or "all", len(pids),
-                    )
-                    self._fanout_shared_to_provider_caches(
-                        vintage, state, pids, descs,
-                    )
+            return
+
+        jobs = [(v, s) for v in vintages for s in state_list]
+        if max_workers <= 1 or len(jobs) <= 1:
+            for i, (vintage, state) in enumerate(jobs, 1):
+                log.info(
+                    "prefetch [%d/%d] SHARED vintage=%s state=%s providers=%d",
+                    i, total, vintage, state or "all", len(pids),
+                )
+                self._fanout_shared_to_provider_caches(vintage, state, pids, descs)
+            return
+
+        # Parallel shared scans: each job uses its own Redshift connection.
+        done = 0
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {
+                pool.submit(self._prefetch_shared_job, vintage, state, pids, descs): (vintage, state)
+                for vintage, state in jobs
+            }
+            for fut in as_completed(futures):
+                vintage, state = futures[fut]
+                done += 1
+                fut.result()  # raise on worker failure
+                log.info(
+                    "prefetch [%d/%d] SHARED done vintage=%s state=%s",
+                    done, total, vintage, state or "all",
+                )
 
     def _compose_provider_layer(
         self, provider_id: int, technology: str, vintage: str, state_list: list[str],

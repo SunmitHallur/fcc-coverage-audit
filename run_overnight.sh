@@ -36,6 +36,15 @@ BATCHES=(
 
 echo "=== Overnight run started $(date) ===" | tee -a "$LOG"
 
+# National Redshift prefetch once (51 FIPS × 2 vintages, parallel shared scans).
+# Batch loops then --skip-prefetch so overlapping neighbor states are not re-scanned.
+echo "" | tee -a "$LOG"
+echo "=== National prefetch (download) @ $(date) ===" | tee -a "$LOG"
+if ! $PY -m fcc_audit.cli download 2>&1 | tee -a "$LOG"; then
+  echo "NATIONAL PREFETCH FAILED; refusing overnight batches" | tee -a "$LOG"
+  exit 1
+fi
+
 FAILED_BATCHES=()
 BATCH_TIMES=()
 BATCH_IDX=0
@@ -45,8 +54,8 @@ for STATES in "${BATCHES[@]}"; do
   echo "" | tee -a "$LOG"
   echo "=== BATCH $BATCH_IDX/$N_BATCHES $STATES @ $(date) ===" | tee -a "$LOG"
   T0=$(date +%s)
-  # Prefetch shared Redshift slices inside `cli run`, then analyze with workers.
-  if ! $PY -m fcc_audit.cli run --states "$STATES" --workers 4 2>&1 | tee -a "$LOG"; then
+  # Caches warm from national download; unit-level --workers 6 for CPU analyze.
+  if ! $PY -m fcc_audit.cli run --states "$STATES" --workers 6 --skip-prefetch 2>&1 | tee -a "$LOG"; then
     echo "BATCH FAILED: $STATES (continuing)" | tee -a "$LOG"
     FAILED_BATCHES+=("$STATES")
     continue

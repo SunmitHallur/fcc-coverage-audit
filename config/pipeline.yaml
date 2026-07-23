@@ -47,6 +47,10 @@ source:
     merged_table_prefix: "bbmap_mobile_bb_merged_all_"
     # FCC mobile environment code to read (0 or 1). Pick one consistently.
     environment: 0
+    # Parallel shared scans during prefetch / download (capped at 3 in code for
+    # Redshift WLM safety). Overnight `download` uses this; batch `run` skips
+    # when caches are already warm.
+    prefetch_workers: 3
     # Map each analysis service (by its `desc`) to the hex coverage column base;
     # the environment suffix (_env0/_env1) is appended automatically.
     service_hex_columns:

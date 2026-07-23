@@ -47,6 +47,16 @@ $batches = @(
 )
 
 $start = Get-Date
+
+# National Redshift prefetch once; batches then --skip-prefetch.
+Write-Host "=== National prefetch (download) ===" -ForegroundColor Cyan
+& $py -m fcc_audit.cli download
+if ($LASTEXITCODE -ne 0) {
+  Write-Error "National prefetch failed; refusing overnight batches"
+  Stop-Transcript | Out-Null
+  exit $LASTEXITCODE
+}
+
 $i = 0
 $failedBatches = @()
 foreach ($b in $batches) {
@@ -56,9 +66,8 @@ foreach ($b in $batches) {
   # Quote the batch string so commas stay in ONE --states arg. Unquoted, some
   # shells/arg parsers split "20,19,49" into argv tokens and only the first FIPS
   # (Kansas for this batch) is honored — looks "national" in the log, one state in results.
-  # Prefetch (shared Redshift scans) runs inside `cli run` before workers.
-  # --workers 4 then analyzes Big-4 in parallel from local parquet only.
-  & $py -m fcc_audit.cli run --states "$b" --workers 4
+  # Caches warm from national download; --workers 6 = unit-level CPU parallelism.
+  & $py -m fcc_audit.cli run --states "$b" --workers 6 --skip-prefetch
   if ($LASTEXITCODE -ne 0) {
     $failedBatches += $b
     Write-Warning "Batch failed or was incomplete: $b (exit $LASTEXITCODE)"

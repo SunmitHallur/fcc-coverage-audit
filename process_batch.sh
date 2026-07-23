@@ -11,7 +11,7 @@ if [[ ! -d .venv ]]; then
 fi
 export PYTHONPATH=src
 echo "=== Processing states: $STATES ==="
-.venv/bin/python -m fcc_audit.cli run --states "$STATES" --workers 4
+.venv/bin/python -m fcc_audit.cli run --states "$STATES" --workers 6
 echo ""
 echo "=== Done. Next steps ==="
 echo "  # After ALL national batches succeed:"
