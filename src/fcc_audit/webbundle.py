@@ -107,17 +107,19 @@ def assign_record_tiers(scored: pd.DataFrame, top_n: int = 250) -> pd.DataFrame:
 def _build_flag_math(row: pd.Series, threshold: float, weights: dict[str, float]) -> dict[str, Any]:
     """Build the flag-math dict for the reviewer cockpit info tooltip.
 
-    Returns:
-        priority_score   : float
-        flag_threshold   : float  — the percentile cutoff value
-        flag             : bool
-        features         : list[{name, label, value, weight, contribution, gates_fired}]
+    Prefers exported ``score_contribution_*`` columns from the scoring path so
+    the UI matches the bounded / exculpatory math in ``score.score``.
     """
     feats = []
     for name, label in _TOOLTIP_FEATURES:
         val = _finite_or_none(row.get(name, 0.0))
-        w = weights.get(name, 0.0)
-        contrib = _finite_or_none((val or 0.0) * w)
+        w = float(weights.get(name, 0.0) or 0.0)
+        contrib_key = f"score_contribution_{name}"
+        if contrib_key in row.index and pd.notna(row.get(contrib_key)):
+            contrib = _finite_or_none(row.get(contrib_key))
+        else:
+            # Fallback only when contributions were not persisted (legacy rows).
+            contrib = None
         feats.append({
             "name": name,
             "label": label,
@@ -127,7 +129,7 @@ def _build_flag_math(row: pd.Series, threshold: float, weights: dict[str, float]
         })
     return {
         "priority_score": _finite_or_none(row.get("priority_score")),
-        "flag_threshold": round(threshold, 4),
+        "flag_threshold": round(float(threshold), 4),
         "flag": bool(row.get("flag_for_review", False)),
         "features": feats,
     }
@@ -264,6 +266,17 @@ def build_web_meta(scored: pd.DataFrame, meta: dict[str, Any]) -> dict[str, Any]
         "flagged_count": flagged,
         "states_processed": meta.get("states_processed", "all"),
     }
+    if meta.get("incomplete") or meta.get("allow_incomplete"):
+        web_meta["incomplete"] = True
+    if meta.get("flag_threshold") is not None:
+        try:
+            web_meta["flag_threshold"] = float(meta["flag_threshold"])
+        except (TypeError, ValueError):
+            pass
+    if meta.get("feature_weights"):
+        web_meta["feature_weights"] = {
+            str(k): float(v) for k, v in dict(meta["feature_weights"]).items()
+        }
     if meta.get("default_provider_id") is not None:
         web_meta["default_provider_id"] = int(meta["default_provider_id"])
     if meta.get("default_county_geoid"):
@@ -491,6 +504,13 @@ def build_county_detail(
     )
     if est_p or est_c:
         detail["signal_estimated"] = True
+    else:
+        prior_vals = {h[1] for h in detail["prior_hexes"]} if detail["prior_hexes"] else set()
+        current_vals = {h[1] for h in detail["current_hexes"]} if detail["current_hexes"] else set()
+        # Binary / flat Redshift coverage with no per-hex signal variation and no
+        # sites to distance-estimate from — UI must not paint this as max green.
+        if len(prior_vals | current_vals) <= 1:
+            detail["signal_flat"] = True
     if counties is not None:
         boundary = _county_boundary_feature(counties, geoid)
         if boundary:
@@ -724,6 +744,10 @@ def write_web_bundle(
     web_meta = build_web_meta(scored, meta)
     web_meta["top_n"] = top_n
     web_meta["use_split_records"] = True
+    if threshold:
+        web_meta["flag_threshold"] = float(threshold)
+    if weights:
+        web_meta["feature_weights"] = {str(k): float(v) for k, v in weights.items()}
     meta_path.write_text(json.dumps(web_meta, indent=2), encoding="utf-8")
 
     towers_by_provider = build_towers_by_provider(sites)

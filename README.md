@@ -34,8 +34,8 @@ vision on the image where the two disagree.
 
 All analysis is **local**. Site inference uses coverage geometry, and ranking
 uses a deterministic monotone score with a maximum 0.25 influence from any
-single feature. There are **no external LLM/API calls**, which keeps approvals
-minimal.
+single feature. Core scoring has **no external LLM calls**. Optional
+`case-files --llm` narratives (local Ollama / Gemini) are off by default.
 
 ```
 acquire ─► normalize ─► (reconcile) ─► change-detect ─► infer sites
@@ -94,9 +94,12 @@ the pipeline analyzes each `(provider, service)` across the configured states.
 ./run.sh                 # macOS/Linux        |   run.bat   (Windows: double-click)
 ```
 
-With no arguments the launcher does a full national run with `--cleanup-raw`. You
-can also pass through any subcommand, e.g. `./run.sh download` or
-`run.bat run --states 01,02 --cleanup-raw`.
+With no arguments the launcher runs the **overnight national path** (10 state
+batches + final `build-web`). It does **not** pass `--cleanup-raw` — Redshift
+neighbor-state caches must be kept across batches. Pass `--cleanup-raw`
+explicitly only for FCC polygon runs when you need to bound disk. You can also
+pass through any subcommand, e.g. `./run.sh download` or
+`./run.sh run --states 01,02`.
 
 **Or drive the CLI directly:**
 
@@ -104,23 +107,27 @@ can also pass through any subcommand, e.g. `./run.sh download` or
 python -m fcc_audit.cli list-vintages          # available vintages
 python -m fcc_audit.cli download                 # PRE-FETCH all raw files only (resumable)
 python -m fcc_audit.cli run                      # download + analyze, Big 4 + all services
-python -m fcc_audit.cli run --states 01,02 --cleanup-raw   # one state batch
-python -m fcc_audit.cli run --states 01,02 --cleanup-raw --build-web  # batch + web bundle
-python -m fcc_audit.cli build-web                # rebuild web bundle from accumulated batches
-python -m fcc_audit.cli run --current "December 31, 2025" --prior "June 30, 2025"
+python -m fcc_audit.cli run --states 01,02       # one state batch (keep Redshift caches)
+python -m fcc_audit.cli run --states 01,02 --cleanup-raw   # FCC only: bound disk
+python -m fcc_audit.cli build-web                # rebuild web bundle from ALL batches
+python -m fcc_audit.cli run --current "277" --prior "279"   # Redshift build ids
 ```
 
-Vintages are the FCC `filing_subtype` labels (e.g. `"December 31, 2025"`), not
-ISO dates. `download` and `run` are both resumable — already-downloaded files and
-interim parquet are cached and skipped, so an interrupted run picks up where it
-left off.
+Vintages depend on backend: Redshift uses hex-table build ids (e.g. `"277"`);
+FCC uses `filing_subtype` labels (e.g. `"December 31, 2025"`). `download` and
+`run` are both resumable — already-downloaded files and interim parquet are
+cached and skipped, so an interrupted run picks up where it left off.
+
+**National completeness** means **50 states + DC (51 FIPS)**. Puerto Rico and
+other territories are out of scope unless you add them explicitly.
 
 ### Start small — validate before the national run
 
-Real mobile coverage is **per state × provider × service**, downloaded at the
-FCC's ~10-requests/minute limit, so a full national, all-provider run is an
-**overnight (many-hour) job**. Confirm everything works on a small scope first by
-editing `config/pipeline.yaml`:
+Real mobile coverage is **per state × provider × service**. On the FCC polygon
+backend, downloads are rate-limited (~10/min) so a full national run is
+**multi-day**. On Redshift (default), prefer the overnight launcher for a
+full national run targeting under ~10 wall-clock hours. Confirm everything
+works on a small scope first by editing `config/pipeline.yaml`:
 
 ```yaml
 analysis:
@@ -134,28 +141,35 @@ analysis:
 Then `python -m fcc_audit.cli run --states 48`. Once that produces a sane `selected_counties_*.csv`,
 widen `services`/`states` for the full run.
 
-Or use the batch helper (processes + rebuilds the web bundle in one step):
+Or use the batch helper (analyzes one batch; does **not** rebuild the web site):
 
 ```bash
 ./process_batch.sh "01,02"          # macOS/Linux
 process_batch.bat 01,02             # Windows
+# After ALL batches succeed:
+python -m fcc_audit.cli build-web
 ```
 
 ### Incremental processing → live website
 
-Process data in manageable batches, push the web bundle, and Vercel redeploys:
+Process data in manageable batches, then build the national web bundle once:
 
 ```bash
-# 1. Process a batch (downloads, analyzes, saves parquet, rebuilds web bundle)
+# 1. Process a batch (downloads, analyzes, saves parquet — does NOT wipe web/)
 ./process_batch.sh "01,02,04,05"
 
-# 2. Commit the updated web bundle (small — a few MB)
-git add web/public/data
-git commit -m "Add batch results for states 01,02,04,05"
-git push
+# 2. Repeat with remaining state batches…
 
-# 3. Repeat with the next states. Each batch accumulates in data/processed/scored/
-#    and build-web merges everything into web/public/data/records.json.
+# 3. After all batches succeed, merge into the web bundle:
+python -m fcc_audit.cli build-web
+#    → web/public/data/meta.json
+#    → web/public/data/records/<provider_id>/<service>.json
+#    → web/public/data/details/…
+
+# 4. Optionally publish (overnight --publish, or manually):
+git add web/public/data
+git commit -m "National web bundle"
+git push
 ```
 
 **What goes in git vs what doesn't:**
@@ -173,16 +187,16 @@ Anyone can regenerate raw data with `python -m fcc_audit.cli download` — no AP
 
 #### Data volume & time — read this before a national run
 
-Mobile coverage is per state × provider × service, so a full national run is
-**thousands of file downloads at ~10/minute → many hours / overnight**, and
-**0.5–1 TB** of raw files cumulatively. Options, in order of preference:
+**FCC polygon backend:** thousands of file downloads at ~10/minute → multi-day,
+and **0.5–1 TB** of raw files. **Redshift backend (default):** shared
+`(vintage, state)` hex scans — the recommended path for a full national run
+under ~10 hours. Options, in order of preference:
 
-1. **Redshift (best).** Once your AWS access lands, query server-side and never
-   download the raw geometry (see below). The right path for "all data".
-2. **`--cleanup-raw` + scope down.** The pipeline keeps only a compact per-layer
-   hex parquet (`data/interim/`) and deletes the big raw files after each service
-   when you pass `--cleanup-raw`, so peak disk stays small. Combine with dropping
-   `3G` (being retired) and unneeded states/providers in config.
+1. **Redshift (best).** Query server-side and never download raw geometry.
+   Use `./run.sh` / `run_overnight.sh` (10 geo batches + `--workers 4`).
+2. **`--cleanup-raw` + scope down (FCC only).** Deletes big raw files after each
+   service so peak disk stays small. Do **not** use on Redshift overnight
+   (neighbor-state caches must persist).
 3. **Run per-state / per-provider in batches.** The interim parquet cache makes
    re-runs cheap and the download is resumable.
 
@@ -220,8 +234,9 @@ Or deploy from CLI:
 npx vercel --prod    # from repo root (vercel.json points at web/)
 ```
 
-The site loads `public/data/counties.geojson` (county boundaries) and
-`public/data/records.json` (provider × service × county metrics + explanations).
+The site loads `public/data/counties.geojson` (county boundaries),
+`public/data/meta.json`, and split `public/data/records/<provider_id>/<service>.json`
+(provider × service × county metrics + explanations; see `meta.use_split_records`).
 Select a provider from the dropdown to see coverage-change shading and flagged
 counties highlighted in red.
 

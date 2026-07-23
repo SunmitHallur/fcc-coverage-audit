@@ -122,12 +122,13 @@ geography:
   counties_url: "https://www2.census.gov/geo/tiger/TIGER2024/COUNTY/tl_2024_us_county.zip"
 
 # ---------------------------------------------------------------------------
-# Tower / site inference (HDBSCAN over high-signal hexes)
+# Tower / site inference (H3 connected components over high-signal hexes)
 # ---------------------------------------------------------------------------
 towers:
   # Only hexes at/above this modeled signal band seed a candidate site.
   # FCC signal bands are typically -85 / -95 / -105 dBm (higher = stronger).
-  # A site is inferred per CONTIGUOUS blob of such hexes (H3 adjacency), so one
+  # A site is inferred per CONTIGUOUS blob of such hexes (H3 adjacency /
+  # connected components, with depth peaks for flat binary coverage). One
   # tower yields one site regardless of footprint size.
   min_signal_band_dbm: -95
   # Minimum hexes in a site blob. Scale with resolution so the minimum physical
@@ -135,9 +136,9 @@ towers:
   #   res 8  (~0.737 km^2/hex) ->  5 hexes (~3.7 km^2)  -- legacy
   #   res 9  (~0.105 km^2/hex) -> 35 hexes (~3.7 km^2)
   #   res 10 (~0.015 km^2/hex) -> 25 hexes (~0.38 km^2)
-  # The pipeline auto-scales this when site_h3_resolution != 9; the value here
-  # is the reference for site_h3_resolution 10 (current default).
-  min_site_hexes: 25               # for site_h3_resolution 10
+  # Reference for site_h3_resolution 9 (~0.105 km^2/hex → ~3.7 km^2 minimum).
+  # Auto-scales when the data resolution differs from site_h3_resolution.
+  min_site_hexes: 35               # for site_h3_resolution 9
   # Two inferred sites within this distance (meters) across vintages are
   # treated as the same physical site (matched), else "new".
   site_match_radius_m: 2000
@@ -146,7 +147,10 @@ towers:
 # Reconciliation (vector vs rendered tile) + CV fallback
 # ---------------------------------------------------------------------------
 reconcile:
-  enabled: true
+  # Tile CV reconcile is an available helper (reconcile.py) but is NOT invoked
+  # by default `run` — enabling it nationally would blow the <10h budget.
+  # Boundary-snap distance below is still used during analysis.
+  enabled: false
   tile_zoom: 12
   # If vector-vs-tile coverage IoU drops below this in a tile, fall back to
   # computer-vision segmentation of the rendered green map for that tile.
@@ -202,16 +206,16 @@ scoring:
     new_site_share: -0.10               # growth from genuine new towers
     # signal_jump_implausibility: 0.0   # available; off (Menard-type degradation ignored)
     # historical_volatility: 0.10       # enable once >2 vintages are processed
-    # --- independent ground-truth corroboration (optional; 0 when data absent) ---
-    # These are the strongest gaming signals when combined with same-site growth.
-    asr_no_new_structure: 0.12          # no registered structure built in window
-    measurement_gap: 0.10               # coverage claimed but nobody measured it
+    # --- independent ground-truth corroboration (enable when enrichment wired) ---
+    # asr_no_new_structure: 0.12        # no registered structure built in window
+    # measurement_gap: 0.10             # coverage claimed but nobody measured it
 
 # ---------------------------------------------------------------------------
 # Ground-truth benchmark (from FCC J25 vs D25 5G 7/1 Mbps example slides).
 # Used by `python -m fcc_audit.cli benchmark` to check the pipeline reproduces
 # the FCC's own selected / not-selected decisions once real data is available.
 # ---------------------------------------------------------------------------
+benchmark:
   # Redshift build ids: 277 = D25 (use "283" once accessible), 279 = J25. For the
   # `fcc` backend instead use the filing labels:
   # { current: "December 31, 2025", prior: "June 30, 2025" }.

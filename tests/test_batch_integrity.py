@@ -46,6 +46,100 @@ def test_redshift_empty_query_is_cached_as_valid_layer(tmp_path, monkeypatch):
     assert layer.is_hex is True
 
 
+def test_redshift_shared_scan_fans_out_all_providers(tmp_path, monkeypatch):
+    """One warehouse scan should populate every configured provider's state cache."""
+    cfg = load_config()
+    cfg.project_root = tmp_path
+    cfg.raw["source"]["backend"] = "redshift"
+    cfg.set_states(["20"])
+    # Keep the service list small for the test.
+    cfg.raw["analysis"]["services"] = [
+        {"label": "5G-NR 7/1", "desc": "5G-NR (7/1 Mbps)"},
+        {"label": "4G LTE", "desc": "4G LTE"},
+    ]
+    cfg.raw["analysis"]["providers"] = [
+        {"id": 130077, "name": "AT&T"},
+        {"id": 130403, "name": "T-Mobile"},
+    ]
+    source = RedshiftSource(cfg)
+    calls: list[str] = []
+
+    def fake_query(sql, params=()):
+        calls.append(sql)
+        assert "LIKE" not in sql.upper()
+        assert "tech5g_spd1_env0_prov" in sql
+        assert "tech4g_env0_prov" in sql
+        return pd.DataFrame({
+            "h3index": ["8928308280fffff", "8928308281fffff", "8928308283fffff"],
+            "tech5g_spd1_env0": [1, 1, 1],
+            "tech5g_spd1_env0_prov": ["130077", "130077,130403", "130403"],
+            "tech4g_env0": [0, 1, 0],
+            "tech4g_env0_prov": ["", "130077", ""],
+        })
+
+    monkeypatch.setattr(source, "_query_df", fake_query)
+    source.prefetch(["277"], ["20"], [130077, 130403])
+
+    assert len(calls) == 1
+    from fcc_audit.acquire import safe_service_name
+    att_5g = pd.read_parquet(
+        tmp_path / "data/raw/277/130077"
+        / f"{safe_service_name('5G-NR (7/1 Mbps)')}_redshift_st20_hex9.parquet"
+    )
+    tm_5g = pd.read_parquet(
+        tmp_path / "data/raw/277/130403"
+        / f"{safe_service_name('5G-NR (7/1 Mbps)')}_redshift_st20_hex9.parquet"
+    )
+    att_4g = pd.read_parquet(
+        tmp_path / "data/raw/277/130077"
+        / f"{safe_service_name('4G LTE')}_redshift_st20_hex9.parquet"
+    )
+    assert set(att_5g["h3"]) == {"8928308280fffff", "8928308281fffff"}
+    assert set(tm_5g["h3"]) == {"8928308281fffff", "8928308283fffff"}
+    assert set(att_4g["h3"]) == {"8928308281fffff"}
+
+    # Second prefetch must not hit Redshift again.
+    source.prefetch(["277"], ["20"], [130077, 130403])
+    assert len(calls) == 1
+
+    # fetch() after warm caches must compose locally — no new warehouse scans.
+    layer = source.fetch(130077, "5G-NR (7/1 Mbps)", "277")
+    assert len(calls) == 1
+    assert set(pd.read_parquet(layer.local_path)["h3"]) == {
+        "8928308280fffff", "8928308281fffff",
+    }
+
+
+def test_redshift_single_provider_uses_direct_queries(tmp_path, monkeypatch):
+    """1 provider → DIRECT slices (not a multi-provider shared union scan)."""
+    cfg = load_config()
+    cfg.project_root = tmp_path
+    cfg.raw["source"]["backend"] = "redshift"
+    cfg.set_states(["20"])
+    cfg.raw["analysis"]["services"] = [
+        {"label": "5G-NR 7/1", "desc": "5G-NR (7/1 Mbps)"},
+    ]
+    cfg.raw["analysis"]["providers"] = [{"id": 130077, "name": "AT&T"}]
+    source = RedshiftSource(cfg)
+    calls: list[str] = []
+
+    def fake_query(sql, params=()):
+        calls.append(sql)
+        assert "LIKE" in sql.upper()
+        assert "tech5g_spd1_env0 = 1" in sql.replace(" ", "") or "tech5g_spd1_env0=1" in sql.replace(" ", "") or "tech5g_spd1_env0 = 1" in sql
+        return pd.DataFrame({"h3index": ["8928308280fffff", "8928308281fffff"]})
+
+    monkeypatch.setattr(source, "_query_df", fake_query)
+    source.prefetch(["277", "279"], ["20"], [130077])
+    # 2 vintages × 1 state × 1 provider × 1 service = 2 direct queries
+    assert len(calls) == 2
+    assert all("LIKE" in c.upper() for c in calls)
+
+    layer = source.fetch(130077, "5G-NR (7/1 Mbps)", "277")
+    assert len(calls) == 2  # warm
+    assert len(pd.read_parquet(layer.local_path)) == 2
+
+
 def test_redshift_query_error_propagates_without_cache(tmp_path, monkeypatch):
     cfg = load_config()
     cfg.project_root = tmp_path
@@ -89,7 +183,7 @@ def test_successful_all_empty_units_are_completed(tmp_path, monkeypatch):
         cli, "_analyze_unit",
         lambda *_args, **_kwargs: (pd.DataFrame(), pd.DataFrame(), pd.DataFrame()),
     )
-    feats, sites, coverage, completed = process_provider(
+    feats, sites, coverage, completed, skipped = process_provider(
         cfg, EmptySource(), provider, "277", "279", gpd.GeoDataFrame(), {},
     )
 
@@ -116,12 +210,14 @@ def test_successful_all_empty_batch_writes_complete_manifest(tmp_path, monkeypat
         completed = {
             (int(provider.id), str(service["label"])) for service in cfg.services
         }
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), completed
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), completed, set()
 
     monkeypatch.setattr(cli, "process_provider", completed_empty)
     args = SimpleNamespace(
         states=None, current="277", prior="279", cleanup_raw=False,
         workers=1, build_web=False, verbose=False, config=None,
+        providers=None, services=None, no_context=False, ack_fcc_national=False,
+        top_n=250,
     )
 
     assert cli.cmd_run(cfg, args) == 0
@@ -133,6 +229,27 @@ def test_successful_all_empty_batch_writes_complete_manifest(tmp_path, monkeypat
         (unit["provider_id"], unit["technology"]) for unit in units
     }
     assert as_pairs(manifest["completed_analysis_units"]) == as_pairs(manifest["analysis_units"])
+
+
+def test_write_batch_timing_schema(tmp_path):
+    run_dir = tmp_path / "processed" / "run"
+    path = cli._write_batch_timing(
+        run_dir,
+        "20",
+        {
+            "states": ["20"],
+            "backend": "redshift",
+            "prefetch_s": 1.5,
+            "analyze_s": 10.0,
+            "total_s": 12.0,
+            "status": "complete",
+        },
+    )
+    blob = json.loads(path.read_text(encoding="utf-8"))
+    assert blob["prefetch_s"] == 1.5
+    assert blob["analyze_s"] == 10.0
+    assert blob["total_s"] == 12.0
+    assert path.name == "batch_timing_20.json"
 
 
 def test_target_rows_remove_context_state_outputs():
@@ -200,8 +317,47 @@ def test_windows_launcher_runs_exact_national_batches_and_final_build():
 
     assert set(batch_states) == NATIONAL_STATE_FIPS
     assert len(batch_states) == len(set(batch_states))
-    assert "--cleanup-raw" in powershell
+    # Keep Redshift/interim caches across overlapping neighbor states.
+    run_lines = [
+        line for line in powershell.splitlines()
+        if "fcc_audit.cli run" in line and not line.lstrip().startswith("#")
+    ]
+    assert run_lines, "expected a cli run invocation in run_overnight.ps1"
+    assert all("--cleanup-raw" not in line for line in run_lines)
+    assert any("--workers 4" in line for line in run_lines)
     assert "-m fcc_audit.cli build-web" in powershell
+    # Default overnight must not auto-push; only -Publish does.
+    assert "param(" in powershell and "$Publish" in powershell
+    assert "git push" in powershell
+    push_block = powershell.split("if ($Publish)", 1)[1]
+    assert "git push" in push_block
 
     launcher = (root / "run.bat").read_text(encoding="utf-8")
     assert "run_overnight.ps1" in launcher
+    assert "web\\index.html" in launcher or "web\\" in launcher
+
+
+def test_unix_launchers_match_national_contract():
+    root = Path(__file__).resolve().parents[1]
+    overnight = (root / "run_overnight.sh").read_text(encoding="utf-8")
+    run_sh = (root / "run.sh").read_text(encoding="utf-8")
+    process = (root / "process_batch.sh").read_text(encoding="utf-8")
+    process_bat = (root / "process_batch.bat").read_text(encoding="utf-8")
+
+    assert "run_overnight.sh" in run_sh
+    assert "web/index.html" in run_sh or "http.server 8000" in run_sh
+    assert "dashboard/index.html" not in run_sh
+
+    assert "--workers 4" in overnight
+    assert "build-web" in overnight
+    assert "--publish" in overnight
+    # git push only inside the PUBLISH branch
+    assert 'PUBLISH=1' in overnight or 'PUBLISH=0' in overnight
+    assert 'if [[ "$PUBLISH" -eq 1 ]]' in overnight
+
+    assert "--workers 4" in process
+    # process_batch must not invoke --build-web (would wipe national site).
+    assert re.search(r"fcc_audit\.cli run[^\n]*--build-web", process) is None
+    assert re.search(r"fcc_audit\.cli run[^\n]*--build-web", process_bat) is None
+    assert "fcc_audit.cli run" in process
+    assert "--workers 4" in process

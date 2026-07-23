@@ -22,5 +22,8 @@
   ],
   "total_records": 519,
   "flagged_count": 25,
-  "states_processed": "20"
+  "states_processed": "20",
+  "incomplete": true,
+  "use_split_records": true,
+  "top_n": 250
 }

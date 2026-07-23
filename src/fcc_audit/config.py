@@ -120,6 +120,37 @@ class Config:
         else:
             self.raw["analysis"]["states"] = [t.zfill(2) for t in tokens]
 
+    @property
+    def target_states(self):
+        """States whose counties are scored (may be a subset of query ``states``).
+
+        When Redshift runs expand ``states`` for cross-border tower context,
+        ``target_states`` stays the CLI/batch scope so neighbor hexes can be
+        clipped to a border buffer before expensive normalize/tower work.
+        """
+        t = self.raw["analysis"].get("target_states")
+        if t is None:
+            return self.states
+        if isinstance(t, str) and t.lower() == "all":
+            return "all"
+        return [str(x).zfill(2) for x in t]
+
+    def set_target_states(self, states: str | list[str] | None) -> None:
+        """Record the scoring scope before query states are expanded for context."""
+        if states is None:
+            self.raw["analysis"].pop("target_states", None)
+            return
+        if isinstance(states, str):
+            tokens = [s.strip() for s in states.split(",") if s.strip()]
+        else:
+            tokens = []
+            for item in states:
+                tokens.extend(s.strip() for s in str(item).split(",") if s.strip())
+        if not tokens or (len(tokens) == 1 and tokens[0].lower() == "all"):
+            self.raw["analysis"]["target_states"] = "all"
+        else:
+            self.raw["analysis"]["target_states"] = [t.zfill(2) for t in tokens]
+
     def set_providers_big4(self) -> None:
         """Restrict to the Big 4 known providers."""
         self.raw["analysis"]["providers"] = [

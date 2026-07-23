@@ -3,9 +3,10 @@
 #  FCC Coverage-Change Audit - one-command launcher (macOS / Linux)
 #
 #  Usage:
-#     ./run.sh                    ->  download + analyze ALL providers/techs
-#     ./run.sh download           ->  only pre-fetch raw data from the FCC API
-#     ./run.sh run --current 2025-12-31 --prior 2025-06-30
+#     ./run.sh                    ->  overnight national batches + final build-web
+#     ./run.sh --publish          ->  same, then git commit + push web bundle
+#     ./run.sh download           ->  only pre-fetch raw data
+#     ./run.sh run --states 01,02 ->  pass-through to CLI
 #
 #  Creates a local virtual environment, installs dependencies once, then runs
 #  the pipeline. Re-running reuses the same environment.
@@ -26,14 +27,16 @@ fi
 
 export PYTHONPATH=src
 
-# 2) Run. With no arguments, do a full national run that deletes each raw file
-#    after processing so disk usage stays bounded.
-if [ "$#" -eq 0 ]; then
-    echo "[run] full pipeline: all providers, all configured technologies"
-    .venv/bin/python -m fcc_audit.cli run --cleanup-raw
-else
-    .venv/bin/python -m fcc_audit.cli "$@"
+# 2) No args (or --publish only): crash-safe geographic overnight path,
+#    matching Windows run.bat → run_overnight.ps1.
+if [ "$#" -eq 0 ] || { [ "$#" -eq 1 ] && [ "$1" = "--publish" ]; }; then
+    echo "[run] full national pipeline: geographic batches + validated web build"
+    exec bash ./run_overnight.sh "$@"
 fi
 
+.venv/bin/python -m fcc_audit.cli "$@"
+
 echo
-echo "Done. Outputs are in data/outputs/  (open dashboard/index.html for the map)"
+echo "Done. Outputs are in data/outputs/"
+echo "Serve the web app:  cd web && python3 -m http.server 8000"
+echo "then open http://localhost:8000"

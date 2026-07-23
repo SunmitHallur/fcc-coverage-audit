@@ -60,6 +60,7 @@
     .pill.sev-critical { background: rgba(239,68,68,.2); color: #fca5a5; }
     .pill.sev-high { background: rgba(245,158,11,.15); color: #fcd34d; }
     .pill.sev-moderate { background: rgba(59,130,246,.15); color: #93c5fd; }
+    .pill.sev-low { background: rgba(148,163,184,.15); color: #cbd5e1; }
     #detail {
       position: absolute; top: 16px; right: 16px; width: min(920px, calc(100% - 32px));
       max-height: calc(100% - 32px);
@@ -347,6 +348,25 @@
   </style>
 </head>
 <body>
+  <style>
+    #scope-banner {
+      display: none; padding: 10px 16px; background: #422006; color: #fde68a;
+      border-bottom: 1px solid #78350f; font-size: 12px; line-height: 1.4;
+    }
+    #scope-banner.visible { display: block; }
+    #cdn-error {
+      display: none; padding: 24px; color: #fecaca; background: #450a0a;
+      font-size: 14px; line-height: 1.5;
+    }
+    #cdn-error.visible { display: block; }
+    @media print {
+      .compare-maps, .swipe-compare { display: block !important; }
+      .print-maps-note { display: block !important; color: #111; font-size: 11px; }
+    }
+    .print-maps-note { display: none; }
+  </style>
+  <div id="cdn-error"></div>
+  <div id="scope-banner"></div>
   <div id="app-loading"><div class="spinner" style="width:28px;height:28px;border-width:3px"></div><p>Loading coverage audit data…</p></div>
   <div id="app">
     <div id="sidebar">
@@ -368,7 +388,7 @@
           <input id="search" type="search" placeholder="County name…" />
         </div>
         <div>
-          <label for="thresh-slider">Flag threshold (priority score)</label>
+          <label for="thresh-slider">Display cutoff (not official flag)</label>
           <div class="threshold-row">
             <input type="range" id="thresh-slider" class="thresh-slider" min="0" max="1" step="0.01" value="0" />
             <span id="thresh-val" class="thresh-val">—</span>
@@ -403,7 +423,6 @@
         <span id="list-head-label">Flagged for review</span>
         <span>
           <span class="list-toggle" id="list-mode-toggle" title="Toggle all counties">Show all</span>
-          <span id="metric-toggle" style="cursor:pointer;color:var(--accent);margin-left:8px">Metric: priority</span>
         </span>
       </div>
       <div id="list"></div>
@@ -447,6 +466,7 @@
           <button type="button" id="btn-swipe">Swipe compare</button>
           <button type="button" id="btn-download">Download comparison</button>
         </div>
+        <p class="print-maps-note" id="print-maps-note">Maps: included when PNG rasters were rendered; otherwise attach hex screenshots from the interactive view.</p>
         <div id="compare-wrap">
           <div class="detail-loading" id="detail-map-status"><span class="spinner"></span><span>Select a county to compare prior vs current coverage.</span></div>
           <div class="swipe-compare" id="swipe-compare" style="display:none">
@@ -537,7 +557,6 @@
     const DATA_BASE = 'public/data';
     let meta = {}, records = {}, countiesGeo = null;
     let currentProvider = null, currentService = null;
-    let metricMode = 'priority'; // or 'change'
     let towerMarkers = [];
     let towersCache = {};
     let compareMaps = { prior: null, current: null };
@@ -655,11 +674,13 @@
       return out;
     }
 
-    function hexesToGeoJSON(hexes, sites) {
+    function hexesToGeoJSON(hexes, sites, opts = {}) {
+      const flat = !!opts.flat;
       const sorted = [...(hexes || [])].sort((a, b) => (a[1] || 0) - (b[1] || 0));
       const cellSig = new Map();
       sorted.forEach(([cell, rawSig]) => cellSig.set(cell, decodeSignal(rawSig)));
-      const smoothed = smoothHexSignal(cellSig);
+      const smoothed = flat ? cellSig : smoothHexSignal(cellSig);
+      const flatColor = '#94a3b8';
       const features = [];
       sorted.forEach(([cell]) => {
         const dbm = smoothed.get(cell);
@@ -667,7 +688,7 @@
         if (!ring) return;
         features.push({
           type: 'Feature',
-          properties: { dbm, color: signalColor(dbm) },
+          properties: { dbm, color: flat ? flatColor : signalColor(dbm) },
           geometry: { type: 'Polygon', coordinates: [ring] }
         });
       });
@@ -747,6 +768,10 @@
     }
 
     function showRasterCompare(detail, rec) {
+      if (!detail.prior_map && !detail.current_map) {
+        showPredictedRasterCompare(rec);
+        return;
+      }
       const base = detailAssetBase(rec);
       const priorUrl = `${base}/${detail.prior_map || 'prior.png'}`;
       const currentUrl = `${base}/${detail.current_map || 'current.png'}`;
@@ -762,18 +787,15 @@
     }
 
     function showPredictedRasterCompare(rec) {
-      const base = detailAssetBase(rec);
-      const priorUrl = `${base}/prior.png`;
-      const currentUrl = `${base}/current.png`;
-      lastRasterUrls = { prior: priorUrl, current: currentUrl };
-      document.getElementById('img-prior').src = priorUrl;
-      document.getElementById('img-current').src = currentUrl;
-      document.getElementById('swipe-prior').src = priorUrl;
-      document.getElementById('swipe-current').src = currentUrl;
-      document.getElementById('compare-maps').style.display = 'grid';
-      document.getElementById('compare-toolbar').style.display = 'flex';
-      setCompareMode('raster');
-      setCompareViewLayout(compareViewMode);
+      // Do not invent PNG URLs — default builds omit rasters and broken <img>
+      // icons confuse reviewers. Hex maps are the primary path.
+      lastRasterUrls = { prior: null, current: null };
+      document.getElementById('img-prior').removeAttribute('src');
+      document.getElementById('img-current').removeAttribute('src');
+      document.getElementById('swipe-prior').removeAttribute('src');
+      document.getElementById('swipe-current').removeAttribute('src');
+      document.getElementById('compare-toolbar').style.display = 'none';
+      setCompareMode('hex');
     }
 
     async function downloadComparison() {
@@ -962,7 +984,7 @@
         });
         if (countyFeature) {
           mapObj.addLayer({
-            id: 'county-outline',
+            id: 'county-outline-strong',
             type: 'line',
             source: 'county',
             paint: {
@@ -991,6 +1013,17 @@
       const data = await res.json();
       detailCache[key] = data;
       return data;
+    }
+
+
+    if (typeof maplibregl === 'undefined' || typeof h3 === 'undefined') {
+      const err = document.getElementById('cdn-error');
+      err.classList.add('visible');
+      err.innerHTML = '<strong>Map libraries failed to load</strong> (MapLibre / h3 from CDN). ' +
+        'Check network access to unpkg.com, or serve this page online. ' +
+        'Offline locked-down laptops need a vendored copy of the libraries.';
+      document.getElementById('app-loading')?.classList.add('hidden');
+      throw new Error('CDN libraries missing');
     }
 
     const map = new maplibregl.Map({
@@ -1025,13 +1058,51 @@
       }
       meta = await metaRes.json();
       countiesGeo = await geoRes.json();
-      // Newer build-web writes only split records (no monolithic records.json).
+      // Prefer split records whenever meta says so OR the monolith is absent.
+      // Never prefer a stale records.json over a present records/ tree.
       if (meta.use_split_records || !recRes.ok) {
         useSplitRecords = true;
         records = {};
       } else {
-        records = await recRes.json();
+        // Probe one split path; if it exists, prefer split over monolith.
+        const probePid = meta.providers?.[0]?.id;
+        const probeSvc = meta.services?.[0];
+        let splitOk = false;
+        if (probePid != null && probeSvc) {
+          try {
+            const probe = await fetch(
+              `${DATA_BASE}/records/${probePid}/${safeServiceKey(probeSvc)}.json`,
+              { method: 'HEAD' }
+            );
+            splitOk = probe.ok;
+          } catch {}
+        }
+        if (splitOk || meta.use_split_records) {
+          useSplitRecords = true;
+          records = {};
+        } else {
+          records = await recRes.json();
+        }
       }
+      updateScopeBanner();
+    }
+
+    function updateScopeBanner() {
+      const el = document.getElementById('scope-banner');
+      if (!el || !meta) return;
+      const scope = String(meta.states_processed || '');
+      const topN = meta.top_n || 250;
+      const incomplete = !!meta.incomplete || (scope && scope !== 'all' && !scope.includes(','));
+      const bits = [];
+      if (incomplete) {
+        bits.push(
+          `This bundle is not a full national run (states_processed=${scope || '?'}). ` +
+          'Treat rankings as a sample/preview until overnight batches + build-web complete.'
+        );
+      }
+      bits.push(`Detail maps are available for the top ${topN} counties per provider×service.`);
+      el.textContent = bits.join(' ');
+      el.classList.add('visible');
     }
 
     async function ensureProviderRecordsLoaded(pid, svc) {
@@ -1043,8 +1114,16 @@
         if (res.ok) {
           records[pid] = records[pid] || {};
           records[pid][svc] = await res.json();
+          return;
         }
-      } catch {}
+        const msg = res.status === 404
+          ? `No records file for provider ${pid} / ${svc} (404). Re-run build-web.`
+          : `Failed to load records for provider ${pid} / ${svc} (HTTP ${res.status}).`;
+        document.getElementById('list').innerHTML = `<div class="err">${msg}</div>`;
+      } catch (err) {
+        document.getElementById('list').innerHTML =
+          `<div class="err">Network error loading records for ${pid}/${svc}: ${err.message || err}</div>`;
+      }
     }
 
     function providerRecords(pid, svc) {
@@ -1157,7 +1236,7 @@
           { source: 'counties', id: geoid },
           {
             hasData: show,
-            flag: rec?.tier === 'red',
+            flag: !!rec?.flag,
             priority: rec?.priority || 0,
             color: colorForRecord(rec)
           }
@@ -1241,6 +1320,8 @@
         const div = document.createElement('div');
         div.className = 'row';
         div.dataset.geoid = r.geoid;
+        div.setAttribute('role', 'button');
+        div.tabIndex = 0;
         const sev = (r.explanation?.severity || 'Low').toLowerCase();
 
         const top = document.createElement('div');
@@ -1277,13 +1358,17 @@
         sub.textContent = r.explanation?.headline || '';
 
         div.append(top, sub);
-        div.onclick = () => {
+        const activate = () => {
           document.querySelectorAll('.row').forEach(el => el.classList.remove('active'));
           div.classList.add('active');
           currentDetailRec = r;
           showDetail(r);
           flyToCounty(r.geoid);
           updateTriagePanel(r);
+        };
+        div.onclick = activate;
+        div.onkeydown = e => {
+          if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); activate(); }
         };
         list.appendChild(div);
       });
@@ -1322,7 +1407,7 @@
       if (curX > 0 || newX > 0) {
         note.style.display = 'block';
         note.textContent = curX > 0
-          ? `${curX} neighboring-county tower${curX !== 1 ? 's' : ''} shown in blue — their coverage extends into this county and is counted above.`
+          ? `${curX} neighboring-county tower${curX !== 1 ? 's' : ''} shown with a white ring — their coverage extends into this county and is counted above.`
           : `${newX} new tower${newX !== 1 ? 's' : ''} outside this county explain part of the growth here.`;
       } else {
         note.style.display = 'none';
@@ -1387,7 +1472,11 @@
         if (reqId !== detailRequestId) return;
         if (!detail) {
           statusEl.style.display = 'flex';
-          statusEl.innerHTML = 'Coverage detail not available — re-run the pipeline with <code>--build-web</code>.';
+          const topN = meta?.top_n || 250;
+          const outsideTop = rec.tier == null;
+          statusEl.innerHTML = outsideTop
+            ? `Coverage detail maps are only generated for the top ${topN} counties per provider×service. This county is outside that set — rankings and flag math above are still valid.`
+            : 'Coverage detail not available for this county. Re-run <code>python -m fcc_audit.cli build-web</code> after batches complete.';
           statusEl.className = 'detail-missing';
           return;
         }
@@ -1419,11 +1508,20 @@
         setCompareMode('map');
         document.getElementById('compare-maps').style.display = 'grid';
         document.getElementById('signal-gradient-legend').style.display = 'grid';
-        document.getElementById('signal-estimated-note').style.display =
-          detail.signal_estimated ? 'block' : 'none';
+        const estNote = document.getElementById('signal-estimated-note');
+        if (detail.signal_flat && !detail.signal_estimated) {
+          estNote.style.display = 'block';
+          estNote.textContent = 'Coverage is binary (flat 0/1) with no usable signal band — hexes shown in neutral gray, not signal strength.';
+        } else {
+          estNote.style.display = detail.signal_estimated ? 'block' : 'none';
+          if (detail.signal_estimated) {
+            estNote.textContent = estNote.dataset.defaultText || estNote.textContent;
+          }
+        }
         const countyFeature = resolveCountyFeature(rec.geoid, detail);
-        const priorGeo = hexesToGeoJSON(detail.prior_hexes, detail.sites_prior);
-        const currentGeo = hexesToGeoJSON(detail.current_hexes, detail.sites_current);
+        const flatOpts = { flat: !!detail.signal_flat && !detail.signal_estimated };
+        const priorGeo = hexesToGeoJSON(detail.prior_hexes, detail.sites_prior, flatOpts);
+        const currentGeo = hexesToGeoJSON(detail.current_hexes, detail.sites_current, flatOpts);
         const sharedBounds = unionBounds(
           countyBounds(countyFeature),
           boundsFromGeoJSON(priorGeo),
@@ -1486,7 +1584,11 @@
     document.getElementById('provider').addEventListener('change', onSelectionChange);
     document.getElementById('service').addEventListener('change', onSelectionChange);
     document.getElementById('search').addEventListener('input', renderList);
-    document.getElementById('flagged-only').addEventListener('change', () => { applyFeatureStates(); });
+    document.getElementById('flagged-only').addEventListener('change', e => {
+      listShowAll = !e.target.checked;
+      renderList();
+      applyFeatureStates();
+    });
     document.getElementById('show-towers').addEventListener('change', e => loadTowers(e.target.checked));
     document.getElementById('legend-toggle').addEventListener('click', () => {
       const legend = document.getElementById('map-legend');
@@ -1497,20 +1599,11 @@
       document.getElementById('detail').classList.remove('visible');
       destroyCompareMaps();
     });
-    document.addEventListener('keydown', e => {
-      if (e.key === 'Escape') {
-        document.getElementById('detail').classList.remove('visible');
-        destroyCompareMaps();
-      }
-    });
-    document.getElementById('metric-toggle').addEventListener('click', () => {
-      metricMode = metricMode === 'priority' ? 'change' : 'priority';
-      document.getElementById('metric-toggle').textContent = `Metric: ${metricMode}`;
-      applyFeatureStates();
-    });
     document.getElementById('list-mode-toggle').addEventListener('click', () => {
       listShowAll = !listShowAll;
+      document.getElementById('flagged-only').checked = !listShowAll;
       renderList();
+      applyFeatureStates();
     });
     document.getElementById('btn-side-by-side').addEventListener('click', () => setCompareViewLayout('side'));
     document.getElementById('btn-swipe').addEventListener('click', () => setCompareViewLayout('swipe'));
@@ -1522,14 +1615,18 @@
     // ── Decisions: persistence + triage ─────────────────────────────────
     let decisions = {};
     let currentDetailRec = null;
-    const DECISIONS_KEY = 'fcc-audit-decisions';
+    function decisionsStorageKey() {
+      const cur = meta?.current_vintage || 'unknown';
+      const pri = meta?.prior_vintage || 'unknown';
+      return `fcc-audit-decisions:${cur}|${pri}`;
+    }
 
     function decisionKey(geoid, pid, svc) {
       return `${pid}/${safeServiceKey(svc || '')}/${geoid}`;
     }
 
     function loadDecisions() {
-      try { decisions = JSON.parse(localStorage.getItem(DECISIONS_KEY) || '{}'); } catch {}
+      try { decisions = JSON.parse(localStorage.getItem(decisionsStorageKey()) || '{}'); } catch { decisions = {}; }
     }
 
     function saveDecision(verdict, note) {
@@ -1545,7 +1642,7 @@
         flag: currentDetailRec.flag,
         timestamp: new Date().toISOString(),
       };
-      localStorage.setItem(DECISIONS_KEY, JSON.stringify(decisions));
+      localStorage.setItem(decisionsStorageKey(), JSON.stringify(decisions));
       updateTriagePanel(currentDetailRec);
       renderList();
     }
@@ -1561,7 +1658,7 @@
       const note = document.getElementById('triage-note').value;
       if (decisions[key]) {
         decisions[key].note = note;
-        localStorage.setItem(DECISIONS_KEY, JSON.stringify(decisions));
+        localStorage.setItem(decisionsStorageKey(), JSON.stringify(decisions));
       }
     }
 
@@ -1594,6 +1691,8 @@
         priority_score: v.priority,
         was_flagged: v.flag,
         decided_at: v.timestamp,
+        current_vintage: meta?.current_vintage,
+        prior_vintage: meta?.prior_vintage,
       }));
       const blob = new Blob([JSON.stringify(entries, null, 2)], {type: 'application/json'});
       const a = document.createElement('a');
@@ -1662,39 +1761,37 @@
       });
     }
 
-    // ── Live threshold slider ────────────────────────────────────────────
+    // ── Display cutoff slider (does NOT change official pipeline flags) ──
+    let displayCutoff = null;
+
     function applyLiveThreshold(threshVal) {
+      displayCutoff = threshVal;
       document.getElementById('thresh-val').textContent = threshVal.toFixed(3);
       if (!currentProvider || !currentService) return;
       const recs = providerRecords(currentProvider, currentService);
-      let flaggedCount = 0;
-      Object.values(recs).forEach(r => {
-        const wasFlag = r.flag;
-        r.flag = (r.priority || 0) >= threshVal;
-        if (r.flag) flaggedCount++;
-      });
-      document.getElementById('n-flagged').textContent = flaggedCount;
+      // Official flagged count always comes from pipeline `flag`.
+      document.getElementById('n-flagged').textContent =
+        Object.values(recs).filter(r => r.flag).length;
       applyFeatureStates();
       renderList();
     }
 
     function initThresholdSlider() {
       const recs = providerRecords(currentProvider, currentService);
-      const scores = Object.values(recs).map(r => r.priority || 0).filter(Boolean).sort((a,b) => a - b);
+      const scores = Object.values(recs).map(r => r.priority || 0).filter(v => v > 0).sort((a,b) => a - b);
       const slider = document.getElementById('thresh-slider');
-      // Always span [0, 1] — the full valid score range — regardless of how
-      // compressed the actual scores are in this dataset.
       slider.min   = '0';
       slider.max   = '1';
       slider.step  = '0.001';
-      if (!scores.length) {
+      const metaThresh = (meta && meta.flag_threshold != null) ? Number(meta.flag_threshold) : null;
+      if (!scores.length && metaThresh == null) {
         slider.value = '0';
         document.getElementById('thresh-val').textContent = '—';
+        displayCutoff = null;
         return;
       }
-      // Default to the 90th-percentile score (mirrors the pipeline's flag_percentile).
-      const idx   = Math.min(Math.floor(scores.length * 0.9), scores.length - 1);
-      const pct90 = scores[idx] ?? 0;
+      const idx   = Math.min(Math.floor(scores.length * 0.9), Math.max(0, scores.length - 1));
+      const pct90 = metaThresh != null && Number.isFinite(metaThresh) ? metaThresh : (scores[idx] ?? 0);
       slider.value = pct90.toFixed(3);
       applyLiveThreshold(pct90);
     }
@@ -1703,19 +1800,21 @@
       applyLiveThreshold(Number(e.target.value));
     });
 
-    // Extended keyboard handler
+    // Single keyboard handler
     document.addEventListener('keydown', e => {
       const tag = document.activeElement.tagName;
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      const detailVisible = document.getElementById('detail').classList.contains('visible');
       if (e.key === 'j') { e.preventDefault(); navigateList(1); }
       else if (e.key === 'k') { e.preventDefault(); navigateList(-1); }
-      else if (e.key === 'a' && currentDetailRec) setDecision('accept');
-      else if (e.key === 'r' && currentDetailRec) setDecision('reject');
-      else if (e.key === 'n' && currentDetailRec) setDecision('needs-info');
+      else if (detailVisible && e.key === 'a' && currentDetailRec) setDecision('accept');
+      else if (detailVisible && e.key === 'r' && currentDetailRec) setDecision('reject');
+      else if (detailVisible && e.key === 'n' && currentDetailRec) setDecision('needs-info');
       else if (e.key === 'Escape') {
         const d = document.getElementById('detail');
         if (d.classList.contains('visible')) {
           d.classList.remove('visible');
+          destroyCompareMaps();
           currentDetailRec = null;
           updateTriagePanel(null);
           document.querySelectorAll('.row').forEach(el => el.classList.remove('active'));
@@ -1723,20 +1822,30 @@
       }
     });
 
-    loadDecisions();
-
     map.on('load', async () => {
       const loader = document.getElementById('app-loading');
       try {
         await loadData();
+        loadDecisions();
         fillDropdowns();
         setupMapLayers();
         if (useSplitRecords) {
           await ensureProviderRecordsLoaded(currentProvider, currentService);
+          // Re-pick default provider now that flag counts are available (F36).
+          if (meta.default_provider_id == null) {
+            const best = preferredProviderId();
+            if (best && best !== currentProvider) {
+              document.getElementById('provider').value = best;
+              currentProvider = best;
+              currentService = fillServiceDropdown(currentProvider);
+              await ensureProviderRecordsLoaded(currentProvider, currentService);
+            }
+          }
         }
         initThresholdSlider();
         renderList();
         fitMapToUS();
+        openDemoCounty();
         loader.classList.add('hidden');
         setTimeout(() => loader.remove(), 400);
       } catch (e) {

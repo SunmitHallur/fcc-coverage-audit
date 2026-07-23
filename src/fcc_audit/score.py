@@ -115,7 +115,17 @@ def build_features(
         df["measurement_gap"] = 0.0
     df["measurement_gap"] = df["measurement_gap"].fillna(0.0).clip(lower=0.0)
 
+    if "inference_insufficient" not in df:
+        df["inference_insufficient"] = False
+    df["inference_insufficient"] = df["inference_insufficient"].fillna(False).astype(bool)
+    # When site inference could not run (flat binary / below min blob size),
+    # unattributed share is an artifact — zero it for scoring so it cannot flag.
+    df.loc[df["inference_insufficient"], "unattributed_share"] = 0.0
+
     return df
+
+
+_SMALL_COHORT_N = 50
 
 
 def _bounded_feature(s: pd.Series) -> pd.Series:
@@ -168,7 +178,14 @@ def score(features: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     df["priority_score"] = df["risk_score"]
 
     flag_pct = float(cfg.scoring["flag_percentile"])
-    threshold = df["priority_score"].quantile(flag_pct) if len(df) > 1 else 0.0
+    # Small cohorts (pilots / single-state batches): percentile alone is unstable
+    # (n=1 previously set threshold=0 and flagged everything eligible). Require
+    # the absolute same-site implausibility path instead.
+    small_cohort = len(df) < _SMALL_COHORT_N
+    if small_cohort:
+        threshold = float("inf")
+    else:
+        threshold = float(df["priority_score"].quantile(flag_pct))
     susp = float(cfg.scoring["suspicious_same_site_growth"])
     min_added = float(cfg.scoring.get("min_added_km2_to_flag", 0.0))
 
@@ -198,7 +215,10 @@ def score(features: pd.DataFrame, cfg: Config) -> pd.DataFrame:
             | (df["unattributed_share"].fillna(0.0) >= min_unattributed)
         )
     )
-    suspicious = (df["priority_score"] >= threshold) | same_site_implausible
+    if small_cohort:
+        suspicious = same_site_implausible
+    else:
+        suspicious = (df["priority_score"] >= threshold) | same_site_implausible
 
     # Growth explained by new towers outside this county is usually legitimate.
     cross_border_build = (

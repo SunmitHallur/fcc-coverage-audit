@@ -213,6 +213,130 @@ def county_areas_km2(counties: gpd.GeoDataFrame, equal_area_crs: str = "EPSG:507
     return dict(zip(counties["county_geoid"].astype(str), areas))
 
 
+def assign_counties(
+    hex_df: pd.DataFrame,
+    counties: gpd.GeoDataFrame,
+    *,
+    clip_to_states=None,
+    buffer_m: float = 50_000.0,
+    equal_area_crs: str = "EPSG:5070",
+) -> pd.DataFrame:
+    """Attach county attributes via each hex centroid (point-in-polygon join).
+
+    When *clip_to_states* is set, hexes outside a *buffer_m* fringe of those
+    states are dropped **using the same centroid pass** (no second H3 decode).
+    """
+    if hex_df.empty:
+        return hex_df.assign(county_geoid=None, county_name=None, state_fips=None)
+
+    import numpy as np
+
+    base = hex_df[["h3", "signal_dbm"]].copy()
+    cell_ids = base["h3"].astype(str).tolist()
+    lats = np.empty(len(cell_ids), dtype=float)
+    lngs = np.empty(len(cell_ids), dtype=float)
+    for i, c in enumerate(cell_ids):
+        lat, lng = h3.cell_to_latlng(c)
+        lats[i] = lat
+        lngs[i] = lng
+
+    if clip_to_states not in (None, "all") and clip_to_states:
+        wanted = {str(s).zfill(2) for s in clip_to_states}
+        state_col = counties["state_fips"].astype(str).str.zfill(2)
+        target = counties.loc[state_col.isin(wanted)]
+        if not target.empty:
+            geom = target.to_crs(equal_area_crs).geometry.union_all().buffer(float(buffer_m))
+            pts_proj = gpd.GeoSeries(
+                gpd.points_from_xy(lngs, lats), crs="EPSG:4326",
+            ).to_crs(equal_area_crs)
+            keep = pts_proj.intersects(geom).to_numpy()
+            if not bool(keep.all()):
+                n_before = len(base)
+                base = base.loc[keep].reset_index(drop=True)
+                lats = lats[keep]
+                lngs = lngs[keep]
+                log.info(
+                    "  clipped hexes to target buffer: %s -> %s (states=%s)",
+                    f"{n_before:,}", f"{len(base):,}", ",".join(sorted(wanted)),
+                )
+            if base.empty:
+                return base.assign(county_geoid=None, county_name=None, state_fips=None)
+
+    pts = gpd.GeoDataFrame(
+        base,
+        geometry=gpd.points_from_xy(lngs, lats),
+        crs="EPSG:4326",
+    )
+    joined = gpd.sjoin(pts, counties, how="left", predicate="within")
+    if "index_right" in joined.columns:
+        joined = joined.drop(columns=["index_right"])
+    for col in ["county_geoid", "county_name", "state_fips"]:
+        right = f"{col}_right"
+        if right in joined.columns:
+            joined[col] = joined[right]
+            joined = joined.drop(
+                columns=[c for c in joined.columns if c.endswith("_right") or c.endswith("_left")]
+            )
+        elif col not in joined.columns:
+            joined[col] = None
+    return pd.DataFrame(
+        joined[["h3", "signal_dbm", "county_geoid", "county_name", "state_fips"]]
+    )
+
+
+def filter_counties_to_states(counties: gpd.GeoDataFrame, states) -> gpd.GeoDataFrame:
+    """Keep only counties in the requested state list (or all if unrestricted)."""
+    if states == "all" or not states:
+        return counties
+    wanted = {str(s).zfill(2) for s in states}
+    mask = counties["state_fips"].astype(str).str.zfill(2).isin(wanted)
+    return counties.loc[mask].copy()
+
+
+def clip_hexes_to_target_buffer(
+    hex_df: pd.DataFrame,
+    counties: gpd.GeoDataFrame,
+    target_states,
+    buffer_m: float = 50_000.0,
+    equal_area_crs: str = "EPSG:5070",
+) -> pd.DataFrame:
+    """Drop neighbor-state hexes farther than *buffer_m* from target states.
+
+    Prefer :func:`assign_counties` with ``clip_to_states=`` (single centroid pass).
+    Kept for callers that only need spatial filtering.
+    """
+    if hex_df.empty or target_states == "all" or not target_states:
+        return hex_df
+    wanted = {str(s).zfill(2) for s in target_states}
+    state_col = counties["state_fips"].astype(str).str.zfill(2)
+    target = counties.loc[state_col.isin(wanted)]
+    if target.empty:
+        return hex_df
+    import numpy as np
+
+    geom = target.to_crs(equal_area_crs).geometry.union_all().buffer(float(buffer_m))
+    cell_ids = hex_df["h3"].astype(str).tolist()
+    lats = np.empty(len(cell_ids), dtype=float)
+    lngs = np.empty(len(cell_ids), dtype=float)
+    for i, c in enumerate(cell_ids):
+        lat, lng = h3.cell_to_latlng(c)
+        lats[i] = lat
+        lngs[i] = lng
+    pts = gpd.GeoSeries(
+        gpd.points_from_xy(lngs, lats),
+        crs="EPSG:4326",
+    ).to_crs(equal_area_crs)
+    keep = pts.intersects(geom)
+    if bool(keep.all()):
+        return hex_df
+    out = hex_df.loc[keep.to_numpy()].reset_index(drop=True)
+    log.info(
+        "  clipped hexes to target buffer: %s -> %s (states=%s)",
+        f"{len(hex_df):,}", f"{len(out):,}", ",".join(sorted(wanted)),
+    )
+    return out
+
+
 def boundary_snap_share(
     change_df: pd.DataFrame,
     counties: gpd.GeoDataFrame,
@@ -234,7 +358,13 @@ def boundary_snap_share(
     if gained.empty:
         return pd.DataFrame(columns=["county_geoid", "boundary_snap_share"])
 
-    centers = [h3.cell_to_latlng(c) for c in gained["h3"]]
+    # Only compute against counties that actually gained coverage.
+    geoids = set(gained["county_geoid"].astype(str))
+    counties = counties[counties["county_geoid"].astype(str).isin(geoids)]
+    if counties.empty:
+        return pd.DataFrame(columns=["county_geoid", "boundary_snap_share"])
+
+    centers = [h3.cell_to_latlng(c) for c in gained["h3"].tolist()]
     pts = gpd.GeoSeries(
         gpd.points_from_xy([lng for _la, lng in centers], [la for la, _lng in centers]),
         crs="EPSG:4326",
@@ -256,35 +386,6 @@ def boundary_snap_share(
             share = float((dists <= threshold_m).mean())
         rows.append({"county_geoid": str(geoid), "boundary_snap_share": share})
     return pd.DataFrame(rows)
-
-
-def assign_counties(hex_df: pd.DataFrame, counties: gpd.GeoDataFrame) -> pd.DataFrame:
-    """Attach county attributes via each hex centroid (point-in-polygon join)."""
-    if hex_df.empty:
-        return hex_df.assign(county_geoid=None, county_name=None, state_fips=None)
-    base = hex_df[["h3", "signal_dbm"]].copy()
-    centers = [h3.cell_to_latlng(c) for c in base["h3"]]
-    pts = gpd.GeoDataFrame(
-        base,
-        geometry=gpd.points_from_xy(
-            [lng for _lat, lng in centers], [lat for lat, _lng in centers]
-        ),
-        crs="EPSG:4326",
-    )
-    joined = gpd.sjoin(pts, counties, how="left", predicate="within")
-    # Drop sjoin index column; prefer right (TIGER) attrs when both sides exist.
-    if "index_right" in joined.columns:
-        joined = joined.drop(columns=["index_right"])
-    for col in ["county_geoid", "county_name", "state_fips"]:
-        right = f"{col}_right"
-        if right in joined.columns:
-            joined[col] = joined[right]
-            joined = joined.drop(columns=[c for c in joined.columns if c.endswith("_right") or c.endswith("_left")])
-        elif col not in joined.columns:
-            joined[col] = None
-    return pd.DataFrame(
-        joined[["h3", "signal_dbm", "county_geoid", "county_name", "state_fips"]]
-    )
 
 
 def _derive_parent_hexes(
@@ -338,6 +439,19 @@ def _hex_layer_at_resolution(cov: CoverageFile, resolution: int) -> pd.DataFrame
     return rolled.groupby("h3", as_index=False)["signal_dbm"].max()
 
 
+def _normalize_scope_key(cfg: Config) -> str:
+    """Cache token for state query scope, including target when clipped."""
+    scope = cfg.states_scope_key()
+    targets = cfg.target_states
+    if (
+        targets not in (None, "all")
+        and cfg.states not in (None, "all")
+        and set(str(s).zfill(2) for s in targets) != set(str(s).zfill(2) for s in cfg.states)
+    ):
+        return f"{scope}_t{'-'.join(sorted(str(s).zfill(2) for s in targets))}"
+    return scope
+
+
 def normalize_layers(
     cfg: Config,
     cov: CoverageFile,
@@ -365,7 +479,7 @@ def normalize_layers(
         return df, df
 
     safe_svc = safe(service_label)
-    scope = cfg.states_scope_key()
+    scope = _normalize_scope_key(cfg)
     backend = cfg.backend
     # Include backend so fixture caches never poison fcc/redshift national runs.
     cache_c = (
@@ -434,7 +548,7 @@ def normalize_layer(
     filtering is needed. If the file has a signal column it's kept (strongest per
     hex); otherwise coverage is treated as a flat band. Cached to parquet.
     """
-    scope = cfg.states_scope_key()
+    scope = _normalize_scope_key(cfg)
     backend = cfg.backend
     cache = (
         cfg.path("interim")
@@ -445,7 +559,21 @@ def normalize_layer(
 
     if getattr(cov, "is_hex", False):
         hex_df = _hex_layer_at_resolution(cov, resolution)
-        hex_df = assign_counties(hex_df, counties)
+        targets = cfg.target_states
+        query = cfg.states
+        clip_to = None
+        if (
+            targets not in (None, "all")
+            and query not in (None, "all")
+            and set(str(s).zfill(2) for s in targets) != set(str(s).zfill(2) for s in query)
+        ):
+            clip_to = targets
+        hex_df = assign_counties(
+            hex_df, counties,
+            clip_to_states=clip_to,
+            buffer_m=50_000.0,
+            equal_area_crs=cfg.geography.get("equal_area_crs", "EPSG:5070"),
+        )
         hex_df["provider_id"] = cov.provider_id
         hex_df["technology"] = service_label
         hex_df["vintage"] = cov.vintage

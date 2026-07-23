@@ -14,6 +14,7 @@ import json
 import logging
 import re
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -46,6 +47,36 @@ def _states_list(cfg: Config) -> list[str]:
     return [] if s == "all" else list(s)
 
 
+def _web_bundle_score_params(cfg: Config, scored: pd.DataFrame) -> tuple[float, dict[str, float]]:
+    """National flag quantile + feature weights for web flag-math panels."""
+    weights = {
+        str(k): float(v)
+        for k, v in dict(cfg.scoring.get("feature_weights") or {}).items()
+    }
+    if scored.empty or "priority_score" not in scored.columns or len(scored) <= 1:
+        return 0.0, weights
+    flag_pct = float(cfg.scoring.get("flag_percentile", 0.90))
+    return float(scored["priority_score"].quantile(flag_pct)), weights
+
+
+
+def _unit_marker_path(unit_dir: Path, provider_id: int, service_label: str) -> Path:
+    safe = re.sub(r"[^\w.\-]+", "_", str(service_label)).strip("_") or "svc"
+    return unit_dir / f"{int(provider_id)}_{safe}.done"
+
+
+def _write_batch_timing(
+    run_dir: Path,
+    states_key: str,
+    payload: dict[str, Any],
+) -> Path:
+    timing_dir = run_dir / "timing"
+    timing_dir.mkdir(parents=True, exist_ok=True)
+    path = timing_dir / f"batch_timing_{states_key}.json"
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return path
+
+
 def _run_key(cfg: Config, current: str, prior: str) -> str:
     """Stable directory key isolating one backend/vintage comparison."""
     def safe(value: str) -> str:
@@ -73,31 +104,35 @@ def _sites_relevant_to_coverage(
     coverage: pd.DataFrame,
     target_states: list[str],
 ) -> pd.DataFrame:
-    """Keep target-home sites and cross-border sites that serve target coverage."""
+    """Keep target-home sites and nearby cross-border sites that can serve them.
+
+    Avoids re-attributing every coverage hex (O(hexes × sites) on western
+    batches). Sites within 80 km of a target-home tower are kept as the
+    cross-border fringe; that matches the 50 km context buffer used at fetch.
+    """
     if sites.empty or not target_states:
         return sites
     wanted = set(target_states)
-    keep: set[int] = set(
-        sites.index[
-            sites["county_geoid"].astype(str).str[:2].isin(wanted)
-        ].tolist()
-    )
-    keys = ["provider_id", "technology", "vintage"]
-    if coverage.empty or any(key not in sites or key not in coverage for key in keys):
-        return sites.loc[sorted(keep)].reset_index(drop=True)
-    for values, site_group in sites.groupby(keys, sort=False):
-        mask = pd.Series(True, index=coverage.index)
-        for key, value in zip(keys, values):
-            mask &= coverage[key] == value
-        cov_group = coverage.loc[mask]
-        if cov_group.empty:
-            continue
-        local_indices, _, _ = attribute.attribute_hexes_to_sites(
-            cov_group, site_group.reset_index(drop=True),
-        )
-        valid = sorted(set(int(i) for i in local_indices if i >= 0))
-        keep.update(site_group.index[valid].tolist())
-    return sites.loc[sorted(keep)].reset_index(drop=True)
+    home_state = sites["county_geoid"].astype(str).str[:2]
+    in_target = home_state.isin(wanted)
+    if bool(in_target.all()):
+        return sites.reset_index(drop=True)
+    target_sites = sites.loc[in_target]
+    other = sites.loc[~in_target]
+    if target_sites.empty:
+        return sites.reset_index(drop=True)
+    if other.empty:
+        return target_sites.reset_index(drop=True)
+    for col in ("x_m", "y_m"):
+        if col not in sites.columns:
+            return pd.concat([target_sites, other], ignore_index=True)
+    from scipy.spatial import cKDTree
+    import numpy as np
+
+    tree = cKDTree(target_sites[["x_m", "y_m"]].to_numpy())
+    dist, _ = tree.query(other[["x_m", "y_m"]].to_numpy(), k=1)
+    near = other.loc[np.asarray(dist) <= 80_000.0]
+    return pd.concat([target_sites, near], ignore_index=True)
 
 
 def _context_states(counties, target_states: list[str], buffer_m: float = 50_000) -> list[str]:
@@ -165,18 +200,25 @@ def _analyze_unit(
     log = logging.getLogger(__name__)
     county_res = int(cfg.geography["county_h3_resolution"])
     site_res = int(cfg.geography["site_h3_resolution"])
+    t_unit = time.perf_counter()
 
+    t0 = time.perf_counter()
     cur8, cur9 = normalize.normalize_layers(
         cfg, cur_file, counties, county_res, site_res, service_label
     )
     pri8, pri9 = normalize.normalize_layers(
         cfg, pri_file, counties, county_res, site_res, service_label
     )
+    t_norm = time.perf_counter() - t0
     if cur8.empty and pri8.empty:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    t0 = time.perf_counter()
     change = changedetect.hex_change(pri8, cur8)
     cc = changedetect.county_change(change, county_res, county_area_km2)
+    t_change = time.perf_counter() - t0
 
+    t0 = time.perf_counter()
     prior_sites = towers.infer_sites(pri9, cfg, label_prefix="P")
     current_sites = towers.infer_sites(cur9, cfg, label_prefix="C")
     current_sites = attribute.match_sites(
@@ -188,7 +230,9 @@ def _analyze_unit(
     # will capture ~100% of its gained hexes after this step.
     current_sites = towers.compute_lobe_reach(cur9, current_sites)
     prior_sites = towers.compute_lobe_reach(pri9, prior_sites)
+    t_towers = time.perf_counter() - t0
 
+    t0 = time.perf_counter()
     attr = attribute.attribute_changes(change, current_sites, county_res)
     bsnap = normalize.boundary_snap_share(
         change, counties,
@@ -202,8 +246,13 @@ def _analyze_unit(
     }
     if not feats.empty:
         feats["county_geoid"] = feats["county_geoid"].astype(str)
-        prior_srv = attribute.serving_towers_by_county(pri8, prior_sites)
-        current_srv = attribute.serving_towers_by_county(cur8, current_sites)
+        # Tower serving counts are only consumed for scored (changed) counties.
+        # Attributing every hex in a multi-state batch is otherwise O(coverage).
+        changed_geoids = set(feats["county_geoid"])
+        pri_for_srv = pri8[pri8["county_geoid"].astype(str).isin(changed_geoids)]
+        cur_for_srv = cur8[cur8["county_geoid"].astype(str).isin(changed_geoids)]
+        prior_srv = attribute.serving_towers_by_county(pri_for_srv, prior_sites)
+        current_srv = attribute.serving_towers_by_county(cur_for_srv, current_sites)
         if not prior_srv.empty:
             prior_srv["county_geoid"] = prior_srv["county_geoid"].astype(str)
             feats = feats.merge(
@@ -264,10 +313,13 @@ def _analyze_unit(
         for k, v in tag.items():
             coverage[k] = v
 
+    t_attr = time.perf_counter() - t0
     log.info(
-        "  %s %s: %d counties changed, %d prior / %d current sites",
+        "  %s %s: %d counties changed, %d prior / %d current sites "
+        "(normalize=%.1fs change=%.1fs towers=%.1fs attr=%.1fs total=%.1fs)",
         provider.name, service_label,
         0 if feats.empty else len(feats), len(prior_sites), len(current_sites),
+        t_norm, t_change, t_towers, t_attr, time.perf_counter() - t_unit,
     )
     return feats, sites, coverage
 
@@ -281,29 +333,60 @@ def process_provider(
     counties,
     county_area_km2: dict | None = None,
     cleanup_raw: bool = False,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, set[tuple[int, str]]]:
+    *,
+    unit_marker_dir: Path | None = None,
+    unit_feats_dir: Path | None = None,
+    force_rerun: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, set[tuple[int, str]], set[tuple[int, str]]]:
     log = logging.getLogger(__name__)
     log.info("=== %s (id=%s) ===", provider.name, provider.id)
 
     feats_parts, sites_parts, coverage_parts = [], [], []
     completed_units: set[tuple[int, str]] = set()
+    skipped_units: set[tuple[int, str]] = set()
+    if unit_marker_dir is not None:
+        unit_marker_dir.mkdir(parents=True, exist_ok=True)
+    if unit_feats_dir is not None:
+        unit_feats_dir.mkdir(parents=True, exist_ok=True)
     for svc in cfg.services:
         label, desc = svc["label"], svc["desc"]
+        marker = (
+            _unit_marker_path(unit_marker_dir, int(provider.id), str(label))
+            if unit_marker_dir is not None else None
+        )
+        feats_path = None
+        if unit_feats_dir is not None:
+            safe = re.sub(r"[^\w.\-]+", "_", str(label)).strip("_") or "svc"
+            feats_path = unit_feats_dir / f"{int(provider.id)}_{safe}.parquet"
+        if marker is not None and marker.exists() and not force_rerun:
+            log.info("  resume: skipping cached unit %s %s", provider.name, label)
+            completed_units.add((int(provider.id), str(label)))
+            if feats_path is not None and feats_path.exists():
+                cached = pd.read_parquet(feats_path)
+                if not cached.empty:
+                    feats_parts.append(cached)
+            continue
         try:
             cur_file = source.fetch(provider.id, desc, current)
             pri_file = source.fetch(provider.id, desc, prior)
         except FileNotFoundError as exc:
-            # FCC/fixture backends may legitimately have no filing for a
-            # provider/service. Redshift represents no coverage as an empty
-            # layer; RuntimeError is therefore a real query/permission failure
-            # and must abort the batch rather than silently publishing partial data.
             log.warning("no source layer for %s %s: %s", provider.name, label, exc)
+            skipped_units.add((int(provider.id), str(label)))
+            if marker is not None:
+                marker.write_text("skipped_no_filing\n", encoding="utf-8")
             continue
 
         feats, sites, coverage = _analyze_unit(
             cfg, provider, label, cur_file, pri_file, counties, county_area_km2,
         )
         completed_units.add((int(provider.id), str(label)))
+        if marker is not None:
+            marker.write_text("complete\n", encoding="utf-8")
+        if feats_path is not None:
+            if feats.empty:
+                pd.DataFrame().to_parquet(feats_path, index=False)
+            else:
+                feats.to_parquet(feats_path, index=False)
         if not feats.empty:
             feats_parts.append(feats)
         if not sites.empty:
@@ -322,12 +405,12 @@ def process_provider(
     feats = pd.concat(feats_parts, ignore_index=True) if feats_parts else pd.DataFrame()
     sites = pd.concat(sites_parts, ignore_index=True) if sites_parts else pd.DataFrame()
     coverage = pd.concat(coverage_parts, ignore_index=True) if coverage_parts else pd.DataFrame()
-    return feats, sites, coverage, completed_units
+    return feats, sites, coverage, completed_units, skipped_units
 
 
 def _provider_worker(
     payload: dict,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, set[tuple[int, str]]]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, set[tuple[int, str]], set[tuple[int, str]]]:
     """Process one provider in a separate process (for ``run --workers N``).
 
     Each worker rebuilds its own config/source/counties so nothing large needs
@@ -341,14 +424,21 @@ def _provider_worker(
     if payload.get("backend"):
         cfg.raw["source"]["backend"] = payload["backend"]
     cfg.set_states(payload["states"])
+    if payload.get("target_states") is not None:
+        cfg.set_target_states(payload["target_states"])
     source = get_source(cfg)
     counties = normalize.load_counties(cfg)
+    # Match the parent process: join only against query/context states.
+    counties = normalize.filter_counties_to_states(counties, cfg.states)
     area = normalize.county_areas_km2(counties, cfg.geography["equal_area_crs"])
     provider = Provider(**payload["provider"])
     return process_provider(
         cfg, source, provider,
         payload["current"], payload["prior"],
         counties, area, payload["cleanup_raw"],
+        unit_marker_dir=Path(payload["unit_marker_dir"]) if payload.get("unit_marker_dir") else None,
+        unit_feats_dir=Path(payload["unit_feats_dir"]) if payload.get("unit_feats_dir") else None,
+        force_rerun=bool(payload.get("force_rerun", False)),
     )
 
 
@@ -378,19 +468,22 @@ def _save_batch_results(
     coverage_dir = run_dir / "coverage"
     states_key = "-".join(sorted(states)) if states else "all"
 
-    # A rerun replaces the whole target batch, including units/states that are
-    # now legitimately empty. Remove old partitions before writing new results.
-    if scored_dir.exists():
-        for stale in scored_dir.glob(f"scored_*_{states_key}.parquet"):
-            stale.unlink()
+    # A rerun replaces partitions for services present in *scored*. Other
+    # service partitions for this states_key are left intact (within-batch resume).
+    if not scored.empty and "technology" in scored.columns and scored_dir.exists():
+        for svc in scored["technology"].astype(str).unique():
+            safe_svc = str(svc).replace("/", "-").replace(" ", "")
+            for stale in scored_dir.glob(f"scored_{safe_svc}_{states_key}.parquet"):
+                stale.unlink()
     (sites_dir / f"sites_{states_key}.parquet").unlink(missing_ok=True)
-    if coverage_dir.exists():
-        stale_coverage = (
-            [coverage_dir / f"coverage_{state}.parquet" for state in states]
-            if states else list(coverage_dir.glob("coverage_*.parquet"))
-        )
-        for stale in stale_coverage:
-            stale.unlink(missing_ok=True)
+    if coverage is not None and coverage_dir.exists():
+        if states:
+            for state in states:
+                (coverage_dir / f"coverage_{str(state).zfill(2)}.parquet").unlink(missing_ok=True)
+        elif coverage.empty:
+            for stale in coverage_dir.glob("coverage_*.parquet"):
+                stale.unlink(missing_ok=True)
+
 
     if not scored.empty and "technology" in scored.columns:
         for svc in scored["technology"].unique():
@@ -425,6 +518,7 @@ def _save_batch_results(
         "query_states": meta.get("query_states", states or ["all"]),
         "analysis_units": meta.get("analysis_units", []),
         "completed_analysis_units": meta.get("completed_analysis_units", []),
+        "skipped_analysis_units": meta.get("skipped_analysis_units", []),
         "missing_analysis_units": meta.get("missing_analysis_units", []),
         "status": "complete" if not meta.get("missing_analysis_units") else "incomplete",
         "completed_at": batch_ts,
@@ -448,21 +542,40 @@ def cmd_run(cfg: Config, args) -> int:
     log.info("comparing current=%s vs prior=%s (states=%s)", current, prior, cfg.states)
     target_key = "-".join(sorted(target_states)) if target_states else "all"
     run_dir = cfg.path("processed") / _run_key(cfg, current, prior)
-    (run_dir / "manifests" / f"batch_{target_key}.json").unlink(missing_ok=True)
-    for stale in (run_dir / "scored").glob(f"scored_*_{target_key}.parquet"):
-        stale.unlink()
-    (run_dir / "sites" / f"sites_{target_key}.parquet").unlink(missing_ok=True)
-    coverage_dir = run_dir / "coverage"
-    stale_coverage = (
-        [coverage_dir / f"coverage_{state}.parquet" for state in target_states]
-        if target_states else list(coverage_dir.glob("coverage_*.parquet"))
-    )
-    for stale in stale_coverage:
-        stale.unlink(missing_ok=True)
+    unit_marker_dir = run_dir / "unit_markers" / target_key
+    unit_feats_dir = run_dir / "unit_feats" / target_key
+    force_rerun = bool(getattr(args, "force_rerun", False))
+    t_batch0 = time.perf_counter()
+    prefetch_s = 0.0
+
+    if force_rerun:
+        (run_dir / "manifests" / f"batch_{target_key}.json").unlink(missing_ok=True)
+        for stale in (run_dir / "scored").glob(f"scored_*_{target_key}.parquet"):
+            stale.unlink()
+        (run_dir / "sites" / f"sites_{target_key}.parquet").unlink(missing_ok=True)
+        coverage_dir = run_dir / "coverage"
+        stale_coverage = (
+            [coverage_dir / f"coverage_{state}.parquet" for state in target_states]
+            if target_states else list(coverage_dir.glob("coverage_*.parquet"))
+        )
+        for stale in stale_coverage:
+            stale.unlink(missing_ok=True)
+        if unit_marker_dir.exists():
+            for marker in unit_marker_dir.glob("*.done"):
+                marker.unlink()
+        if unit_feats_dir.exists():
+            for cached in unit_feats_dir.glob("*.parquet"):
+                cached.unlink()
+    else:
+        # Soft resume: keep prior scored partitions and unit markers.
+        (run_dir / "manifests" / f"batch_{target_key}.json").unlink(missing_ok=True)
 
     counties = normalize.load_counties(cfg)
     county_area_km2 = normalize.county_areas_km2(counties, cfg.geography["equal_area_crs"])
-    if cfg.backend == "redshift" and target_states:
+    if target_states:
+        cfg.set_target_states(target_states)
+    no_context = bool(getattr(args, "no_context", False))
+    if cfg.backend == "redshift" and target_states and not no_context:
         context_states = _context_states(counties, target_states)
         if context_states != sorted(target_states):
             log.info(
@@ -470,21 +583,87 @@ def cmd_run(cfg: Config, args) -> int:
                 target_states, context_states,
             )
             cfg.set_states(context_states)
+    elif no_context and target_states:
+        log.info(" --no-context: skipping neighbor-state halo (target=%s)", target_states)
+    # County point-in-polygon against the full US TIGER layer dominates
+    # normalize time; restrict to the query/context (or target) states.
+    if cfg.states != "all":
+        counties = normalize.filter_counties_to_states(counties, cfg.states)
 
     providers = _resolve_providers(cfg, source, current)
+    if getattr(args, "providers", None):
+        wanted = {int(x.strip()) for x in str(args.providers).split(",") if x.strip()}
+        providers = [p for p in providers if int(p.id) in wanted]
+        if not providers:
+            log.error("no providers matched --providers %s", args.providers)
+            return 2
+    if getattr(args, "services", None):
+        wanted_labels = {s.strip() for s in str(args.services).split(",") if s.strip()}
+        cfg.raw["analysis"]["services"] = [
+            s for s in cfg.services if str(s["label"]) in wanted_labels
+        ]
+        if not cfg.services:
+            log.error("no services matched --services %s", args.services)
+            return 2
     expected_units = {
         (int(provider.id), str(service["label"]))
         for provider in providers
         for service in cfg.services
     }
     cleanup_raw = bool(getattr(args, "cleanup_raw", False)) and cfg.raw["source"]["backend"] != "fixture"
-    workers = max(1, int(getattr(args, "workers", 1) or 1))
+    workers_raw = getattr(args, "workers", 1)
+    try:
+        workers = int(workers_raw)
+    except (TypeError, ValueError):
+        log.error("--workers must be an integer >= 1 (got %r)", workers_raw)
+        return 2
+    if workers < 1:
+        log.error("--workers must be >= 1 (got %s)", workers)
+        return 2
+
+    # FCC polygon national is multi-day (rate limit + TB-scale transfer).
+    if cfg.backend == "fcc" and (cfg.states == "all" or not target_states):
+        if not getattr(args, "ack_fcc_national", False):
+            log.error(
+                "FCC backend national run cannot meet a <10h SLO (API ~10 req/min + "
+                "0.5–1 TB raw). Use --backend redshift for national overnight, or pass "
+                "--ack-fcc-national to proceed knowing this is a multi-day job."
+            )
+            return 2
+        log.warning(
+            "FCC national run acknowledged via --ack-fcc-national; expect multi-day wall clock"
+        )
+
+    # Redshift: one shared scan per (vintage, state) BEFORE workers so parallel
+    # analyze does not open competing warehouse connections (WLM thrash → ~5% CPU).
+    if cfg.backend == "redshift" and hasattr(source, "prefetch"):
+        query_states = _states_list(cfg) or "all"
+        log.info(
+            "prefetching Redshift slices (single connection) for states=%s …",
+            query_states,
+        )
+        t_pf = time.perf_counter()
+        source.prefetch(
+            [current, prior],
+            query_states if query_states else "all",
+            [p.id for p in providers],
+            [s["desc"] for s in cfg.services],
+        )
+        prefetch_s = time.perf_counter() - t_pf
+        try:
+            source.close()
+        except Exception:  # noqa: BLE001
+            pass
+
     all_feats, all_sites, all_coverage = [], [], []
     completed_units: set[tuple[int, str]] = set()
+    skipped_units: set[tuple[int, str]] = set()
+    t_analyze0 = time.perf_counter()
 
     def _collect(result):
-        feats, sites, coverage, completed = result
+        feats, sites, coverage, completed, skipped = result
         completed_units.update(completed)
+        skipped_units.update(skipped)
         feats = _target_rows(feats, target_states)
         coverage = _target_rows(coverage, target_states)
         if not feats.empty:
@@ -504,11 +683,15 @@ def cmd_run(cfg: Config, args) -> int:
                 "config": getattr(args, "config", None),
                 "backend": cfg.backend,
                 "states": _states_list(cfg) or "all",
+                "target_states": target_states or "all",
                 "current": current,
                 "prior": prior,
                 "provider": {"id": p.id, "name": p.name},
                 "cleanup_raw": cleanup_raw,
                 "verbose": getattr(args, "verbose", False),
+                "unit_marker_dir": str(unit_marker_dir),
+                "unit_feats_dir": str(unit_feats_dir),
+                "force_rerun": force_rerun,
             }
             for p in providers
         ]
@@ -518,10 +701,17 @@ def cmd_run(cfg: Config, args) -> int:
     else:
         for provider in providers:
             _collect(process_provider(
-                cfg, source, provider, current, prior, counties, county_area_km2, cleanup_raw
+                cfg, source, provider, current, prior, counties, county_area_km2, cleanup_raw,
+                unit_marker_dir=unit_marker_dir,
+                unit_feats_dir=unit_feats_dir,
+                force_rerun=force_rerun,
             ))
 
-    missing_units = sorted(expected_units - completed_units)
+    analyze_s = time.perf_counter() - t_analyze0
+
+    # Intentional no-filing skips count toward completeness.
+    accounted = completed_units | skipped_units
+    missing_units = sorted(expected_units - accounted)
     if missing_units:
         log.error(
             "incomplete batch: %d provider/service units did not complete: %s",
@@ -529,7 +719,12 @@ def cmd_run(cfg: Config, args) -> int:
             "; ".join(f"{provider_id}/{service}" for provider_id, service in missing_units),
         )
         return 2
-
+    if skipped_units:
+        log.info(
+            "skipped %d provider/service units with no filing: %s",
+            len(skipped_units),
+            "; ".join(f"{pid}/{svc}" for pid, svc in sorted(skipped_units)),
+        )
     sites = pd.concat(all_sites, ignore_index=True) if all_sites else pd.DataFrame()
     coverage = pd.concat(all_coverage, ignore_index=True) if all_coverage else pd.DataFrame()
     states_label = ",".join(target_states) if target_states else "all"
@@ -548,11 +743,46 @@ def cmd_run(cfg: Config, args) -> int:
             {"provider_id": provider_id, "technology": service}
             for provider_id, service in sorted(completed_units)
         ],
+        "skipped_analysis_units": [
+            {
+                "provider_id": provider_id,
+                "technology": service,
+                "reason": "skipped_no_filing",
+            }
+            for provider_id, service in sorted(skipped_units)
+        ],
         "missing_analysis_units": [],
         "query_states": _states_list(cfg) or ["all"],
     }
 
     sites = _sites_relevant_to_coverage(sites, coverage, target_states)
+
+    def _emit_timing(status: str) -> None:
+        total_s = time.perf_counter() - t_batch0
+        _write_batch_timing(
+            run_dir,
+            target_key,
+            {
+                "states": target_states or ["all"],
+                "backend": cfg.backend,
+                "current": current,
+                "prior": prior,
+                "prefetch_s": round(prefetch_s, 3),
+                "analyze_s": round(analyze_s, 3),
+                "total_s": round(total_s, 3),
+                "providers": len(providers),
+                "services": len(cfg.services),
+                "completed_units": len(completed_units),
+                "skipped_units": len(skipped_units),
+                "status": status,
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        log.info(
+            "batch timing states=%s prefetch=%.1fs analyze=%.1fs total=%.1fs",
+            target_key, prefetch_s, analyze_s, total_s,
+        )
+
     if not all_feats:
         # A successful all-empty query is complete, not a failed batch. Persist
         # its success manifest so national completeness can distinguish zero
@@ -560,6 +790,7 @@ def cmd_run(cfg: Config, args) -> int:
         _save_batch_results(
             cfg, pd.DataFrame(), sites, meta, coverage, states=target_states,
         )
+        _emit_timing("complete_empty")
         log.info("batch complete: all provider/service layers were valid but produced no rows")
         return 0
 
@@ -578,19 +809,25 @@ def cmd_run(cfg: Config, args) -> int:
         web_dir = cfg.project_root / "web"
         web_meta = dict(meta)
         web_meta.update(_demo_web_defaults(cfg, scored))
+        threshold, weights = _web_bundle_score_params(cfg, scored)
+        web_meta["flag_threshold"] = threshold
+        web_meta["feature_weights"] = weights
         web_paths = report.write_web_bundle(
             scored, sites, counties, web_dir, web_meta, coverage=coverage,
+            threshold=threshold,
+            weights=weights,
             top_n=getattr(args, "top_n", 250),
         )
         paths.update({f"web_{k}": v for k, v in web_paths.items()})
 
     flagged = int(scored["flag_for_review"].sum())
     log.info("DONE: %d provider-county rows, %d flagged", len(scored), flagged)
+    _emit_timing("complete")
     print("\nOutputs:")
     for k, v in paths.items():
         print(f"  {k}: {v}")
     print(f"\nFlagged for review: {flagged}/{len(scored)}")
-    print(f"Open the dashboard: {cfg.project_root / 'web' / 'index.html'}")
+    print(f"Open the web app: {cfg.project_root / 'web' / 'index.html'}")
     return 0
 
 
@@ -634,7 +871,11 @@ def cmd_build_web(cfg: Config, args) -> int:
                 (int(unit["provider_id"]), str(unit["technology"]))
                 for unit in manifest.get("completed_analysis_units", manifest.get("analysis_units", []))
             )
-            if completed != units or manifest.get("missing_analysis_units"):
+            skipped = frozenset(
+                (int(unit["provider_id"]), str(unit["technology"]))
+                for unit in manifest.get("skipped_analysis_units", [])
+            )
+            if (completed | skipped) != units or manifest.get("missing_analysis_units"):
                 continue
             if units:
                 unit_sets.add(units)
@@ -726,11 +967,18 @@ def cmd_build_web(cfg: Config, args) -> int:
     web_dir = cfg.project_root / "web"
     web_meta = dict(meta)
     web_meta.update(_demo_web_defaults(cfg, scored))
+    if getattr(args, "allow_incomplete", False):
+        web_meta["incomplete"] = True
     render_pngs = getattr(args, "render_pngs", False)
     top_n = getattr(args, "top_n", 250)
     coverage_paths = sorted(coverage_dir.glob("coverage_*.parquet"))
+    threshold, weights = _web_bundle_score_params(cfg, scored)
+    web_meta["flag_threshold"] = threshold
+    web_meta["feature_weights"] = weights
     paths = report.write_web_bundle(
         scored, sites, counties, web_dir, web_meta, coverage_paths=coverage_paths,
+        threshold=threshold,
+        weights=weights,
         render_pngs=render_pngs,
         top_n=top_n,
     )
@@ -752,7 +1000,7 @@ def cmd_list_vintages(cfg: Config, args) -> int:
 
 
 def cmd_download(cfg: Config, args) -> int:
-    """Pre-stage raw coverage files from the FCC API without running analysis."""
+    """Pre-stage raw coverage files from the FCC API / Redshift without analysis."""
     log = logging.getLogger(__name__)
     if getattr(args, "states", None):
         cfg.set_states(args.states)
@@ -763,6 +1011,35 @@ def cmd_download(cfg: Config, args) -> int:
     )
     providers = _resolve_providers(cfg, source, current)
     services = cfg.services
+
+    # Redshift: shared scan path (~N states × 2 vintages, not × providers × services).
+    if cfg.backend == "redshift" and hasattr(source, "prefetch"):
+        target = _states_list(cfg)
+        if target:
+            counties = normalize.load_counties(cfg)
+            query_states = _context_states(counties, target)
+            cfg.set_states(query_states)
+            cfg.set_target_states(target)
+        else:
+            query_states = "all"
+        log.info(
+            "Redshift prefetch: %d providers × %d services via shared state scans (states=%s)",
+            len(providers), len(services), query_states,
+        )
+        source.prefetch(
+            [current, prior],
+            query_states if query_states else "all",
+            [p.id for p in providers],
+            [s["desc"] for s in cfg.services],
+        )
+        try:
+            source.close()
+        except Exception:  # noqa: BLE001
+            pass
+        print(f"\nPrefetched Redshift slices under {cfg.path('raw')}")
+        print("Now run:  python -m fcc_audit.cli run --workers 4")
+        return 0
+
     total_bytes = 0
     n_files = n_skipped = 0
     log.info("downloading %d providers x %d services x 2 vintages (states=%s)",
@@ -918,8 +1195,30 @@ def main(argv: list[str] | None = None) -> int:
     p_run.add_argument(
         "--workers", type=int, default=1,
         help="parallel worker processes for provider analysis (CPU-bound). "
-             "Best used after `download` has cached the raw files, so workers "
-             "don't multiply the FCC request rate. Default 1 (serial).",
+             "Must be >= 1. Best used after `download` has cached the raw files, "
+             "so workers don't multiply the FCC request rate. Default 1 (serial).",
+    )
+    p_run.add_argument(
+        "--force-rerun", action="store_true",
+        help="ignore within-batch unit markers and re-analyze every provider/service",
+    )
+    p_run.add_argument(
+        "--ack-fcc-national", action="store_true",
+        help="required to run FCC-backend national (states=all); acknowledges multi-day runtime",
+    )
+    p_run.add_argument(
+        "--no-context", action="store_true",
+        help="Redshift only: do not pull neighbor states for cross-border towers "
+             "(faster 1-state runs). Has no effect on the FCC polygon backend.",
+    )
+    p_run.add_argument(
+        "--providers", default=None,
+        help="comma-separated provider ids to analyze (default: config list)",
+    )
+    p_run.add_argument(
+        "--services", default=None,
+        help="comma-separated service labels to analyze, e.g. '5G-NR 7/1' "
+             "(default: all configured services)",
     )
     p_run.set_defaults(func=cmd_run)
 

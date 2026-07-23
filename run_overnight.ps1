@@ -7,7 +7,12 @@
 #
 # Prereqs (one time): a .venv with `pip install -r requirements.txt`, and a .env
 # with REDSHIFT_HOST/DB/USER/PASSWORD. Then just:  .\run_overnight.ps1
+# Optional: .\run_overnight.ps1 -Publish   # commit + push web/public/data
 # (If PowerShell blocks it:  powershell -ExecutionPolicy Bypass -File .\run_overnight.ps1)
+
+param(
+  [switch]$Publish
+)
 
 Set-Location $PSScriptRoot
 $ErrorActionPreference = "Continue"   # record failed batches, then fail the run
@@ -51,7 +56,9 @@ foreach ($b in $batches) {
   # Quote the batch string so commas stay in ONE --states arg. Unquoted, some
   # shells/arg parsers split "20,19,49" into argv tokens and only the first FIPS
   # (Kansas for this batch) is honored — looks "national" in the log, one state in results.
-  & $py -m fcc_audit.cli run --states "$b" --cleanup-raw
+  # Prefetch (shared Redshift scans) runs inside `cli run` before workers.
+  # --workers 4 then analyzes Big-4 in parallel from local parquet only.
+  & $py -m fcc_audit.cli run --states "$b" --workers 4
   if ($LASTEXITCODE -ne 0) {
     $failedBatches += $b
     Write-Warning "Batch failed or was incomplete: $b (exit $LASTEXITCODE)"
@@ -76,4 +83,16 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host ("DONE in {0:hh\:mm}. Outputs in data\outputs\ ; serve web with: cd web; python -m http.server 8000" -f `
   ((Get-Date) - $start)) -ForegroundColor Green
 Write-Host "Log: $log" -ForegroundColor Green
+
+if ($Publish) {
+  Write-Host "=== -Publish: committing and pushing web bundle ===" -ForegroundColor Cyan
+  git add web/public/data
+  git commit -m ("Final overnight web bundle {0}" -f (Get-Date -Format "yyyy-MM-dd"))
+  if ($LASTEXITCODE -eq 0) {
+    git push origin HEAD
+  }
+} else {
+  Write-Host "Skipping git publish (pass -Publish to commit + push web/public/data)." -ForegroundColor Yellow
+}
+
 Stop-Transcript | Out-Null

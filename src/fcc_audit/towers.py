@@ -69,11 +69,42 @@ _MIN_PEAK_DEPTH = 2
 # Minimum separation between accepted peaks, in meters. Peaks closer than this
 # are indistinguishable given the site_match_radius used downstream.
 _MIN_PEAK_SEPARATION_M = 3000.0
+# Binary Redshift footprints can be multi-million-hex mega-blobs; full
+# boundary-depth lobe splitting on those dominates overnight runtime. Above this
+# many core cells, infer sites on a coarser parent grid and scale reach back.
+_FLAT_COARSE_HEX_THRESHOLD = 25_000
+_FLAT_INFER_PARENT_STEPS = 2  # res 9 -> res 7 (~49x fewer cells)
 
 SITE_COLUMNS = [
     "site_id", "lat", "lng", "x_m", "y_m", "reach_m",
     "n_hexes", "max_signal_dbm", "mean_signal_dbm", "county_geoid",
 ]
+
+
+def _rollup_flat_for_inference(hex_df: pd.DataFrame, parent_steps: int) -> pd.DataFrame:
+    """Collapse flat-signal hexes to coarser parents for tower inference only."""
+    if parent_steps <= 0 or hex_df.empty:
+        return hex_df
+    src_res = h3.get_resolution(str(hex_df["h3"].iloc[0]))
+    parent_res = max(0, src_res - parent_steps)
+    parents = [h3.cell_to_parent(str(c), parent_res) for c in hex_df["h3"].tolist()]
+    out = (
+        hex_df.assign(_parent=parents)
+        .drop_duplicates(subset=["_parent"], keep="first")
+        .copy()
+    )
+    out["h3"] = out["_parent"].astype(str)
+    return out.drop(columns=["_parent"])
+
+
+def _flat_parent_steps(n_hexes: int) -> int:
+    """Choose parent rollup depth so inference stays near ~60k cells."""
+    if n_hexes < _FLAT_COARSE_HEX_THRESHOLD:
+        return 0
+    steps = _FLAT_INFER_PARENT_STEPS
+    while n_hexes / (7 ** steps) > 60_000 and steps < 4:
+        steps += 1
+    return steps
 
 
 def _connected_components(cells: set[str]) -> list[list[str]]:
@@ -242,11 +273,18 @@ def infer_sites(hex_df: pd.DataFrame, cfg: Config, label_prefix: str = "S") -> p
     # across H3 resolutions. Config value is authoritative for the configured
     # site_h3_resolution; infer actual resolution from the data and scale.
     base_hexes = int(tcfg["min_site_hexes"])
-    if not strong.empty:
+    infer_df = strong
+    parent_steps = 0
+    if signal_flat and len(strong) >= _FLAT_COARSE_HEX_THRESHOLD:
+        parent_steps = _flat_parent_steps(len(strong))
+        infer_df = _rollup_flat_for_inference(strong, parent_steps)
+        # Scale min hexes by ~7^steps so the physical area threshold is preserved.
+        base_hexes = max(3, round(base_hexes / (7 ** parent_steps)))
+    if not infer_df.empty:
         try:
-            actual_res = h3.get_resolution(strong["h3"].iloc[0])
+            actual_res = h3.get_resolution(infer_df["h3"].iloc[0])
             cfg_res = int(cfg.geography.get("site_h3_resolution", actual_res))
-            if actual_res != cfg_res:
+            if actual_res != cfg_res and parent_steps == 0:
                 # Scale by inverse hex area ratio: each step in H3 resolution
                 # is ~7x finer in area, so keep the total blob area constant.
                 area_ratio = h3.average_hexagon_area(cfg_res, unit="km^2") / max(
@@ -256,13 +294,13 @@ def infer_sites(hex_df: pd.DataFrame, cfg: Config, label_prefix: str = "S") -> p
         except Exception:
             pass
     min_hexes = base_hexes
-    if len(strong) < min_hexes:
+    if len(infer_df) < min_hexes:
         return pd.DataFrame(columns=SITE_COLUMNS)
 
-    signal_by_cell = dict(zip(strong["h3"], strong["signal_dbm"]))
-    county_by_cell = dict(zip(strong["h3"], strong["county_geoid"]))
+    signal_by_cell = dict(zip(infer_df["h3"], infer_df["signal_dbm"]))
+    county_by_cell = dict(zip(infer_df["h3"], infer_df["county_geoid"]))
 
-    all_cells = set(strong["h3"])
+    all_cells = set(infer_df["h3"].astype(str))
     # Project every core cell once (used for depth peaks, splitting, centroids).
     cell_list = list(all_cells)
     centers = np.array([h3.cell_to_latlng(c) for c in cell_list])  # (lat, lng)
@@ -309,6 +347,8 @@ def infer_sites(hex_df: pd.DataFrame, cfg: Config, label_prefix: str = "S") -> p
             # The full coverage lobe (incl. weaker bands) extends beyond the
             # strong core, so attribution scales this up by a margin.
             reach = float(np.max(np.hypot(xs - cx, ys - cy)))
+            if parent_steps:
+                reach *= (7 ** 0.5) ** parent_steps
             lng, lat = _INV.transform(cx, cy)
             # Assign home geography from the cell nearest the inferred tower
             # centroid. A modal lobe county can put a border tower in the wrong
@@ -323,7 +363,7 @@ def infer_sites(hex_df: pd.DataFrame, cfg: Config, label_prefix: str = "S") -> p
                     "x_m": cx,
                     "y_m": cy,
                     "reach_m": reach,
-                    "n_hexes": int(len(lobe)),
+                    "n_hexes": int(len(lobe) * (7 ** parent_steps if parent_steps else 1)),
                     "max_signal_dbm": float(sigs.max()),
                     "mean_signal_dbm": float(sigs.mean()),
                     "county_geoid": county,
@@ -363,7 +403,11 @@ def compute_lobe_reach(
     core_reach = s.get("reach_m", pd.Series(0.0, index=s.index)).to_numpy(dtype=float)
     fallback = np.maximum(core_reach * _LOBE_REACH_FALLBACK_MARGIN, _MIN_REACH_M)
 
-    if hex_df.empty:
+    # Flat / binary Redshift layers have no weaker fringe bands — the core
+    # footprint IS the lobe. Projecting every hex again is pure cost.
+    if hex_df.empty or (
+        "signal_dbm" in hex_df.columns and int(hex_df["signal_dbm"].nunique(dropna=True)) <= 1
+    ):
         s["lobe_reach_m"] = fallback
         return s
 
@@ -379,13 +423,16 @@ def compute_lobe_reach(
     dist, idx = tree.query(np.column_stack([xs_h, ys_h]), k=1)
 
     lobe_reach = fallback.copy()
-    for i in range(len(s)):
-        mask = idx == i
-        n = int(mask.sum())
-        if n >= _LOBE_REACH_MIN_HEXES:
-            emp = float(np.percentile(dist[mask], percentile))
-            # Always at least as large as the fallback so we never shrink reach.
-            lobe_reach[i] = max(emp, fallback[i])
+    order = np.argsort(idx, kind="mergesort")
+    idx_sorted = idx[order]
+    dist_sorted = dist[order]
+    splits = np.flatnonzero(np.diff(idx_sorted)) + 1
+    groups = np.split(dist_sorted, splits)
+    site_ids = idx_sorted[np.concatenate([[0], splits])]
+    for site_i, dists in zip(site_ids, groups):
+        if len(dists) >= _LOBE_REACH_MIN_HEXES:
+            emp = float(np.percentile(dists, percentile))
+            lobe_reach[int(site_i)] = max(emp, fallback[int(site_i)])
 
     s["lobe_reach_m"] = np.maximum(lobe_reach, _MIN_REACH_M)
     return s

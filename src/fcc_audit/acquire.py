@@ -103,7 +103,14 @@ class DataSource(ABC):
             raise RuntimeError(
                 f"Need >=2 vintages to compare; backend reported {available!r}"
             )
-        return current or available[0], prior or available[1]
+        picked_current = current or available[0]
+        picked_prior = prior or available[1]
+        logging.getLogger(__name__).warning(
+            "auto-picked vintages current=%s prior=%s from available=%s — "
+            "set analysis.vintages explicitly for production D25/J25 comparisons",
+            picked_current, picked_prior, available[:6],
+        )
+        return picked_current, picked_prior
 
 
 # ---------------------------------------------------------------------------
@@ -381,6 +388,13 @@ class RedshiftSource(DataSource):
       (e.g. ``tech5g_spd1_env0``) plus a companion ``..._prov`` column holding a
       COMMA-DELIMITED list of the provider ids that cover the cell for that service.
 
+    **Performance:** each (vintage, state) is scanned **once** for all configured
+    services (``SELECT h3index, …_prov … WHERE state_fips=? AND (flags)``). Provider
+    membership is filtered in Python into per-provider parquet caches. That replaces
+    the old per-provider ``LIKE %,<id>,%`` query pattern (~12× fewer warehouse scans
+    for Big-4 × 3 services). Call :meth:`prefetch` before ``run --workers N`` so
+    analyze workers never compete for Redshift connections.
+
     The table suffix ``<build>`` is a monotonic build/process id and serves as
     the **vintage token**: set ``analysis.vintages.current/prior`` to two builds.
 
@@ -389,11 +403,6 @@ class RedshiftSource(DataSource):
     expensive polygon polyfill (see ``CoverageFile.is_hex``). These hex tables
     carry only a 0/1 coverage flag (no modeled signal), so coverage is treated as
     a flat band; tower inference then works from contiguous-coverage blobs.
-
-    To enable:
-      1. ``pip install -r requirements.txt`` (redshift-connector is included).
-      2. Fill ``source.redshift`` (host/db/user/password via env vars) + schema.
-      3. Set two build ids in ``analysis.vintages`` and ``source.backend: redshift``.
     """
 
     # Map an analysis service (by its catalog `desc`) to the hex table's coverage
@@ -418,9 +427,26 @@ class RedshiftSource(DataSource):
             **self._DEFAULT_SERVICE_COLUMNS,
             **(self.rs.get("service_hex_columns") or {}),
         }
+        self._conn = None
+
+    def _validate_redshift_credentials(self) -> None:
+        """Fail fast with a clear setup hint when .env was not loaded."""
+        missing = []
+        for key in ("host", "database", "user", "password"):
+            val = str(self.rs.get(key) or "").strip()
+            if not val or "${" in val:
+                missing.append(key)
+        if missing:
+            raise RuntimeError(
+                "Redshift credentials are missing or still contain unresolved "
+                f"${{ENV}} placeholders ({', '.join(missing)}). "
+                "Copy .env.example → .env and set REDSHIFT_HOST / REDSHIFT_DB / "
+                "REDSHIFT_USER / REDSHIFT_PASSWORD before using --backend redshift."
+            )
 
     # -- connection / query helpers --
     def _connect(self):  # pragma: no cover - requires live credentials
+        self._validate_redshift_credentials()
         try:
             import redshift_connector
         except ImportError as exc:
@@ -435,17 +461,36 @@ class RedshiftSource(DataSource):
             password=self.rs["password"],
         )
 
+    def _get_conn(self):  # pragma: no cover - live only
+        if self._conn is None:
+            self._conn = self._connect()
+        return self._conn
+
+    def close(self) -> None:  # pragma: no cover - live only
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._conn = None
+
     def _query_df(self, sql: str, params: tuple = ()):  # pragma: no cover - live only
         import pandas as pd
 
-        with self._connect() as conn, conn.cursor() as cur:
-            cur.execute(sql, params)
-            try:
-                df = cur.fetch_dataframe()
-            except Exception:  # noqa: BLE001 - older connector lacks fetch_dataframe
-                cols = [d[0] for d in cur.description]
-                df = pd.DataFrame(cur.fetchall(), columns=cols)
-        return df
+        conn = self._get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                try:
+                    df = cur.fetch_dataframe()
+                except Exception:  # noqa: BLE001 - older connector lacks fetch_dataframe
+                    cols = [d[0] for d in cur.description]
+                    df = pd.DataFrame(cur.fetchall(), columns=cols)
+            return df
+        except Exception:
+            # Drop a broken connection so the next call reconnects.
+            self.close()
+            raise
 
     def _hex_table(self, vintage: str) -> str:
         return f"{self.schema}.{self.hex_prefix}{vintage}"
@@ -460,7 +505,6 @@ class RedshiftSource(DataSource):
             )
         return f"{base}_env{self.environment}"
 
-    # -- DataSource interface --
     def list_vintages(self) -> list[str]:  # pragma: no cover - live only
         """Available hex-snapshot build ids, newest (largest) first."""
         df = self._query_df(
@@ -496,72 +540,412 @@ class RedshiftSource(DataSource):
             out[pid] = known.get(pid, str(row.get("provider_name") or pid))
         return [Provider(id=i, name=n) for i, n in sorted(out.items())]
 
-    def fetch(self, provider_id, technology, vintage) -> CoverageFile:  # pragma: no cover
-        """Return the covered res-9 H3 cells for one (provider, service, build).
+    def _state_cache_path(
+        self, out_dir: Path, technology: str, state: str | None,
+    ) -> Path:
+        safe = safe_service_name(technology)
+        token = "all" if state is None else f"st{str(state).zfill(2)}"
+        return out_dir / f"{safe}_{self.cfg.backend}_{token}_hex{self.hex_resolution}.parquet"
 
-        Result is cached to parquet under ``data/raw`` so runs are resumable, and
-        is flagged ``is_hex`` so normalize skips polyfill.
+    def _shared_slice_path(self, vintage: str, state: str | None) -> Path:
+        """One Redshift scan per (vintage, state, service-set) shared across providers."""
+        token = "all" if state is None else f"st{str(state).zfill(2)}"
+        svc_token = "-".join(
+            sorted(safe_service_name(d) for d in self._configured_service_descs())
+        ) or "none"
+        return (
+            self.raw_dir / str(vintage) / "_shared"
+            / f"services_{svc_token}_{self.cfg.backend}_{token}_hex{self.hex_resolution}.parquet"
+        )
+
+    def _configured_service_descs(self) -> list[str]:
+        return [str(s["desc"]) for s in self.cfg.services]
+
+    def _configured_provider_ids(self) -> list[int]:
+        if self.cfg.providers_all:
+            # Discovery is expensive; fan-out only for known Big-4 when 'all'.
+            return [p.id for p in self.cfg.known_providers] or [
+                p.id for p in self.cfg.providers
+            ]
+        return [p.id for p in self.cfg.providers]
+
+    def _write_hex_cache(self, dest: Path, hexes) -> None:
+        import pandas as pd
+
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        series = pd.Series(hexes, dtype="string")
+        cached = pd.DataFrame({
+            "h3": series,
+            "signal_dbm": pd.Series(0.0, index=series.index, dtype="float64"),
+        })
+        tmp = dest.with_suffix(dest.suffix + ".part")
+        cached.to_parquet(tmp, index=False)
+        tmp.replace(dest)
+
+    @staticmethod
+    def _cache_ready(path: Path) -> bool:
+        return path.exists() and path.stat().st_size > 0
+
+    @staticmethod
+    def _provider_mask(prov_series, provider_id: int):
+        """Vectorized membership test for comma-delimited provider id lists."""
+        needle = f",{int(provider_id)},"
+        filled = prov_series.fillna("").astype(str)
+        return ("," + filled + ",").str.contains(needle, regex=False)
+
+    def _provider_state_caches_complete(
+        self, vintage: str, state: str | None, provider_ids: list[int],
+    ) -> bool:
+        for desc in self._configured_service_descs():
+            for pid in provider_ids:
+                dest = self._state_cache_path(
+                    self.raw_dir / str(vintage) / str(pid), desc, state,
+                )
+                if not self._cache_ready(dest):
+                    return False
+        return True
+
+    def _ensure_shared_slice(self, vintage: str, state: str | None) -> Path:
+        """Pull every configured service's flags+provider lists for one state in ONE query.
+
+        Avoids per-provider ``LIKE`` scans. Downstream fan-out writes the existing
+        per-(provider, service, state) parquet caches from this shared frame.
         """
         import pandas as pd
 
+        dest = self._shared_slice_path(vintage, state)
+        if self._cache_ready(dest):
+            return dest
+
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        # Directory lock so parallel workers cannot double-query the same slice.
+        lock_dir = Path(str(dest) + ".lock")
+        while True:
+            if self._cache_ready(dest):
+                return dest
+            try:
+                lock_dir.mkdir(parents=False)
+                break
+            except FileExistsError:
+                try:
+                    # Recover from a crashed holder (lock dirs are empty markers).
+                    if time.time() - lock_dir.stat().st_mtime > 7200:
+                        lock_dir.rmdir()
+                        continue
+                except OSError:
+                    pass
+                time.sleep(0.25)
+
+        try:
+            if self._cache_ready(dest):
+                return dest
+
+            descs = self._configured_service_descs()
+            if not descs:
+                raise RuntimeError("No analysis.services configured for Redshift fetch")
+
+            table = self._hex_table(vintage)
+            select_parts = ["h3index"]
+            flag_ors: list[str] = []
+            flag_aliases: list[str] = []
+            prov_aliases: list[str] = []
+            for desc in descs:
+                col = self._service_column(desc)
+                flag_aliases.append(col)
+                prov_aliases.append(f"{col}_prov")
+                select_parts.append(f"{col} AS {col}")
+                select_parts.append(f"{col}_prov AS {col}_prov")
+                flag_ors.append(f"{col} = 1")
+
+            where = [f"({' OR '.join(flag_ors)})"]
+            params: list = []
+            if state is not None:
+                where.insert(0, "state_fips = %s")
+                params.append(str(state).zfill(2))
+
+            sql = (
+                f"SELECT {', '.join(select_parts)} FROM {table} "
+                f"WHERE {' AND '.join(where)}"
+            )
+            log.info(
+                "  redshift SHARED scan %s states=%s services=%d (no per-provider LIKE)",
+                vintage, state or "all", len(descs),
+            )
+            df = self._query_df(sql, tuple(params))
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if df.empty:
+                empty = pd.DataFrame({"h3": pd.Series(dtype="string")})
+                for alias in flag_aliases:
+                    empty[alias] = pd.Series(dtype="float64")
+                for alias in prov_aliases:
+                    empty[alias] = pd.Series(dtype="string")
+                tmp = dest.with_suffix(dest.suffix + ".part")
+                empty.to_parquet(tmp, index=False)
+                tmp.replace(dest)
+                return dest
+
+            rename = {c: c.lower() for c in df.columns}
+            df = df.rename(columns=rename)
+            if "h3index" not in df.columns:
+                raise RuntimeError(
+                    f"Redshift shared scan for {table} did not return h3index"
+                )
+            out = pd.DataFrame({"h3": df["h3index"].astype(str)})
+            for alias in flag_aliases:
+                key = alias.lower()
+                out[alias] = (
+                    pd.to_numeric(df[key], errors="coerce").fillna(0).astype("int8")
+                    if key in df.columns
+                    else pd.Series(0, index=out.index, dtype="int8")
+                )
+            for alias in prov_aliases:
+                key = alias.lower()
+                out[alias] = (
+                    df[key].astype("string")
+                    if key in df.columns
+                    else pd.Series(pd.NA, index=out.index, dtype="string")
+                )
+            tmp = dest.with_suffix(dest.suffix + ".part")
+            out.to_parquet(tmp, index=False)
+            tmp.replace(dest)
+            log.info("  shared slice cached %s (%s rows)", dest.name, f"{len(out):,}")
+            return dest
+        finally:
+            try:
+                lock_dir.rmdir()
+            except OSError:
+                pass
+
+    def _fetch_direct_state_slice(
+        self,
+        provider_id: int,
+        technology: str,
+        vintage: str,
+        state: str | None,
+        dest: Path,
+    ) -> Path:
+        """Minimal Redshift query: one provider × one service × one state.
+
+        Transfers only that provider's covered hexes. This is the sub-minute
+        path for a single analysis unit; multi-provider overnight uses
+        :meth:`prefetch` shared scans instead.
+        """
+        import pandas as pd
+
+        if self._cache_ready(dest):
+            return dest
+
         col = self._service_column(technology)
         table = self._hex_table(vintage)
-        scope = self.cfg.states_scope_key()
+        where = [f"{col} = 1", f"',' || {col}_prov || ',' LIKE %s"]
+        params: list = [f"%,{int(provider_id)},%"]
+        if state is not None:
+            where.insert(0, "state_fips = %s")
+            params.insert(0, str(state).zfill(2))
+        sql = f"SELECT h3index FROM {table} WHERE " + " AND ".join(where)
+        log.info(
+            "  redshift DIRECT %s provider %s %s state=%s",
+            vintage, provider_id, technology, state or "all",
+        )
+        t0 = time.perf_counter()
+        df = self._query_df(sql, tuple(params))
+        elapsed = time.perf_counter() - t0
+        if df.empty:
+            hexes = pd.Series(dtype="string")
+            n = 0
+        else:
+            if "h3index" not in df.columns:
+                # connector may lower-case
+                cols = {c.lower(): c for c in df.columns}
+                if "h3index" not in cols:
+                    raise RuntimeError(
+                        f"Redshift direct query for {table}.{col} missing h3index"
+                    )
+                df = df.rename(columns={cols["h3index"]: "h3index"})
+            hexes = df["h3index"].astype(str)
+            n = len(hexes)
+        self._write_hex_cache(dest, hexes)
+        log.info(
+            "  direct cache %s (%s hexes in %.1fs)", dest.name, f"{n:,}", elapsed,
+        )
+        return dest
+
+    def _fanout_shared_to_provider_caches(
+        self,
+        vintage: str,
+        state: str | None,
+        provider_ids: list[int] | None = None,
+        service_descs: list[str] | None = None,
+    ) -> None:
+        """Write per-provider hex caches from the shared (vintage, state) slice."""
+        import pandas as pd
+
+        pids = [int(p) for p in (provider_ids or self._configured_provider_ids())]
+        descs = list(service_descs or self._configured_service_descs())
+        if not descs:
+            return
+        # Completeness check only for the requested subset.
+        complete = True
+        for desc in descs:
+            for pid in pids:
+                dest = self._state_cache_path(
+                    self.raw_dir / str(vintage) / str(pid), desc, state,
+                )
+                if not self._cache_ready(dest):
+                    complete = False
+                    break
+            if not complete:
+                break
+        if complete:
+            return
+
+        # Temporarily narrow configured services so the shared cache key / SELECT
+        # match the requested subset (avoids pulling unused tiers).
+        saved = self.cfg.raw["analysis"]["services"]
+        try:
+            if service_descs is not None:
+                self.cfg.raw["analysis"]["services"] = [
+                    s for s in saved if str(s["desc"]) in set(descs)
+                ] or [{"label": d, "desc": d} for d in descs]
+            shared_path = self._ensure_shared_slice(vintage, state)
+            shared = pd.read_parquet(shared_path)
+        finally:
+            self.cfg.raw["analysis"]["services"] = saved
+
+        for desc in descs:
+            col = self._service_column(desc)
+            prov_col = f"{col}_prov"
+            for pid in pids:
+                out_dir = self.raw_dir / str(vintage) / str(pid)
+                dest = self._state_cache_path(out_dir, desc, state)
+                if self._cache_ready(dest):
+                    continue
+                if shared.empty or prov_col not in shared.columns:
+                    self._write_hex_cache(dest, pd.Series(dtype="string"))
+                    continue
+                covered = (
+                    pd.to_numeric(shared[col], errors="coerce").fillna(0).gt(0)
+                    if col in shared.columns
+                    else pd.Series(True, index=shared.index)
+                )
+                mask = covered & self._provider_mask(shared[prov_col], int(pid))
+                self._write_hex_cache(dest, shared.loc[mask, "h3"])
+
+    def prefetch(
+        self,
+        vintages: list[str],
+        states: list[str] | str,
+        provider_ids: list[int] | None = None,
+        service_descs: list[str] | None = None,
+    ) -> None:
+        """Materialize raw caches before parallel analyze.
+
+        * **Multi-provider:** one shared scan per (vintage, state) then local fan-out
+          (best for overnight Big-4).
+        * **Single provider:** direct per-(provider, service, state) queries so a
+          1×1×1 unit only transfers that provider's hexes (sub-minute target).
+        """
+        state_list: list[str | None]
+        if states == "all":
+            state_list = [None]
+        else:
+            state_list = [str(s).zfill(2) for s in states]
+        pids = [int(p) for p in (provider_ids or self._configured_provider_ids())]
+        descs = list(service_descs or self._configured_service_descs())
+        use_direct = len(pids) <= 1
+        mode = "DIRECT" if use_direct else "SHARED"
+        total = len(vintages) * len(state_list) * (len(pids) * len(descs) if use_direct else 1)
+        done = 0
+        log.info(
+            "prefetch mode=%s vintages=%d states=%d providers=%d services=%d",
+            mode, len(vintages), len(state_list), len(pids), len(descs),
+        )
+        for vintage in vintages:
+            for state in state_list:
+                if use_direct:
+                    for pid in pids:
+                        for desc in descs:
+                            done += 1
+                            dest = self._state_cache_path(
+                                self.raw_dir / str(vintage) / str(pid), desc, state,
+                            )
+                            log.info(
+                                "prefetch [%d/%d] DIRECT vintage=%s state=%s provider=%s %s",
+                                done, total, vintage, state or "all", pid, desc,
+                            )
+                            self._fetch_direct_state_slice(
+                                pid, desc, vintage, state, dest,
+                            )
+                else:
+                    done += 1
+                    log.info(
+                        "prefetch [%d/%d] SHARED vintage=%s state=%s providers=%d",
+                        done, total, vintage, state or "all", len(pids),
+                    )
+                    self._fanout_shared_to_provider_caches(
+                        vintage, state, pids, descs,
+                    )
+
+    def _compose_provider_layer(
+        self, provider_id: int, technology: str, vintage: str, state_list: list[str],
+    ) -> Path:
+        import pandas as pd
+
         out_dir = self.raw_dir / str(vintage) / str(provider_id)
         out_dir.mkdir(parents=True, exist_ok=True)
-        dest = (
+        scope = "-".join(sorted(state_list))
+        composed = (
             out_dir
             / f"{safe_service_name(technology)}_{self.cfg.backend}_{scope}_hex{self.hex_resolution}.parquet"
         )
-        if dest.exists() and dest.stat().st_size > 0:
+        paths = [self._state_cache_path(out_dir, technology, state) for state in state_list]
+        need_compose = (not self._cache_ready(composed)) or any(
+            self._cache_ready(p) and p.stat().st_mtime > composed.stat().st_mtime for p in paths
+        )
+        if need_compose:
+            frames = [pd.read_parquet(p) for p in paths if self._cache_ready(p)]
+            if frames:
+                combined = pd.concat(frames, ignore_index=True)
+                if "h3" in combined.columns:
+                    combined = combined.drop_duplicates(subset=["h3"], keep="last")
+            else:
+                combined = pd.DataFrame({
+                    "h3": pd.Series(dtype="string"),
+                    "signal_dbm": pd.Series(dtype="float64"),
+                })
+            tmp = composed.with_suffix(composed.suffix + ".part")
+            combined.to_parquet(tmp, index=False)
+            tmp.replace(composed)
+        return composed
+
+    def fetch(self, provider_id, technology, vintage) -> CoverageFile:  # pragma: no cover
+        """Return the covered res-9 H3 cells for one (provider, service, build).
+
+        Cache misses use a **direct** provider×service×state query (smallest
+        Redshift transfer). Overnight :meth:`prefetch` warms caches via shared
+        scans so workers typically never hit the warehouse.
+        """
+        pid = int(provider_id)
+        states = self.cfg.states
+        if states == "all":
+            dest = self._state_cache_path(
+                self.raw_dir / str(vintage) / str(pid), technology, None,
+            )
+            self._fetch_direct_state_slice(pid, technology, vintage, None, dest)
             return CoverageFile(
                 provider_id, technology, vintage, dest,
                 is_hex=True, hex_resolution=self.hex_resolution,
             )
 
-        # Delimiter-guarded membership so provider 130077 doesn't match 1300770 /
-        # 131310 etc. Read-only: the `||` concat only shapes the value for the
-        # LIKE comparison; it never modifies the table. The `_prov` list is
-        # comma-separated with no spaces (verified).
-        where = [
-            f"{col} = 1",
-            f"',' || {col}_prov || ',' LIKE %s",
-        ]
-        params: list = [f"%,{int(provider_id)},%"]
-        states = self.cfg.states
-        if states != "all":
-            where.append("TRIM(state_fips) IN (" + ",".join(["%s"] * len(states)) + ")")
-            params.extend(str(s).zfill(2) for s in states)
-        sql = f"SELECT h3index FROM {table} WHERE " + " AND ".join(where)
-
-        log.info("  redshift %s provider %s %s (%s)", vintage, provider_id, technology, col)
-        df = self._query_df(sql, tuple(params))
-        if df.empty:
-            # No covered cells is a valid layer, especially for sparse carriers
-            # in a state batch. Persist an empty parquet so the opposite vintage
-            # can still be analyzed as a complete gain/loss and retries remain
-            # resumable. Query/permission errors still propagate from _query_df.
-            log.info(
-                "  no covered hexes for provider %s %s in %s (states=%s)",
-                provider_id, technology, table, states,
-            )
-            hexes = pd.Series(dtype="string")
-        else:
-            if "h3index" not in df.columns:
-                raise RuntimeError(
-                    f"Redshift query for {table}.{col} did not return required h3index column"
-                )
-            hexes = df["h3index"].astype(str)
-        # Flat band: these hex tables carry a 0/1 coverage flag, not signal.
-        cached = pd.DataFrame({
-            "h3": hexes,
-            "signal_dbm": pd.Series(0.0, index=hexes.index, dtype="float64"),
-        })
-        tmp = dest.with_suffix(dest.suffix + ".part")
-        cached.to_parquet(tmp, index=False)
-        tmp.replace(dest)
+        state_list = [str(s).zfill(2) for s in states]
+        out_dir = self.raw_dir / str(vintage) / str(pid)
+        for state in state_list:
+            dest = self._state_cache_path(out_dir, technology, state)
+            if not self._cache_ready(dest):
+                self._fetch_direct_state_slice(pid, technology, vintage, state, dest)
+        composed = self._compose_provider_layer(pid, technology, vintage, state_list)
         return CoverageFile(
-            provider_id, technology, vintage, dest,
+            provider_id, technology, vintage, composed,
             is_hex=True, hex_resolution=self.hex_resolution,
         )
 

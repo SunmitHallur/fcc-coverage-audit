@@ -112,3 +112,35 @@ def test_flat_signal_detection():
     core, flat = _core_hexes(df, -95.0)
     assert flat
     assert len(core) == 2
+
+
+def test_flat_coarse_rollup_still_finds_site(cfg, monkeypatch):
+    """Large flat footprints roll up to parents; a single lobe still yields one site."""
+    import fcc_audit.towers as towers_mod
+
+    monkeypatch.setattr(towers_mod, "_FLAT_COARSE_HEX_THRESHOLD", 50)
+    center = (38.50, -98.50)
+    cells = list(h3.grid_disk(h3.latlng_to_cell(*center, 9), 12))
+    assert len(cells) >= 50
+    df = pd.DataFrame({"h3": cells, "signal_dbm": 0.0, "county_geoid": "20001"})
+    sites = infer_sites(df, cfg, "T")
+    assert len(sites) == 1
+    assert _km_to(sites.iloc[0]["lat"], sites.iloc[0]["lng"], center) < 3.0
+
+
+def test_lobe_reach_skips_projection_for_flat_signal():
+    from fcc_audit.towers import compute_lobe_reach
+
+    hex_df = pd.DataFrame({
+        "h3": ["8926e64240fffff"],
+        "signal_dbm": [0.0],
+        "county_geoid": ["20001"],
+    })
+    sites = pd.DataFrame([{
+        "site_id": "C0", "lat": 38.5, "lng": -98.5,
+        "x_m": 0.0, "y_m": 0.0, "reach_m": 4000.0,
+        "n_hexes": 10, "max_signal_dbm": 0.0, "mean_signal_dbm": 0.0,
+        "county_geoid": "20001",
+    }])
+    out = compute_lobe_reach(hex_df, sites)
+    assert float(out.iloc[0]["lobe_reach_m"]) >= 4000.0 * 2.5

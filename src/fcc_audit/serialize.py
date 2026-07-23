@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +11,13 @@ import pandas as pd
 from .explain import add_explanations
 
 log = logging.getLogger(__name__)
+
+
+def _safe_tag(value: Any) -> str:
+    """Filesystem-safe vintage/tag token (no spaces or path separators)."""
+    text = str(value or "unknown").strip()
+    text = re.sub(r"[^\w.\-]+", "_", text, flags=re.UNICODE)
+    return text.strip("_") or "unknown"
 
 _CSV_COLUMNS = [
     "rank", "provider_name", "provider_id", "technology",
@@ -65,7 +73,9 @@ def write_summary_md(scored: pd.DataFrame, path: Path, meta: dict[str, Any]) -> 
         lines.append(f"- Missing provider/service units: **{missing}**")
     lines += [
         "",
-        "## Top priorities for on-the-ground testing",
+        "## Top flagged priorities for on-the-ground testing",
+        "",
+        "_Table below lists flagged counties only (up to 25), not the full ranking._",
         "",
         "| Rank | Provider | Service | County | State | Priority | Why |",
         "|-----:|----------|---------|--------|:-----:|:--------:|-----|",
@@ -106,7 +116,7 @@ def write_outputs_csv_md(
 ) -> dict[str, Path]:
     """Write CSV + markdown outputs; return paths dict."""
     scored = add_explanations(scored)
-    tag = f"{meta.get('current')}_vs_{meta.get('prior')}"
+    tag = f"{_safe_tag(meta.get('current'))}_vs_{_safe_tag(meta.get('prior'))}"
     return {
         "ranking_csv": write_ranking_csv(scored, outputs_dir / f"priority_ranking_{tag}.csv"),
         "selected_list": write_selected_list(scored, outputs_dir / f"selected_counties_{tag}.csv"),

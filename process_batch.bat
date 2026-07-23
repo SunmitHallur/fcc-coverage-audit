@@ -13,13 +13,19 @@ set PYTHONPATH=src
 echo === Processing states: %STATES% ===
 REM Quotes keep comma-separated FIPS as a single --states value (cmd can otherwise
 REM split on commas and only the first state is processed).
-".venv\Scripts\python.exe" -m fcc_audit.cli run --states "%STATES%" --cleanup-raw --build-web
+REM Do NOT pass --build-web here: that would replace the national web site with
+REM this batch only. Run build-web after ALL batches succeed.
+".venv\Scripts\python.exe" -m fcc_audit.cli run --states "%STATES%" --workers 4
 if errorlevel 1 (
-  echo ERROR: batch failed or was incomplete; web bundle was not rebuilt.
+  echo ERROR: batch failed or was incomplete.
   exit /b 1
 )
 
-echo === Done. View the website locally ===
-echo   cd web
-echo   ..\.venv\Scripts\python.exe -m http.server 8000
-echo   then open http://localhost:8000 in your browser
+echo === Done. Next steps ===
+echo   After ALL national batches succeed:
+echo     .venv\Scripts\python.exe -m fcc_audit.cli build-web
+echo   Preview partial:
+echo     .venv\Scripts\python.exe -m fcc_audit.cli build-web --allow-incomplete
+echo   View locally:
+echo     cd web
+echo     ..\.venv\Scripts\python.exe -m http.server 8000

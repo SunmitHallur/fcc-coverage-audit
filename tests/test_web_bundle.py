@@ -265,3 +265,54 @@ def test_write_county_details_creates_files(tmp_path):
     assert blob["towers_current"] == 2
     # PNG rendering is opt-in (render_pngs=False by default); prior_map key should be absent.
     assert blob.get("prior_map") is None
+
+
+def test_build_web_meta_marks_incomplete_and_flag_threshold():
+    import pandas as pd
+
+    scored = pd.DataFrame([{
+        "provider_id": 130403,
+        "provider_name": "T-Mobile",
+        "technology": "5G-NR 7/1",
+        "county_geoid": "20001",
+        "flag_for_review": True,
+        "priority_score": 0.9,
+    }])
+    meta = build_web_meta(
+        scored,
+        {
+            "current": "277",
+            "prior": "279",
+            "states_processed": "20",
+            "incomplete": True,
+            "flag_threshold": 0.42,
+            "feature_weights": {"added_frac_of_county": 0.25},
+        },
+    )
+    assert meta["incomplete"] is True
+    assert meta["flag_threshold"] == 0.42
+    assert meta["feature_weights"]["added_frac_of_county"] == 0.25
+
+
+def test_flag_math_prefers_score_contributions():
+    import pandas as pd
+
+    scored = pd.DataFrame([{
+        "provider_id": 130403,
+        "provider_name": "T-Mobile",
+        "technology": "5G-NR 7/1",
+        "county_geoid": "20001",
+        "county_name": "Allen",
+        "state_fips": "20",
+        "priority_score": 0.55,
+        "flag_for_review": True,
+        "added_frac_of_county": 0.2,
+        "score_contribution_added_frac_of_county": 0.11,
+    }])
+    records = build_web_records(
+        scored, threshold=0.4, weights={"added_frac_of_county": 0.25},
+    )
+    fm = records["130403"]["5G-NR 7/1"]["20001"]["flag_math"]
+    assert fm["flag_threshold"] == 0.4
+    feat = next(f for f in fm["features"] if f["name"] == "added_frac_of_county")
+    assert feat["contribution"] == 0.11

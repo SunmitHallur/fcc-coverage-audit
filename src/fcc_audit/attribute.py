@@ -135,28 +135,43 @@ def serving_towers_by_county(
 
     site_idx, _, _ = attribute_hexes_to_sites(sub, sites)
     sub["_site_idx"] = site_idx
+    attributed = sub.loc[sub["_site_idx"] >= 0, ["county_geoid", "_site_idx"]]
+    if attributed.empty:
+        geoids = sub["county_geoid"].astype(str).unique()
+        return pd.DataFrame({
+            "county_geoid": geoids,
+            "towers_serving": 0,
+            "towers_in_county": 0,
+            "towers_cross_border": 0,
+        })
 
-    rows = []
-    for county, grp in sub.groupby("county_geoid"):
-        geoid = str(county)
-        sidx = grp.loc[grp["_site_idx"] >= 0, "_site_idx"].astype(int).unique()
-        if len(sidx) == 0:
-            rows.append({
-                "county_geoid": geoid,
+    attributed = attributed.drop_duplicates()
+    attributed["county_geoid"] = attributed["county_geoid"].astype(str)
+    home = sites["county_geoid"].astype(str).to_numpy()
+    idx = attributed["_site_idx"].to_numpy(dtype=int)
+    attributed["in_county"] = home[idx] == attributed["county_geoid"].to_numpy()
+
+    serving = attributed.groupby("county_geoid", sort=False)["_site_idx"].nunique()
+    in_county = attributed.loc[attributed["in_county"]].groupby(
+        "county_geoid", sort=False
+    )["_site_idx"].nunique()
+    out = pd.DataFrame({"county_geoid": serving.index.astype(str), "towers_serving": serving.to_numpy()})
+    out["towers_in_county"] = out["county_geoid"].map(in_county).fillna(0).astype(int)
+    out["towers_cross_border"] = (out["towers_serving"] - out["towers_in_county"]).astype(int)
+    # Include counties that had hexes but zero attributed towers.
+    all_geoids = set(sub["county_geoid"].astype(str))
+    missing = all_geoids - set(out["county_geoid"])
+    if missing:
+        out = pd.concat([
+            out,
+            pd.DataFrame({
+                "county_geoid": sorted(missing),
                 "towers_serving": 0,
                 "towers_in_county": 0,
                 "towers_cross_border": 0,
-            })
-            continue
-        serving = sites.iloc[sidx]
-        in_county = int((serving["county_geoid"].astype(str) == geoid).sum())
-        rows.append({
-            "county_geoid": geoid,
-            "towers_serving": int(len(serving)),
-            "towers_in_county": in_county,
-            "towers_cross_border": int(len(serving) - in_county),
-        })
-    return pd.DataFrame(rows)
+            }),
+        ], ignore_index=True)
+    return out[cols]
 
 
 def site_indices_serving_county(
@@ -230,12 +245,14 @@ def attribute_changes(
                 "county_geoid", "added_km2_new_site",
                 "added_km2_expanded_site", "added_km2_unattributed",
                 "new_towers", "new_towers_in_county", "new_towers_cross_border",
+                "inference_insufficient",
             ]
         )
     if current_sites.empty:
         # A thin/small full-gain layer may not meet tower-inference thresholds.
         # Those gained cells did not disappear analytically: with no inferred
-        # site, all of their area is explicitly unattributed.
+        # site, all of their area is explicitly unattributed — but scoring must
+        # treat this as inference_insufficient (not gaming).
         counts = gained.groupby("county_geoid").size()
         return pd.DataFrame({
             "county_geoid": counts.index.astype(str),
@@ -245,6 +262,7 @@ def attribute_changes(
             "new_towers": 0,
             "new_towers_in_county": 0,
             "new_towers_cross_border": 0,
+            "inference_insufficient": True,
         })
 
     site_idx, _, attribution = attribute_hexes_to_sites(gained, current_sites)
@@ -271,12 +289,14 @@ def attribute_changes(
             {
                 "county_geoid": geoid,
                 "added_km2_new_site": float(counts.get("new_site", 0) * hex_km2),
-                "added_km2_expanded_site": float(counts.get("expanded_site", 0) * hex_km2)
-                + float(counts.get("stable_site", 0) * hex_km2),
+                # Stable matched-site hexes are not "expanded growth" — counting
+                # them as expanded inflated same_site_growth_share for modest upgrades.
+                "added_km2_expanded_site": float(counts.get("expanded_site", 0) * hex_km2),
                 "added_km2_unattributed": float(counts.get("unattributed", 0) * hex_km2),
                 "new_towers": new_towers,
                 "new_towers_in_county": new_in,
                 "new_towers_cross_border": new_cross,
+                "inference_insufficient": False,
             }
         )
     return pd.DataFrame(rows)

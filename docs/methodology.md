@@ -29,12 +29,12 @@ Common patterns:
 
 | Source | Type | Ingested by |
 |--------|------|-------------|
-| FCC BDC hex files (per vintage) | Carrier-reported | `acquire.py` |
-| FCC Antenna Structure Registration (ASR) | Independent federal register | `groundtruth_asr.py` |
-| Ookla Open Data (speed tests) | Independent field measurements | `groundtruth_measured.py` |
+| FCC BDC hex files (per vintage) | Carrier-reported | `acquire.py` (FCC or Redshift) |
+| FCC Antenna Structure Registration (ASR) | Independent federal register | `groundtruth_asr.py` (library; **not** wired into default `run`) |
+| Ookla Open Data (speed tests) | Independent field measurements | `groundtruth_measured.py` (library; **not** wired into default `run`) |
 | FCC Speed Test app data | Independent field measurements | `groundtruth_measured.py` (optional) |
 
-**Independence**: the ASR and measurement sources are collected by parties other than the carriers being audited, making them suitable as corroborating evidence.
+**Independence**: the ASR and measurement sources are collected by parties other than the carriers being audited, making them suitable as corroborating evidence when enrichment is enabled. Default `run` uses BDC geometry + deterministic scoring only; tile-CV reconcile helpers in `reconcile.py` are also off the default path (boundary-snap distance threshold is still used).
 
 ---
 
@@ -149,10 +149,10 @@ These do **not** independently flag a county — they amplify the score of an al
 | Parameter | Default | Rationale |
 |-----------|---------|-----------|
 | `flag_percentile` | 0.90 | Top 10% of anomaly scores; keeps false-positive rate manageable for a small review team |
-| `min_added_km2_to_flag` | 1.0 km² | Ignore trivial changes (< 1 km² new coverage) |
+| `min_added_km2_to_flag` | 10.0 km² | Ignore trivial / near-empty county changes (FCC-validated) |
 | `suspicious_same_site_growth` | 0.50 | 50% same-site share is not itself suspicious; only the combination matters |
-| `min_site_hexes` | 25 (at H3 res 10) | ~0.35 km² minimum blob to infer a site; prevents noise from single-hex artifacts |
-| Feature weight: `asr_no_new_structure` | 0.12 | Modest weight because the ASR→carrier join is imperfect (see §8) |
+| `min_site_hexes` | 35 (at H3 res 9) | ~3.7 km² minimum blob to infer a site at res 9; prevents noise |
+| Feature weight: `asr_no_new_structure` | (optional) | Only active when ASR enrichment is wired; off on the default `run` path |
 
 ---
 
@@ -163,11 +163,26 @@ Coverage hexes use Uber H3 for geographic indexing:
 | Resolution | Hex edge length | Avg hex area | Use |
 |------------|-----------------|--------------|-----|
 | 8 | ~461 m | ~0.74 km² | Legacy (retired) |
-| 9 | ~174 m | ~0.11 km² | County-level analysis (default) |
-| 10 | ~65 m | ~0.015 km² | Site-level analysis (default) |
+| 9 | ~174 m | ~0.11 km² | County + site analysis default (matches Redshift hex tables) |
+| 10 | ~65 m | ~0.015 km² | Optional finer site inference for FCC polygon backend only |
 | 11 | ~24 m | ~0.002 km² | Optional fine detail |
 
-Higher resolution → more hexes → more compute. `--workers` parallelises across counties. The pipeline auto-scales hex-count-based knobs (e.g. `min_site_hexes`) when the actual data resolution differs from the configured default.
+Higher resolution → more hexes → more compute. **`--workers N` parallelises across
+providers** (process pool), not counties. Prefetch Redshift slices **before**
+workers so analyze processes do not thrash warehouse WLM. Keep
+`site_h3_resolution: 9` for Redshift — setting 10 forces a 7× child expansion and
+can OOM at national scale. The pipeline auto-scales hex-count-based knobs
+(e.g. `min_site_hexes`) when the actual data resolution differs from the
+configured default.
+
+**Small cohorts (< 50 scored rows):** percentile flagging is disabled; only the
+absolute same-site implausibility gates can flag. This avoids over-flagging
+one-state pilots where `quantile` would otherwise be meaningless.
+
+**Cross-border context:** the Redshift path expands each batch with a ~50 km
+neighbor-state halo so towers just across a state line can explain in-county
+growth. The FCC polygon path does not fetch neighbor states today — border
+counties may look more "unattributed" on that backend.
 
 ---
 
