@@ -13,7 +13,7 @@ selects per service type (e.g. "Verizon 5G 7/1") — so a flag is always tied to
 specific provider, county, technology, and speed tier.
 
 **Why it exists:** today this county-by-county selection is done manually by
-consultants billed at ~$2k/hour. This pipeline automates that selection - it
+consultants billed at ~$170–200/hour. This pipeline automates that selection - it
 produces, every 6 months when new data drops, the ranked list of provider/county
 pairs to review (`data/outputs/selected_counties_*.csv`), the deliverable the
 consultants currently hand-produce.
