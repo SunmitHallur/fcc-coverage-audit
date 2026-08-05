@@ -1,0 +1,4 @@
+# Keep Linux launchers executable as LF even after a Windows checkout.
+*.sh text eol=lf
+*.ps1 text eol=crlf
+*.bat text eol=crlf

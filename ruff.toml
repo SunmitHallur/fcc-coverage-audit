@@ -1,5 +1,6 @@
 # ruff configuration for fcc-coverage-audit
 line-length = 100
+target-version = "py39"
 
 [lint]
 select = ["E", "F", "W", "I"]

@@ -3,6 +3,7 @@
 Usage:
     python -m fcc_audit.cli make-fixtures        # generate offline synthetic data
     python -m fcc_audit.cli list-vintages        # list available FCC vintages
+    python -m fcc_audit.cli doctor               # preflight before overnight
     python -m fcc_audit.cli run                   # full pipeline (auto vintages)
     python -m fcc_audit.cli run --states 01,02 --cleanup-raw
     python -m fcc_audit.cli build-web             # assemble static web bundle
@@ -12,7 +13,11 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import multiprocessing
+import os
+import platform
 import re
+import shutil
 import sys
 import time
 from datetime import datetime, timezone
@@ -24,6 +29,20 @@ import pandas as pd
 from . import attribute, changedetect, explain, normalize, report, score, towers
 from .acquire import DataSource, get_source
 from .config import Config, Provider, load_config
+
+
+def _ensure_spawn_start_method() -> None:
+    """Force spawn so Linux matches the validated macOS/Windows worker path.
+
+    Linux defaults to fork, which can deadlock when GDAL/PROJ threads are
+    already live in the parent. Overnight launchers use --workers > 1, so
+    this is on the critical path for RHEL handoff.
+    """
+    try:
+        multiprocessing.set_start_method("spawn", force=True)
+    except RuntimeError:
+        # Already set in this process (e.g. re-entry under pytest).
+        pass
 
 _NATIONAL_STATE_FIPS = {
     "01", "02", "04", "05", "06", "08", "09", "10", "11", "12", "13",
@@ -1129,8 +1148,8 @@ def cmd_build_web(cfg: Config, args) -> int:
     print("\nWeb bundle:")
     for k, v in paths.items():
         print(f"  {k}: {v}")
-    print(f"\nDeploy: push to git -> Vercel auto-deploys web/")
-    print(f"Preview locally: cd web && python -m http.server 8000")
+    print("\nDeploy: push to git -> Vercel auto-deploys web/")
+    print("Preview locally: cd web && python -m http.server 8000")
     return 0
 
 
@@ -1224,8 +1243,10 @@ def _cmd_case_files(cfg: Config, args) -> int:
 def cmd_validate(cfg: Config, args) -> int:
     """Backtest the pipeline against ground-truth labels; write validation report."""
     from pathlib import Path
+
     from .validate import run_validation_from_cli
 
+    log = logging.getLogger(__name__)
     gt_path = Path(args.ground_truth) if getattr(args, "ground_truth", None) else None
     out_dir = Path(args.output_dir) if getattr(args, "output_dir", None) else None
     report_path = run_validation_from_cli(
@@ -1307,7 +1328,146 @@ def cmd_benchmark(cfg: Config, args) -> int:
     return 0 if (fp + fn) == 0 else 2
 
 
+def cmd_doctor(cfg: Config, args) -> int:
+    """Preflight for RHEL / handoff: interpreter, imports, .env, Redshift, disk."""
+    log = logging.getLogger(__name__)
+    checks: list[tuple[str, bool, str]] = []
+
+    def _ok(name: str, ok: bool, detail: str) -> None:
+        checks.append((name, ok, detail))
+        mark = "PASS" if ok else "FAIL"
+        print(f"  [{mark}] {name}: {detail}")
+
+    print("fcc_audit doctor")
+    print("---------------")
+
+    py = sys.version_info
+    _ok(
+        "interpreter",
+        py >= (3, 9),
+        f"Python {platform.python_version()} on {platform.system()} "
+        f"{platform.machine()} ({sys.executable})",
+    )
+
+    heavy = [
+        ("numpy", "numpy"),
+        ("pandas", "pandas"),
+        ("geopandas", "geopandas"),
+        ("shapely", "shapely"),
+        ("pyproj", "pyproj"),
+        ("h3", "h3"),
+        ("pyarrow", "pyarrow"),
+        ("duckdb", "duckdb"),
+        ("sklearn", "sklearn"),
+        ("scipy", "scipy"),
+        ("yaml", "yaml"),
+        ("requests", "requests"),
+        ("redshift_connector", "redshift_connector"),
+    ]
+    for label, modname in heavy:
+        try:
+            mod = __import__(modname)
+            ver = getattr(mod, "__version__", "?")
+            _ok(f"import:{label}", True, f"{modname} {ver}")
+        except Exception as exc:  # noqa: BLE001
+            _ok(f"import:{label}", False, f"{type(exc).__name__}: {exc}")
+
+    backend = cfg.backend
+    env_path = cfg.project_root / ".env"
+    if backend != "redshift":
+        _ok(
+            ".env",
+            True,
+            f"not required for source.backend={backend!r} "
+            f"({'present' if env_path.exists() else 'absent'})",
+        )
+    elif not env_path.exists():
+        _ok(".env", False, f"missing {env_path} (copy from .env.example)")
+    else:
+        required = ("REDSHIFT_HOST", "REDSHIFT_DB", "REDSHIFT_USER", "REDSHIFT_PASSWORD")
+        missing = [k for k in required if not str(os.environ.get(k) or "").strip()]
+        # Config expands env into redshift.host/database/user/password.
+        rs_missing = []
+        for key in ("host", "database", "user", "password"):
+            val = str(cfg.redshift.get(key) or "").strip()
+            if not val or "${" in val:
+                rs_missing.append(key)
+        if missing or rs_missing:
+            _ok(
+                ".env",
+                False,
+                "incomplete Redshift credentials "
+                f"(env missing={missing or 'none'}; config unresolved={rs_missing or 'none'})",
+            )
+        else:
+            _ok(".env", True, f"present with REDSHIFT_* ({env_path})")
+
+    cores = os.cpu_count() or 1
+    recommend = max(1, min(6, cores - 1 if cores > 1 else 1))
+    _ok("cpu", True, f"{cores} logical CPUs; recommend --workers {recommend}")
+
+    usage = shutil.disk_usage(cfg.project_root)
+    free_gb = usage.free / (1024 ** 3)
+    # National Redshift overnight writes tens of GB under data/; warn under 40 GB.
+    _ok(
+        "disk",
+        free_gb >= 40.0,
+        f"{free_gb:.1f} GB free at {cfg.project_root} "
+        f"({'ok' if free_gb >= 40 else 'low — national runs need tens of GB'})",
+    )
+
+    # Redshift connectivity + configured vintage tables (skip when fixture backend).
+    if backend != "redshift":
+        _ok(
+            "redshift",
+            True,
+            f"skipped (source.backend={backend!r}; set redshift to exercise warehouse)",
+        )
+    else:
+        try:
+            from .acquire import RedshiftSource
+
+            source = RedshiftSource(cfg)
+            source._validate_redshift_credentials()
+            available = source.list_vintages()
+            current = str(cfg.vintage_current or "")
+            prior = str(cfg.vintage_prior or "")
+            missing_v = [v for v in (current, prior) if v and v not in available]
+            if missing_v:
+                _ok(
+                    "redshift",
+                    False,
+                    f"connected but missing vintage table(s) {missing_v}; "
+                    f"available builds (newest first): {available[:8]}",
+                )
+            else:
+                _ok(
+                    "redshift",
+                    True,
+                    f"connected; vintages current={current} prior={prior} "
+                    f"visible among {len(available)} builds",
+                )
+            try:
+                source.close()
+            except Exception:  # noqa: BLE001
+                pass
+        except Exception as exc:  # noqa: BLE001
+            _ok("redshift", False, f"{type(exc).__name__}: {exc}")
+
+    failed = [name for name, ok, _ in checks if not ok]
+    print()
+    if failed:
+        log.error("doctor FAILED: %s", ", ".join(failed))
+        print(f"Result: FAIL ({len(failed)} check(s))")
+        print("Fix the FAIL items above before starting an overnight run.")
+        return 2
+    print("Result: PASS — environment looks ready for a batch / overnight run.")
+    print("Next: python -m fcc_audit.cli run --states 20 --workers 2")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
+    _ensure_spawn_start_method()
     parser = argparse.ArgumentParser(prog="fcc_audit", description=__doc__)
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument("--config", default=None, help="path to pipeline.yaml")
@@ -1377,6 +1537,10 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("list-vintages", help="list available vintages").set_defaults(
         func=cmd_list_vintages
     )
+    sub.add_parser(
+        "doctor",
+        help="preflight: interpreter, imports, .env, Redshift vintages, CPU, disk",
+    ).set_defaults(func=cmd_doctor)
 
     p_dl = sub.add_parser(
         "download", help="pre-fetch all raw coverage files from the FCC API (no analysis)"

@@ -46,7 +46,11 @@ acquire ─► normalize ─► (reconcile) ─► change-detect ─► infer si
 
 ## Quick start
 
-Requires Python 3.13 or 3.14 (verified). From the project root:
+Supports **Python 3.9 through 3.14**. Same install command everywhere — pins are
+version-gated in `requirements.txt`. Verified on macOS/Windows (3.13/3.14) and
+with a real 3.9.25 venv for RHEL 9 handoff.
+
+### macOS / Windows / modern Linux (Python 3.11+)
 
 ```bash
 python3 -m venv .venv
@@ -54,6 +58,55 @@ source .venv/bin/activate            # Windows: .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 export PYTHONPATH=src                 # Windows: $env:PYTHONPATH="src"
+```
+
+### RHEL 9 / EL9 (stock Python 3.9.25)
+
+Use the locked tree so you get the exact dependency versions tested for handoff:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+pip install -r requirements-py39.lock.txt
+export PYTHONPATH=src
+cp .env.example .env   # then fill REDSHIFT_* from your warehouse INI
+```
+
+Map a typical Redshift INI to `.env`:
+
+```text
+REDSHIFT_HOST=redshift-cluster-….amazonaws.com
+REDSHIFT_DB=db_fcc_bdp_ext
+REDSHIFT_USER=…
+REDSHIFT_PASSWORD=…
+```
+
+Preflight before any long run:
+
+```bash
+python -m fcc_audit.cli doctor
+```
+
+`doctor` checks the interpreter, heavy imports, `.env` / Redshift credentials,
+that both configured vintage tables are visible, CPU count (suggests `--workers`),
+and free disk (national runs need tens of GB under `data/`).
+
+Smoke one small batch before overnight:
+
+```bash
+python -m fcc_audit.cli run --states 20 --workers 2
+./run_overnight.sh          # full national (Linux)
+```
+
+**Offline wheelhouse** (if the server cannot reach PyPI):
+
+```bash
+# on a connected machine with the same Python 3.9
+pip download -r requirements-py39.lock.txt -d wheelhouse \
+  --python-version 3.9 --platform manylinux2014_x86_64 --only-binary=:all:
+# copy wheelhouse/ + requirements-py39.lock.txt to the server, then:
+pip install --no-index --find-links wheelhouse -r requirements-py39.lock.txt
 ```
 
 ### 1. Try it offline first (no FCC access needed)
