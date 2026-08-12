@@ -5,6 +5,37 @@ changed, why, and what was verified. Append new dated sections at the top.
 
 ---
 
+## 2026-08-12 — Windows/OneDrive build-web rmtree lock
+
+### Context
+
+National overnight on FCC Windows laptop completed all 10 batches (27,933
+provider-county rows, 390 flagged) then failed at final `build-web` with:
+
+`PermissionError: [WinError 5] Access is denied: ...\web\public\data\records\130077`
+
+Project lived under OneDrive (`...\OneDrive - FCC\Downloads\...`).
+
+### Fix
+
+- `webbundle.write_web_bundle` now deletes `records/` / `details/` / `towers/`
+  via `_rmtree_retry` (chmod + retry on `PermissionError`).
+- Clearer error if locks persist after retries.
+
+### User recovery (no re-analyze needed)
+
+Batches already wrote scored parquet; only re-run:
+
+```powershell
+$env:PYTHONPATH = "src"
+python -m fcc_audit.cli --backend redshift build-web
+```
+
+If still locked: pause OneDrive, close Explorer preview of `web\public\data`,
+manually delete `web\public\data\records`, `details`, `towers`, retry.
+
+---
+
 ## 2026-08-11 — Pre-commit QA of uncommitted modular web + Redshift overnight
 
 ### Context

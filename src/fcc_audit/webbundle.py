@@ -13,6 +13,7 @@ import json
 import logging
 import math
 import shutil
+import time
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,57 @@ from . import attribute
 from . import map_render
 
 log = logging.getLogger(__name__)
+
+
+def _rmtree_retry(path: Path, *, attempts: int = 6, delay_s: float = 0.5) -> None:
+    """Remove a directory tree, retrying Windows/OneDrive lock races.
+
+    OneDrive and Explorer often hold a brief exclusive handle on empty dirs
+    right after file deletes, which surfaces as WinError 5 / PermissionError
+    on ``os.rmdir``. Retrying is enough; ignore_errors alone can leave a
+    half-deleted tree that breaks the next write.
+    """
+    if not path.exists():
+        return
+
+    def _onexc(func, p, exc_info):  # noqa: ANN001 — shutil callback signature
+        err = exc_info[1] if isinstance(exc_info, tuple) else exc_info
+        if isinstance(err, PermissionError):
+            try:
+                Path(p).chmod(0o700)
+            except OSError:
+                pass
+            try:
+                func(p)
+                return
+            except PermissionError:
+                pass
+        raise err
+
+    last: Exception | None = None
+    for i in range(attempts):
+        try:
+            # Python 3.12+ prefers onexc; older 3.9 still has onerror.
+            try:
+                shutil.rmtree(path, onexc=_onexc)
+            except TypeError:
+                shutil.rmtree(path, onerror=_onexc)
+            if not path.exists():
+                return
+        except PermissionError as exc:
+            last = exc
+            log.warning(
+                "retrying delete of %s after lock (%d/%d): %s",
+                path, i + 1, attempts, exc,
+            )
+            time.sleep(delay_s * (i + 1))
+    if path.exists():
+        raise PermissionError(
+            f"Could not remove {path} after {attempts} attempts (OneDrive/Explorer "
+            f"lock?). Close anything using web/public/data, pause OneDrive sync, "
+            f"delete the folder manually, then re-run build-web. Last error: {last}"
+        )
+
 
 _METRIC_KEYS = [
     "priority_score", "flag_for_review", "added_km2", "added_frac_of_county",
@@ -793,9 +845,12 @@ def write_web_bundle(
     # if it remains, the browser can load that stale monolith instead of the
     # current split files.
     for generated_dir in (data_dir / "records", data_dir / "details", towers_dir):
-        if generated_dir.exists():
-            shutil.rmtree(generated_dir)
-    (data_dir / "records.json").unlink(missing_ok=True)
+        _rmtree_retry(generated_dir)
+    try:
+        (data_dir / "records.json").unlink(missing_ok=True)
+    except PermissionError:
+        time.sleep(1.0)
+        (data_dir / "records.json").unlink(missing_ok=True)
 
     towers_dir.mkdir(parents=True, exist_ok=True)
 
