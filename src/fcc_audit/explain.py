@@ -37,15 +37,34 @@ def _km2(value: Any) -> str:
     return f"{v:.2f} km²"
 
 
-def severity_label(priority: float) -> str:
-    """Map priority score to a human severity bucket."""
-    if priority >= 0.85:
-        return "Critical"
+def severity_label(priority: float, score_percentile: float | None = None, flagged: bool = False) -> str:
+    """Map score to a distribution-aware severity badge.
+
+    Absolute cutoffs (0.85/0.70/0.50) were misleading: after weight normalization
+    real scores clustered in ~[0.10, 0.40], so every county read "Low". Prefer the
+    cohort percentile when available.
+    """
+    if score_percentile is not None and math.isfinite(float(score_percentile)):
+        pct = float(score_percentile)
+        if pct >= 0.99:
+            return "Top 1%"
+        if pct >= 0.95:
+            return "Top 5%"
+        if pct >= 0.90:
+            return "Top 10%"
+        if flagged:
+            return "Flagged"
+        return "Below threshold"
+    # Fallback when percentile is unavailable (legacy rows / unit tests).
     if priority >= 0.70:
-        return "High"
-    if priority >= 0.50:
-        return "Moderate"
-    return "Low"
+        return "Top 1%"
+    if priority >= 0.55:
+        return "Top 5%"
+    if priority >= 0.40:
+        return "Top 10%"
+    if flagged:
+        return "Flagged"
+    return "Below threshold"
 
 
 def explain_row(row: pd.Series | dict[str, Any]) -> dict[str, Any]:
@@ -56,6 +75,13 @@ def explain_row(row: pd.Series | dict[str, Any]) -> dict[str, Any]:
     service = str(r.get("technology") or "mobile service")
     flagged = bool(r.get("flag_for_review", False))
     priority = float(r.get("priority_score") or 0.0)
+    score_pct = r.get("score_percentile")
+    try:
+        score_pct_f = float(score_pct) if score_pct is not None else None
+        if score_pct_f is not None and not math.isfinite(score_pct_f):
+            score_pct_f = None
+    except (TypeError, ValueError):
+        score_pct_f = None
 
     added_frac = float(r.get("added_frac_of_county") or 0.0)
     added_km2 = float(r.get("added_km2") or 0.0)
@@ -215,7 +241,7 @@ def explain_row(row: pd.Series | dict[str, Any]) -> dict[str, Any]:
         "headline": headline,
         "bullets": bullets[:4],
         "recommendation": recommendation,
-        "severity": severity_label(priority),
+        "severity": severity_label(priority, score_pct_f, flagged),
     }
 
 

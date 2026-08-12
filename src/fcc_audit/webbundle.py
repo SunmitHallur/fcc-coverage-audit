@@ -367,6 +367,7 @@ def _context_hexes_for_bbox(
     bbox: tuple[float, float, float, float],
     vintage: str,
 ) -> list[list]:
+    """Legacy rectangular context (kept for PNG render extent fallback)."""
     if df.empty or "vintage" not in df.columns:
         return []
     sub = df[df["vintage"] == vintage][["h3", "signal_dbm"]].drop_duplicates(subset=["h3"])
@@ -381,6 +382,54 @@ def _context_hexes_for_bbox(
             continue
         if minx <= lng <= maxx and miny <= lat <= maxy:
             out.append([str(row.h3), _encode_signal(float(row.signal_dbm))])
+    return out
+
+
+_CONTEXT_BUFFER_M = 8_000.0  # feather coverage ~8 km past the county boundary
+
+
+def _context_hexes_for_county_ring(
+    df: pd.DataFrame,
+    counties: gpd.GeoDataFrame,
+    geoid: str,
+    vintage: str,
+    buffer_m: float = _CONTEXT_BUFFER_M,
+    equal_area_crs: str = "EPSG:5070",
+) -> list[list]:
+    """Hexes whose centroids fall inside the county polygon buffered by *buffer_m*.
+
+    Replaces the rectangular lat/lng box that produced straight-edged crops at
+    the edge of detail maps. Coverage feathers around the county instead.
+    """
+    if df.empty or "vintage" not in df.columns or counties is None or counties.empty:
+        return []
+    sub_c = counties[counties["county_geoid"].astype(str) == str(geoid)]
+    if sub_c.empty:
+        return []
+    try:
+        geom = sub_c.to_crs(equal_area_crs).geometry.union_all().buffer(float(buffer_m))
+    except Exception:
+        return []
+    sub = df[df["vintage"] == vintage][["h3", "signal_dbm"]].drop_duplicates(subset=["h3"])
+    if sub.empty:
+        return []
+    out: list[list] = []
+    # Project centroids in batches via GeoSeries for speed.
+    cells = sub["h3"].astype(str).tolist()
+    sigs = sub["signal_dbm"].tolist()
+    lats, lngs = [], []
+    for c in cells:
+        try:
+            lat, lng = h3.cell_to_latlng(c)
+        except Exception:
+            lat, lng = float("nan"), float("nan")
+        lats.append(lat)
+        lngs.append(lng)
+    pts = gpd.GeoSeries(gpd.points_from_xy(lngs, lats), crs="EPSG:4326").to_crs(equal_area_crs)
+    keep = pts.intersects(geom)
+    for cell, sig, ok in zip(cells, sigs, keep.to_numpy()):
+        if bool(ok):
+            out.append([cell, _encode_signal(float(sig))])
     return out
 
 
@@ -487,15 +536,52 @@ def build_county_detail(
     meta: dict[str, Any],
     counties: gpd.GeoDataFrame | None = None,
 ) -> dict[str, Any]:
+    # Prefer a buffered-county ring of hexes so detail maps don't end at a
+    # hard rectangular crop. Fall back to in-county-only when counties missing.
+    if counties is not None and not counties.empty and not coverage.empty:
+        prior_hexes = _context_hexes_for_county_ring(coverage, counties, geoid, "prior")
+        current_hexes = _context_hexes_for_county_ring(coverage, counties, geoid, "current")
+        if not prior_hexes and not current_hexes:
+            prior_hexes = _hexes_for_county(coverage, geoid, "prior")
+            current_hexes = _hexes_for_county(coverage, geoid, "current")
+    else:
+        prior_hexes = _hexes_for_county(coverage, geoid, "prior")
+        current_hexes = _hexes_for_county(coverage, geoid, "current")
+
     detail: dict[str, Any] = {
         "geoid": str(geoid),
         "prior_vintage": meta.get("prior"),
         "current_vintage": meta.get("current"),
-        "prior_hexes": _hexes_for_county(coverage, geoid, "prior"),
-        "current_hexes": _hexes_for_county(coverage, geoid, "current"),
+        "prior_hexes": prior_hexes,
+        "current_hexes": current_hexes,
         "sites_prior": _sites_serving_county(sites, coverage, geoid, "prior"),
         "sites_current": _sites_serving_county(sites, coverage, geoid, "current"),
+        "fit_mode": "county_buffer",
     }
+    # ASR anchors on sites (when present) for the UI tower panel.
+    for key in ("sites_prior", "sites_current"):
+        for s in detail[key]:
+            # Pass through asr fields if the sites frame carried them.
+            pass
+    if not sites.empty and "asr_matched" in sites.columns:
+        vmap = {"sites_prior": "prior", "sites_current": "current"}
+        for key, vintage in vmap.items():
+            sub = sites[sites.get("vintage", pd.Series("", index=sites.index)) == vintage]
+            if sub.empty:
+                continue
+            by_coord = {
+                (round(float(r["lat"]), 5), round(float(r["lng"]), 5)): r
+                for r in sub.to_dict("records")
+            }
+            for s in detail[key]:
+                hit = by_coord.get((round(float(s["lat"]), 5), round(float(s["lng"]), 5)))
+                if hit is not None:
+                    s["asr_matched"] = bool(hit.get("asr_matched", False))
+                    dist = hit.get("asr_distance_m")
+                    s["asr_distance_m"] = (
+                        float(dist) if dist is not None and math.isfinite(float(dist)) else None
+                    )
+
     detail["prior_hexes"], est_p = _estimate_signal_from_sites(
         detail["prior_hexes"], detail["sites_prior"],
     )

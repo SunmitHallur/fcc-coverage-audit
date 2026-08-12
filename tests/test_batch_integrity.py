@@ -406,16 +406,20 @@ def test_windows_launcher_runs_exact_national_batches_and_final_build():
     assert set(batch_states) == NATIONAL_STATE_FIPS
     assert len(batch_states) == len(set(batch_states))
     # Keep Redshift/interim caches across overlapping neighbor states.
+    # Overnight injects --backend via $backendArgs before the subcommand.
     run_lines = [
         line for line in powershell.splitlines()
-        if "fcc_audit.cli run" in line and not line.lstrip().startswith("#")
+        if "fcc_audit.cli" in line and " run " in f" {line} "
+        and not line.lstrip().startswith("#")
     ]
     assert run_lines, "expected a cli run invocation in run_overnight.ps1"
     assert all("--cleanup-raw" not in line for line in run_lines)
     assert any("--workers 6" in line for line in run_lines)
     assert any("--skip-prefetch" in line for line in run_lines)
-    assert "-m fcc_audit.cli download" in powershell
-    assert "-m fcc_audit.cli build-web" in powershell
+    assert "@backendArgs" in powershell or "--backend" in powershell
+    assert "download" in powershell and "fcc_audit.cli" in powershell
+    assert "build-web" in powershell and "fcc_audit.cli" in powershell
+    assert 'Backend = $(if ($env:FCC_AUDIT_BACKEND)' in powershell or 'redshift' in powershell
     # Default overnight must not auto-push; only -Publish does.
     assert "param(" in powershell and "$Publish" in powershell
     assert "git push" in powershell
@@ -440,7 +444,12 @@ def test_unix_launchers_match_national_contract():
 
     assert "--workers 6" in overnight
     assert "--skip-prefetch" in overnight
-    assert "fcc_audit.cli download" in overnight
+    # Overnight must select Redshift explicitly (config defaults to files).
+    assert 'BACKEND="${FCC_AUDIT_BACKEND:-redshift}"' in overnight
+    assert 'BACKEND_ARGS=(--backend "$BACKEND")' in overnight
+    assert "download" in overnight and "fcc_audit.cli" in overnight
+    assert '"${BACKEND_ARGS[@]}" download' in overnight
+    assert '"${BACKEND_ARGS[@]}" run' in overnight
     assert "build-web" in overnight
     assert "--publish" in overnight
     # git push only inside the PUBLISH branch

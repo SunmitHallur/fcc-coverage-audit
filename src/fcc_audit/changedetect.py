@@ -108,7 +108,7 @@ def _county_rollup_duckdb(df: pd.DataFrame, hex_km2: float) -> pd.DataFrame:
         import duckdb  # already a required dep
         con = duckdb.connect()
         con.register("change_df", df)
-        out = con.execute(f"""
+        out = con.execute("""
             SELECT
                 county_geoid,
                 first(county_name)                                       AS county_name,

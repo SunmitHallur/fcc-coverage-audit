@@ -6,7 +6,9 @@
 # Redshift (enable once your AWS access is granted). Nothing downstream changes.
 # ---------------------------------------------------------------------------
 source:
-  backend: redshift       # "fcc" | "redshift" | "fixture"
+  # Default is file-only (cached hex parquet under data/raw/). Redshift is
+  # opt-in for FCC staff: `--backend redshift` (or set backend: redshift here).
+  backend: files          # "files" | "fcc" | "redshift" | "fixture"
 
   fcc:
     # Public (no-auth) catalog + download API used by the website itself. Requires
@@ -178,7 +180,7 @@ scoring:
   # Implausibility gates: at least ONE must fire alongside same_site_growth for
   # a county to be flagged via the same-site path. This prevents flagging normal
   # single-tower expansions (antenna/carrier upgrades, modest lobe growth).
-  suspicious_same_site_min_county_frac: 0.15   # added_frac_of_county threshold
+  suspicious_same_site_min_county_frac: 0.05   # added_frac_of_county threshold
   suspicious_same_site_min_blanket: 0.20        # blanket_fillin threshold
   suspicious_same_site_min_unattributed: 0.20   # unattributed_share threshold
   # Magnitude gate (learned from FCC examples): a county must add at least this
@@ -187,6 +189,10 @@ scoring:
   # (e.g. Menard, TX). At res 9/10, area math is more precise so this threshold
   # is reliable across resolutions; ~10 km^2 works for pilots and nationwide runs.
   min_added_km2_to_flag: 10.0
+  # Calibrated operating ranges: raw feature / range → [0, 1] before weighting.
+  # added_frac_of_county saturates at 5% of county (typical large jump).
+  feature_operating_ranges:
+    added_frac_of_county: 0.05
   # Maximum influence of any one feature is 0.25. Positive = monotonically
   # raises suspicion; negative = monotonically lowers it. Features not listed
   # are ignored. Weights encode the FCC-verified selection patterns (see
@@ -210,9 +216,24 @@ scoring:
     new_site_share: -0.10               # growth from genuine new towers
     # signal_jump_implausibility: 0.0   # available; off (Menard-type degradation ignored)
     # historical_volatility: 0.10       # enable once >2 vintages are processed
-    # --- independent ground-truth corroboration (enable when enrichment wired) ---
-    # asr_no_new_structure: 0.12        # no registered structure built in window
+    # --- independent ground-truth corroboration ---
+    asr_no_new_structure: 0.12        # no registered structure built in window
     # measurement_gap: 0.10             # coverage claimed but nobody measured it
+
+# ---------------------------------------------------------------------------
+# ASR ground-truth enrichment (optional; fails soft if download unavailable)
+# ---------------------------------------------------------------------------
+groundtruth:
+  asr:
+    enabled: true
+    cache_dir: "data/groundtruth/asr"
+    site_match_radius_m: 2000
+    # Map Redshift build ids (and filing labels) to calendar dates for the
+    # ASR construction window. Filing labels pass through as-is.
+    vintage_dates:
+      "277": "December 31, 2025"
+      "279": "June 30, 2025"
+      "283": "December 31, 2025"
 
 # ---------------------------------------------------------------------------
 # Ground-truth benchmark (from FCC J25 vs D25 5G 7/1 Mbps example slides).

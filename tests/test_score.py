@@ -10,7 +10,7 @@ SRC = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC))
 
 from fcc_audit.config import load_config
-from fcc_audit.score import build_features, score
+from fcc_audit.score import _FEATURE_OPERATING_RANGE, build_features, score
 
 
 def _feature_row(case: str = "base") -> dict:
@@ -43,11 +43,17 @@ def _score_for(rows: list[dict], case: str) -> float:
 
 def test_priority_score_is_strictly_monotone_in_each_configured_feature():
     cfg = load_config()
+    ranges = {
+        **_FEATURE_OPERATING_RANGE,
+        **(cfg.scoring.get("feature_operating_ranges") or {}),
+    }
     for feature, weight in cfg.scoring["feature_weights"].items():
+        op = float(ranges.get(feature, 1.0))
         low = _feature_row("low")
         high = _feature_row("high")
-        low[feature] = 0.1
-        high[feature] = 0.9
+        # Stay inside the calibrated operating range so neither value saturates.
+        low[feature] = 0.2 * op
+        high[feature] = 0.9 * op
 
         low_score = _score_for([low, high], "low")
         high_score = _score_for([low, high], "high")
@@ -59,11 +65,16 @@ def test_priority_score_is_strictly_monotone_in_each_configured_feature():
 
 def test_no_single_feature_can_move_score_more_than_quarter_point():
     cfg = load_config()
+    ranges = {
+        **_FEATURE_OPERATING_RANGE,
+        **(cfg.scoring.get("feature_operating_ranges") or {}),
+    }
     for feature in cfg.scoring["feature_weights"]:
+        op = float(ranges.get(feature, 1.0))
         low = _feature_row("low")
         high = _feature_row("high")
         low[feature] = 0.0
-        high[feature] = 1.0
+        high[feature] = op  # full calibrated strength
 
         swing = abs(_score_for([low, high], "high") - _score_for([low, high], "low"))
         assert swing <= 0.25 + 1e-12, (feature, swing)

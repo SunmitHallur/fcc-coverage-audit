@@ -77,7 +77,7 @@ Map a typical Redshift INI to `.env`:
 
 ```text
 REDSHIFT_HOST=redshift-cluster-….amazonaws.com
-REDSHIFT_DB=db_fcc_bdp_ext
+REDSHIFT_DB=db_fcc_bdc
 REDSHIFT_USER=…
 REDSHIFT_PASSWORD=…
 ```
@@ -85,17 +85,26 @@ REDSHIFT_PASSWORD=…
 Preflight before any long run:
 
 ```bash
-python -m fcc_audit.cli doctor
+python -m fcc_audit.cli doctor                       # default: files backend
+python -m fcc_audit.cli --backend redshift doctor    # warehouse + schema probe
 ```
 
-`doctor` checks the interpreter, heavy imports, `.env` / Redshift credentials,
-that both configured vintage tables are visible, CPU count (suggests `--workers`),
-and free disk (national runs need tens of GB under `data/`).
+`doctor` checks the interpreter, heavy imports, the **active** backend
+(`files` / `fcc` / `redshift` / `fixture`), CPU count (suggests `--workers`),
+and free disk. For Redshift it also probes schema access — distinguishing
+SQLSTATE `3F000` ("schema does not exist", usually wrong `REDSHIFT_DB`) from a
+missing vintage table — and verifies the hex + merged provider-discovery tables
+are readable. Schema `bdc_dataplatform` lives in **`db_fcc_bdc`**, not
+`db_fcc_bdp_ext`.
 
 Smoke one small batch before overnight:
 
 ```bash
-python -m fcc_audit.cli run --states 20 --workers 2
+# Public / offline: cached hex parquet under data/raw/ (no Redshift)
+python -m fcc_audit.cli --backend files run --states 20 --workers 2
+
+# FCC staff with warehouse access:
+python -m fcc_audit.cli --backend redshift run --states 20 --workers 2
 ./run_overnight.sh          # full national (Linux)
 ```
 
@@ -109,10 +118,13 @@ pip download -r requirements-py39.lock.txt -d wheelhouse \
 pip install --no-index --find-links wheelhouse -r requirements-py39.lock.txt
 ```
 
-### 1. Try it offline first (no FCC access needed)
+### 1. Try it offline first (no FCC / Redshift access needed)
 
-This generates synthetic data with a planted gaming scenario and runs the whole
-pipeline, so you can confirm everything works before touching real data:
+**Default backend is `files`** — it reads hex parquet under `data/raw/` that an
+FCC machine previously prefetched with `--backend redshift`. Ship `data/raw/`
+and the public can run with no warehouse credentials.
+
+For a fully synthetic demo (no real coverage files):
 
 ```bash
 python -m fcc_audit.cli --backend fixture make-fixtures
@@ -136,8 +148,15 @@ The pipeline sends the browser-like `User-Agent` / `Referer` / `Origin` headers
 
 ### 3. Run on real FCC data
 
-**Downloading is fully automated — you never fetch files by hand.** The default
-backend (`source.backend: fcc`) pulls coverage from the National Broadband Map.
+**Downloading is fully automated — you never fetch files by hand.** Backends:
+
+| Backend | Who | What it reads |
+|---------|-----|---------------|
+| `files` (default) | Public / offline | Cached hex parquet under `data/raw/` |
+| `redshift` | FCC staff | Warehouse `bdc_dataplatform` hex tables |
+| `fcc` | Anyone with internet | Public National Broadband Map downloads |
+| `fixture` | CI / demos | Synthetic GeoJSON under `data/fixtures/` |
+
 With `providers` set to the Big 4 (AT&T, T-Mobile, Verizon, UScellular) by default,
 the pipeline analyzes each `(provider, service)` across the configured states.
 
@@ -178,9 +197,10 @@ other territories are out of scope unless you add them explicitly.
 
 Real mobile coverage is **per state × provider × service**. On the FCC polygon
 backend, downloads are rate-limited (~10/min) so a full national run is
-**multi-day**. On Redshift (default), prefer the overnight launcher for a
-full national run targeting under ~10 wall-clock hours. Confirm everything
-works on a small scope first by editing `config/pipeline.yaml`:
+**multi-day**. On Redshift (`--backend redshift`), prefer the overnight
+launcher for a full national run targeting under ~10 wall-clock hours.
+Confirm everything works on a small scope first by editing
+`config/pipeline.yaml`:
 
 ```yaml
 analysis:
@@ -241,12 +261,15 @@ Anyone can regenerate raw data with `python -m fcc_audit.cli download` — no AP
 #### Data volume & time — read this before a national run
 
 **FCC polygon backend:** thousands of file downloads at ~10/minute → multi-day,
-and **0.5–1 TB** of raw files. **Redshift backend (default):** shared
+and **0.5–1 TB** of raw files. **Redshift backend** (opt-in via
+`--backend redshift` or `./run_overnight.sh`, which defaults to Redshift): shared
 `(vintage, state)` hex scans — the recommended path for a full national run
-under ~10 hours. Options, in order of preference:
+under ~10 hours. Config `source.backend` defaults to `files` for offline/public
+use of prefetched parquet. Options, in order of preference:
 
 1. **Redshift (best).** Query server-side and never download raw geometry.
-   Use `./run.sh` / `run_overnight.sh` (national `download` once, then 10 geo batches + `--workers 6 --skip-prefetch`).
+   Use `./run.sh` / `run_overnight.sh` (passes `--backend redshift`; national
+   `download` once, then 10 geo batches + `--workers 6 --skip-prefetch`).
 2. **`--cleanup-raw` + scope down (FCC only).** Deletes big raw files after each
    service so peak disk stays small. Do **not** use on Redshift overnight
    (neighbor-state caches must persist).

@@ -37,7 +37,9 @@ Use Mike's SSH user/host. `--delete` removes stale detail files after a rebuild 
 
 ## 3. Serve with Python on localhost:8000
 
-On the server, from the deployed `web/` directory:
+The viewer is a zero-build static app: ES modules under `web/js/`, styles under
+`web/css/`, and vendored MapLibre + h3 under `web/vendor/` (no CDN required).
+Serve from the `web/` directory so relative imports resolve:
 
 ```bash
 cd /var/www/fcc-coverage-audit/web
@@ -112,6 +114,12 @@ Open the site through Apache and confirm:
 
 ## Notes
 
-- Server-side Python **does not** need the `h3` package for static hosting; hex rendering is client-side (deck.gl).
+- Server-side Python **does not** need the `h3` package for static hosting; hex
+  rendering is client-side via vendored `web/vendor/h3-js.js` + MapLibre layers
+  (no CDN, no deck.gl).
+- Upload the entire `web/` tree (`index.html`, `css/`, `js/`, `vendor/`, `public/`).
+  Relative ES-module imports require serving from the `web/` directory root.
+- Basemap tiles still need outbound HTTPS to OpenStreetMap / CARTO; if the
+  server network blocks those, county fills still work but the basemap is blank.
 - Rebuild and `rsync` after each pipeline run; do not copy `data/` to the server.
 - To shrink further, lower `--top-n` (e.g. 100) before `build-web`.

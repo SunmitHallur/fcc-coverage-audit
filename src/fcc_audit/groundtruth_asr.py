@@ -86,14 +86,27 @@ _DATE_FMTS = ["%m/%d/%Y", "%Y-%m-%d", "%m-%d-%Y"]
 _REQUEST_TIMEOUT = 300
 
 
-def _parse_vintage_to_date(vintage: str) -> datetime:
-    """Parse an FCC vintage label ('December 31, 2025' or '2025-12-31') to a date."""
+def _parse_vintage_to_date(
+    vintage: str,
+    vintage_dates: dict[str, str] | None = None,
+) -> datetime:
+    """Parse an FCC vintage label or mapped build id to a date.
+
+    Accepts filing labels (``December 31, 2025``), ISO dates, or Redshift build
+    ids when ``vintage_dates`` maps them (e.g. ``{"277": "December 31, 2025"}``).
+    """
+    token = vintage.strip()
+    if vintage_dates and token in vintage_dates:
+        token = str(vintage_dates[token]).strip()
     for fmt in ("%B %d, %Y", "%Y-%m-%d", "%b %d, %Y"):
         try:
-            return datetime.strptime(vintage.strip(), fmt)
+            return datetime.strptime(token, fmt)
         except ValueError:
             continue
-    raise ValueError(f"Cannot parse vintage date: {vintage!r}")
+    raise ValueError(
+        f"Cannot parse vintage date: {vintage!r}. "
+        f"Add it under groundtruth.asr.vintage_dates in pipeline.yaml."
+    )
 
 
 def _parse_date(value: str) -> datetime | None:
@@ -242,6 +255,7 @@ def fetch_asr_labels(
     current_vintage: str,
     cache_dir: Path | str = Path("data/groundtruth/asr"),
     grace_days: int = 90,
+    vintage_dates: dict[str, str] | None = None,
 ) -> pd.DataFrame:
     """Produce per-county 'was any structure built during this vintage window' labels.
 
@@ -274,8 +288,8 @@ def fetch_asr_labels(
     docs/methodology.md for the ASR-to-carrier join caveat.
     """
     cache_dir = Path(cache_dir)
-    prior_dt = _parse_vintage_to_date(prior_vintage)
-    current_dt = _parse_vintage_to_date(current_vintage)
+    prior_dt = _parse_vintage_to_date(prior_vintage, vintage_dates)
+    current_dt = _parse_vintage_to_date(current_vintage, vintage_dates)
 
     # Labels are keyed to the vintage pair; check for a cached result.
     prior_key = prior_vintage.replace(" ", "_").replace(",", "")

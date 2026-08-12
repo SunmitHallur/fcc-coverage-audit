@@ -3,11 +3,18 @@
 # Usage:
 #   ./run_overnight.sh              # analyze + build-web (no git push)
 #   ./run_overnight.sh --publish    # same, then commit + push web/public/data
+#   FCC_AUDIT_BACKEND=files ./run_overnight.sh   # override (default: redshift)
+#
+# Requires .env with REDSHIFT_* when using the default redshift backend.
 set -euo pipefail
 cd "$(dirname "$0")"
 export PYTHONPATH=src
 PY=".venv/bin/python"
 LOG="overnight_$(date +%Y%m%d_%H%M%S).log"
+# Overnight national path is Redshift-first. Config defaults to files for
+# offline/public use; this launcher must select redshift explicitly.
+BACKEND="${FCC_AUDIT_BACKEND:-redshift}"
+BACKEND_ARGS=(--backend "$BACKEND")
 PUBLISH=0
 for arg in "$@"; do
   if [[ "$arg" == "--publish" ]]; then
@@ -34,13 +41,13 @@ BATCHES=(
   "09,23,25,33,34,36,42,44,50"
 )
 
-echo "=== Overnight run started $(date) ===" | tee -a "$LOG"
+echo "=== Overnight run started $(date) backend=$BACKEND ===" | tee -a "$LOG"
 
 # National Redshift prefetch once (51 FIPS × 2 vintages, parallel shared scans).
 # Batch loops then --skip-prefetch so overlapping neighbor states are not re-scanned.
 echo "" | tee -a "$LOG"
-echo "=== National prefetch (download) @ $(date) ===" | tee -a "$LOG"
-if ! $PY -m fcc_audit.cli download 2>&1 | tee -a "$LOG"; then
+echo "=== National prefetch (download) backend=$BACKEND @ $(date) ===" | tee -a "$LOG"
+if ! $PY -m fcc_audit.cli "${BACKEND_ARGS[@]}" download 2>&1 | tee -a "$LOG"; then
   echo "NATIONAL PREFETCH FAILED; refusing overnight batches" | tee -a "$LOG"
   exit 1
 fi
@@ -55,7 +62,7 @@ for STATES in "${BATCHES[@]}"; do
   echo "=== BATCH $BATCH_IDX/$N_BATCHES $STATES @ $(date) ===" | tee -a "$LOG"
   T0=$(date +%s)
   # Caches warm from national download; unit-level --workers 6 for CPU analyze.
-  if ! $PY -m fcc_audit.cli run --states "$STATES" --workers 6 --skip-prefetch 2>&1 | tee -a "$LOG"; then
+  if ! $PY -m fcc_audit.cli "${BACKEND_ARGS[@]}" run --states "$STATES" --workers 6 --skip-prefetch 2>&1 | tee -a "$LOG"; then
     echo "BATCH FAILED: $STATES (continuing)" | tee -a "$LOG"
     FAILED_BATCHES+=("$STATES")
     continue
@@ -80,7 +87,7 @@ if ((${#FAILED_BATCHES[@]})); then
 fi
 
 echo "=== Overnight run finished $(date) ===" | tee -a "$LOG"
-$PY -m fcc_audit.cli build-web 2>&1 | tee -a "$LOG"
+$PY -m fcc_audit.cli "${BACKEND_ARGS[@]}" build-web 2>&1 | tee -a "$LOG"
 
 echo "Done. Serve with: cd web && python3 -m http.server 8000" | tee -a "$LOG"
 

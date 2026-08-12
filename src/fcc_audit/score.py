@@ -21,6 +21,23 @@ _MAX_FEATURE_INFLUENCE = 0.25
 # a county gains this fraction of its area in new coverage.
 _REL_JUMP_ABS_REF = 0.05
 
+# Per-feature operating ranges: raw feature values are divided by these before
+# clipping to [0, 1]. Without calibration, ``added_frac_of_county`` (typical
+# 0–0.05) contributes almost nothing under a 0.25 weight because the score
+# treats 1.0 as the natural scale — trapping every county in "Low".
+_FEATURE_OPERATING_RANGE: dict[str, float] = {
+    "added_frac_of_county": 0.05,
+    "coverage_increase_magnitude": 1.0,  # already bounded in build_features
+    "blanket_fillin": 1.0,
+    "same_site_growth_share": 1.0,
+    "unattributed_share": 1.0,
+    "boundary_snap_share": 1.0,
+    "new_site_share": 1.0,
+    "signal_jump_implausibility": 20.0,  # dB
+    "asr_no_new_structure": 1.0,
+    "measurement_gap": 1.0,
+}
+
 # Map config feature names to the columns built in build_features().
 # Order reflects the FCC-verified selection patterns (primary first).
 _RISK_FEATURES = [
@@ -117,7 +134,12 @@ def build_features(
 
     if "inference_insufficient" not in df:
         df["inference_insufficient"] = False
-    df["inference_insufficient"] = df["inference_insufficient"].fillna(False).astype(bool)
+    insuf = df["inference_insufficient"]
+    if insuf.dtype == object:
+        insuf = insuf.map(lambda v: bool(v) if pd.notna(v) else False)
+    else:
+        insuf = insuf.fillna(False)
+    df["inference_insufficient"] = insuf.astype(bool)
     # When site inference could not run (flat binary / below min blob size),
     # unattributed share is an artifact — zero it for scoring so it cannot flag.
     df.loc[df["inference_insufficient"], "unattributed_share"] = 0.0
@@ -128,16 +150,23 @@ def build_features(
 _SMALL_COHORT_N = 50
 
 
-def _bounded_feature(s: pd.Series) -> pd.Series:
-    """Map risk inputs to a fixed [0, 1] scale without cohort dependence."""
+def _bounded_feature(s: pd.Series, operating_range: float = 1.0) -> pd.Series:
+    """Map risk inputs to a fixed [0, 1] scale without cohort dependence.
+
+    ``operating_range`` is the raw value that maps to 1.0 (full strength). Values
+    above it saturate. This restores dynamic range for features whose natural
+    scale is far below 1.0 (e.g. added_frac_of_county ≈ 0–0.05).
+    """
     numeric = pd.to_numeric(s, errors="coerce").fillna(0.0)
-    return numeric.replace(np.inf, 1.0).replace(-np.inf, 0.0).clip(0.0, 1.0)
+    numeric = numeric.replace(np.inf, operating_range).replace(-np.inf, 0.0)
+    scale = max(float(operating_range), _EPS)
+    return (numeric / scale).clip(0.0, 1.0)
 
 
 def score(features: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     """Add a cohort-invariant monotone priority score and review flag.
 
-    Every feature is put on a fixed [0, 1] scale. Positive weights are
+    Every feature is put on a calibrated [0, 1] scale. Positive weights are
     monotonically suspicious; negative weights are monotonically exculpatory.
     No configured feature may move the final score by more than 0.25.
     """
@@ -145,6 +174,10 @@ def score(features: pd.DataFrame, cfg: Config) -> pd.DataFrame:
         return features
     df = features.copy()
     weights: dict[str, float] = cfg.scoring["feature_weights"]
+    ranges = {
+        **_FEATURE_OPERATING_RANGE,
+        **(cfg.scoring.get("feature_operating_ranges") or {}),
+    }
 
     present = [f for f in _RISK_FEATURES if f in df and f in weights]
     excessive = {f: float(weights[f]) for f in present if abs(float(weights[f])) > _MAX_FEATURE_INFLUENCE}
@@ -154,9 +187,14 @@ def score(features: pd.DataFrame, cfg: Config) -> pd.DataFrame:
             + ", ".join(f"{name}={weight:g}" for name, weight in excessive.items())
         )
 
-    bounded = pd.DataFrame({f: _bounded_feature(df[f]) for f in present})
+    bounded = pd.DataFrame({
+        f: _bounded_feature(df[f], ranges.get(f, 1.0)) for f in present
+    })
     total_abs_weight = sum(abs(float(weights[f])) for f in present)
-    denominator = max(1.0, total_abs_weight)
+    # Normalize by the actual weight mass so the score spans [0, 1] when all
+    # calibrated features fire at full strength. (Previously max(1.0, …) was a
+    # no-op when weights summed to <1 and left scores trapped near ~0.3.)
+    denominator = max(total_abs_weight, _EPS)
     risk = pd.Series(0.0, index=df.index)
     for feature in present:
         weight = float(weights[feature])
@@ -228,7 +266,36 @@ def score(features: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     )
     df["flag_for_review"] = eligible & suspicious & ~cross_border_build
     df["flag_reason"] = df.apply(_reason, axis=1, susp=susp)
+
+    # Distribution-aware severity badges (honest for an unsupervised anomaly rank).
+    df = _attach_severity(df, flag_pct=flag_pct)
     return df.sort_values("priority_score", ascending=False).reset_index(drop=True)
+
+
+def _attach_severity(df: pd.DataFrame, flag_pct: float = 0.90) -> pd.DataFrame:
+    """Attach percentile rank and a distribution-aware severity label."""
+    n = len(df)
+    if n == 0:
+        df["score_percentile"] = pd.Series(dtype=float)
+        df["severity"] = pd.Series(dtype=str)
+        return df
+    # Rank 1 = highest score. Percentile ≈ fraction of cohort at or below.
+    ranks = df["priority_score"].rank(method="average", ascending=True)
+    df["score_percentile"] = (ranks / n).clip(0.0, 1.0)
+    labels = []
+    for pct, flagged in zip(df["score_percentile"], df["flag_for_review"]):
+        if pct >= 0.99:
+            labels.append("Top 1%")
+        elif pct >= 0.95:
+            labels.append("Top 5%")
+        elif pct >= 0.90:
+            labels.append("Top 10%")
+        elif flagged:
+            labels.append("Flagged")
+        else:
+            labels.append("Below threshold")
+    df["severity"] = labels
+    return df
 
 
 def _reason(row: pd.Series, susp: float) -> str:

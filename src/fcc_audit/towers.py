@@ -66,14 +66,19 @@ _ADAPTIVE_CORE_QUANTILE = 0.35
 _DEPTH_CAP = 40
 # Minimum depth for a cell to qualify as a peak (avoids splitting thin strips).
 _MIN_PEAK_DEPTH = 2
-# Minimum separation between accepted peaks, in meters. Peaks closer than this
-# are indistinguishable given the site_match_radius used downstream.
-_MIN_PEAK_SEPARATION_M = 3000.0
+# Default minimum separation between accepted peaks (meters). Overridden at
+# call time by ``site_match_radius_m`` so peak spacing and cross-vintage match
+# distance share one scale (avoids peaks kept 3 km apart but matched at 2 km).
+_MIN_PEAK_SEPARATION_M = 2000.0
 # Binary Redshift footprints can be multi-million-hex mega-blobs; full
 # boundary-depth lobe splitting on those dominates overnight runtime. Above this
 # many core cells, infer sites on a coarser parent grid and scale reach back.
 _FLAT_COARSE_HEX_THRESHOLD = 25_000
 _FLAT_INFER_PARENT_STEPS = 2  # res 9 -> res 7 (~49x fewer cells)
+# Joint-inference: a site with prior hexes below this fraction of current (or
+# absolute floor) is classified as new_site rather than expanded/stable.
+_JOINT_NEW_PRIOR_MAX_HEXES = 2
+_JOINT_EXPANSION_GROWTH = 0.20
 
 SITE_COLUMNS = [
     "site_id", "lat", "lng", "x_m", "y_m", "reach_m",
@@ -262,8 +267,20 @@ def _core_hexes(hex_df: pd.DataFrame, threshold_dbm: float) -> tuple[pd.DataFram
     return strong.copy(), False
 
 
-def infer_sites(hex_df: pd.DataFrame, cfg: Config, label_prefix: str = "S") -> pd.DataFrame:
-    """Infer approximate site locations from a provider+vintage hex table."""
+def infer_sites(
+    hex_df: pd.DataFrame,
+    cfg: Config,
+    label_prefix: str = "S",
+    *,
+    parent_steps_override: int | None = None,
+    min_peak_separation_m: float | None = None,
+) -> pd.DataFrame:
+    """Infer approximate site locations from a provider+vintage hex table.
+
+    ``parent_steps_override`` forces a fixed coarse-grid depth (used by joint
+    cross-vintage inference so both vintages share one H3 resolution).
+    ``min_peak_separation_m`` defaults to ``site_match_radius_m`` from config.
+    """
     tcfg = cfg.towers
     if hex_df.empty:
         return pd.DataFrame(columns=SITE_COLUMNS)
@@ -274,9 +291,13 @@ def infer_sites(hex_df: pd.DataFrame, cfg: Config, label_prefix: str = "S") -> p
     # site_h3_resolution; infer actual resolution from the data and scale.
     base_hexes = int(tcfg["min_site_hexes"])
     infer_df = strong
-    parent_steps = 0
-    if signal_flat and len(strong) >= _FLAT_COARSE_HEX_THRESHOLD:
-        parent_steps = _flat_parent_steps(len(strong))
+    if parent_steps_override is not None:
+        parent_steps = int(parent_steps_override)
+    else:
+        parent_steps = 0
+        if signal_flat and len(strong) >= _FLAT_COARSE_HEX_THRESHOLD:
+            parent_steps = _flat_parent_steps(len(strong))
+    if parent_steps > 0:
         infer_df = _rollup_flat_for_inference(strong, parent_steps)
         # Scale min hexes by ~7^steps so the physical area threshold is preserved.
         base_hexes = max(3, round(base_hexes / (7 ** parent_steps)))
@@ -296,6 +317,12 @@ def infer_sites(hex_df: pd.DataFrame, cfg: Config, label_prefix: str = "S") -> p
     min_hexes = base_hexes
     if len(infer_df) < min_hexes:
         return pd.DataFrame(columns=SITE_COLUMNS)
+
+    peak_sep = float(
+        min_peak_separation_m
+        if min_peak_separation_m is not None
+        else tcfg.get("site_match_radius_m", _MIN_PEAK_SEPARATION_M)
+    )
 
     signal_by_cell = dict(zip(infer_df["h3"], infer_df["signal_dbm"]))
     county_by_cell = dict(zip(infer_df["h3"], infer_df["county_geoid"]))
@@ -320,7 +347,9 @@ def infer_sites(hex_df: pd.DataFrame, cfg: Config, label_prefix: str = "S") -> p
         # inflated single-tower lobes and break same-site attribution.
         if signal_flat:
             depth = _boundary_depth(set(comp))
-            peaks = _find_depth_peaks(comp, depth, xy_by_cell)
+            peaks = _find_depth_peaks(
+                comp, depth, xy_by_cell, min_separation_m=peak_sep,
+            )
             lobes = _split_component_by_peaks(comp, peaks, xy_by_cell)
         else:
             depth = None
@@ -371,6 +400,127 @@ def infer_sites(hex_df: pd.DataFrame, cfg: Config, label_prefix: str = "S") -> p
             )
             site_idx += 1
     return pd.DataFrame(sites, columns=SITE_COLUMNS)
+
+
+def _count_hexes_per_site(hex_df: pd.DataFrame, sites: pd.DataFrame) -> np.ndarray:
+    """Count hexes of ``hex_df`` attributed to each site (within lobe reach)."""
+    n = len(sites)
+    counts = np.zeros(n, dtype=int)
+    if hex_df.empty or sites.empty:
+        return counts
+    from scipy.spatial import cKDTree
+
+    xs_s = sites["x_m"].to_numpy(dtype=float)
+    ys_s = sites["y_m"].to_numpy(dtype=float)
+    reach = np.maximum(
+        sites.get("lobe_reach_m", sites["reach_m"]).to_numpy(dtype=float),
+        _MIN_REACH_M,
+    )
+    # Prefer lobe_reach when present; else core reach * fallback margin.
+    if "lobe_reach_m" not in sites.columns:
+        reach = np.maximum(sites["reach_m"].to_numpy(dtype=float) * _LOBE_REACH_FALLBACK_MARGIN, _MIN_REACH_M)
+
+    hex_ids = hex_df["h3"].astype(str).tolist()
+    centers = np.array([h3.cell_to_latlng(c) for c in hex_ids])
+    xs_h, ys_h = _FWD.transform(centers[:, 1], centers[:, 0])
+    tree = cKDTree(np.column_stack([xs_s, ys_s]))
+    dist, idx = tree.query(np.column_stack([xs_h, ys_h]), k=1)
+    within = dist <= reach[idx]
+    for i in idx[within]:
+        counts[int(i)] += 1
+    return counts
+
+
+def infer_sites_joint(
+    prior_hex: pd.DataFrame,
+    current_hex: pd.DataFrame,
+    cfg: Config,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Infer sites once on the union footprint; classify by per-vintage counts.
+
+    Site geometry and identity are shared across vintages, so centroid jitter
+    cannot manufacture a "new" tower. Returns ``(prior_sites, current_sites)``
+    where ``current_sites`` already carry ``site_class`` /
+    ``matched_prior_id`` / ``match_dist_m``.
+    """
+    empty = pd.DataFrame(columns=SITE_COLUMNS)
+    if prior_hex.empty and current_hex.empty:
+        return empty.copy(), empty.copy()
+
+    # Union footprint for geometry; prefer current county tags, fill from prior.
+    parts = []
+    if not prior_hex.empty:
+        p = prior_hex[["h3", "signal_dbm", "county_geoid"]].copy()
+        p["_v"] = "prior"
+        parts.append(p)
+    if not current_hex.empty:
+        c = current_hex[["h3", "signal_dbm", "county_geoid"]].copy()
+        c["_v"] = "current"
+        parts.append(c)
+    combined = pd.concat(parts, ignore_index=True)
+    # Prefer current row for county/signal when a hex appears in both.
+    combined = combined.sort_values("_v", ascending=True)  # current last
+    union = combined.drop_duplicates(subset=["h3"], keep="last").drop(columns=["_v"])
+
+    # Deterministic coarse grid from the UNION size so vintages never straddle
+    # the 25k threshold independently.
+    strong, signal_flat = _core_hexes(union, float(cfg.towers["min_signal_band_dbm"]))
+    parent_steps = 0
+    if signal_flat and len(strong) >= _FLAT_COARSE_HEX_THRESHOLD:
+        parent_steps = _flat_parent_steps(len(strong))
+
+    sites = infer_sites(
+        union, cfg, label_prefix="J",
+        parent_steps_override=parent_steps,
+        min_peak_separation_m=float(cfg.towers.get("site_match_radius_m", _MIN_PEAK_SEPARATION_M)),
+    )
+    if sites.empty:
+        return empty.copy(), empty.copy()
+
+    sites = compute_lobe_reach(union, sites)
+    n_prior = _count_hexes_per_site(prior_hex, sites)
+    n_current = _count_hexes_per_site(current_hex, sites)
+    sites = sites.copy()
+    sites["n_hexes_prior"] = n_prior
+    sites["n_hexes_current"] = n_current
+    # n_hexes for downstream = current count (fallback to prior for prior-only).
+    sites["n_hexes"] = np.where(n_current > 0, n_current, n_prior).astype(int)
+
+    site_class: list[str] = []
+    matched_prior: list[str | None] = []
+    match_dist: list[float] = []
+    for np_i, nc_i, sid in zip(n_prior, n_current, sites["site_id"].tolist()):
+        if nc_i <= 0:
+            # Prior-only: not present in current_sites.
+            site_class.append("prior_only")
+            matched_prior.append(None)
+            match_dist.append(np.nan)
+            continue
+        if np_i <= _JOINT_NEW_PRIOR_MAX_HEXES:
+            site_class.append("new_site")
+            matched_prior.append(None)
+            match_dist.append(np.nan)
+        else:
+            growth = (nc_i - np_i) / max(np_i, 1)
+            matched_prior.append(sid)  # same identity
+            match_dist.append(0.0)
+            site_class.append(
+                "expanded_site" if growth >= _JOINT_EXPANSION_GROWTH else "stable_site"
+            )
+    sites["site_class"] = site_class
+    sites["matched_prior_id"] = matched_prior
+    sites["match_dist_m"] = match_dist
+
+    prior_mask = n_prior > 0
+    current_mask = n_current > 0
+    prior_sites = sites.loc[prior_mask].copy()
+    if not prior_sites.empty:
+        prior_sites["n_hexes"] = prior_sites["n_hexes_prior"].astype(int)
+        prior_sites["site_class"] = "prior_site"
+    current_sites = sites.loc[current_mask].copy()
+    if not current_sites.empty:
+        current_sites["n_hexes"] = current_sites["n_hexes_current"].astype(int)
+    return prior_sites.reset_index(drop=True), current_sites.reset_index(drop=True)
 
 
 def compute_lobe_reach(

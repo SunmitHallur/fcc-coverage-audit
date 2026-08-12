@@ -11,13 +11,16 @@
 # (If PowerShell blocks it:  powershell -ExecutionPolicy Bypass -File .\run_overnight.ps1)
 
 param(
-  [switch]$Publish
+  [switch]$Publish,
+  [string]$Backend = $(if ($env:FCC_AUDIT_BACKEND) { $env:FCC_AUDIT_BACKEND } else { "redshift" })
 )
 
 Set-Location $PSScriptRoot
 $ErrorActionPreference = "Continue"   # record failed batches, then fail the run
 $env:PYTHONPATH = "src"
 $py = ".\.venv\Scripts\python.exe"
+# Overnight national path is Redshift-first (config defaults to files for offline).
+$backendArgs = @("--backend", $Backend)
 if (-not (Test-Path $py)) {
   Write-Host "=== creating Python virtual environment ===" -ForegroundColor Cyan
   python -m venv .venv
@@ -49,8 +52,8 @@ $batches = @(
 $start = Get-Date
 
 # National Redshift prefetch once; batches then --skip-prefetch.
-Write-Host "=== National prefetch (download) ===" -ForegroundColor Cyan
-& $py -m fcc_audit.cli download
+Write-Host "=== National prefetch (download) backend=$Backend ===" -ForegroundColor Cyan
+& $py -m fcc_audit.cli @backendArgs download
 if ($LASTEXITCODE -ne 0) {
   Write-Error "National prefetch failed; refusing overnight batches"
   Stop-Transcript | Out-Null
@@ -67,7 +70,7 @@ foreach ($b in $batches) {
   # shells/arg parsers split "20,19,49" into argv tokens and only the first FIPS
   # (Kansas for this batch) is honored — looks "national" in the log, one state in results.
   # Caches warm from national download; --workers 6 = unit-level CPU parallelism.
-  & $py -m fcc_audit.cli run --states "$b" --workers 6 --skip-prefetch
+  & $py -m fcc_audit.cli @backendArgs run --states "$b" --workers 6 --skip-prefetch
   if ($LASTEXITCODE -ne 0) {
     $failedBatches += $b
     Write-Warning "Batch failed or was incomplete: $b (exit $LASTEXITCODE)"
@@ -81,8 +84,8 @@ if ($failedBatches.Count -gt 0) {
   exit 1
 }
 
-Write-Host "=== building web bundle ===" -ForegroundColor Cyan
-& $py -m fcc_audit.cli build-web
+Write-Host "=== building web bundle backend=$Backend ===" -ForegroundColor Cyan
+& $py -m fcc_audit.cli @backendArgs build-web
 if ($LASTEXITCODE -ne 0) {
   $code = $LASTEXITCODE
   Stop-Transcript | Out-Null

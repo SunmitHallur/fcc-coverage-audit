@@ -29,12 +29,17 @@ Common patterns:
 
 | Source | Type | Ingested by |
 |--------|------|-------------|
-| FCC BDC hex files (per vintage) | Carrier-reported | `acquire.py` (FCC or Redshift) |
-| FCC Antenna Structure Registration (ASR) | Independent federal register | `groundtruth_asr.py` (library; **not** wired into default `run`) |
+| Cached hex parquet under `data/raw/` | Carrier-reported | `acquire.py` (`files` backend — **default**) |
+| FCC BDC hex tables (Redshift) | Carrier-reported | `acquire.py` (`redshift` — opt-in for FCC staff) |
+| FCC public NBM downloads | Carrier-reported | `acquire.py` (`fcc`) |
+| FCC Antenna Structure Registration (ASR) | Independent federal register | `groundtruth_asr.py` (wired into `run` when `groundtruth.asr.enabled`) |
 | Ookla Open Data (speed tests) | Independent field measurements | `groundtruth_measured.py` (library; **not** wired into default `run`) |
 | FCC Speed Test app data | Independent field measurements | `groundtruth_measured.py` (optional) |
 
-**Independence**: the ASR and measurement sources are collected by parties other than the carriers being audited, making them suitable as corroborating evidence when enrichment is enabled. Default `run` uses BDC geometry + deterministic scoring only; tile-CV reconcile helpers in `reconcile.py` are also off the default path (boundary-snap distance threshold is still used).
+**Independence**: ASR is fetched with a local cache and merged into features / site
+anchors during `run` (fails soft if the download is unavailable). Measurement
+enrichment remains optional. Tile-CV reconcile helpers in `reconcile.py` stay
+off the default path (boundary-snap distance threshold is still used).
 
 ---
 
@@ -47,7 +52,8 @@ BDC hex files
     │
     ├─ changedetect.py  Hex-level diff: added/removed per (provider, service, county)
     │
-    ├─ towers.py        Site inference: blob-detection → centroid → lobe-reach radius
+    ├─ towers.py        Joint site inference on the union of both vintages
+    │                   (shared identity; per-vintage hex counts classify new/expanded/stable)
     │
     ├─ attribute.py     Attribution: assign gained hexes to nearest site; classify as
     │                   same-site / new-site / unattributed
@@ -152,7 +158,7 @@ These do **not** independently flag a county — they amplify the score of an al
 | `min_added_km2_to_flag` | 10.0 km² | Ignore trivial / near-empty county changes (FCC-validated) |
 | `suspicious_same_site_growth` | 0.50 | 50% same-site share is not itself suspicious; only the combination matters |
 | `min_site_hexes` | 35 (at H3 res 9) | ~3.7 km² minimum blob to infer a site at res 9; prevents noise |
-| Feature weight: `asr_no_new_structure` | (optional) | Only active when ASR enrichment is wired; off on the default `run` path |
+| Feature weight: `asr_no_new_structure` | 0.12 | Active when ASR labels merge successfully; soft-disabled if ASR fetch fails |
 
 ---
 

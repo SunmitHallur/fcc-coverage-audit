@@ -133,7 +133,11 @@ def test_plain_language_explanation(scored):
     assert "headline" in expl and len(expl["headline"]) > 10
     assert isinstance(expl["bullets"], list) and len(expl["bullets"]) >= 1
     assert "recommendation" in expl
-    assert expl["severity"] in ("Critical", "High", "Moderate", "Low")
+    assert expl["severity"] in (
+        "Top 1%", "Top 5%", "Top 10%", "Flagged", "Below threshold",
+        # legacy absolute labels (kept as fallback)
+        "Critical", "High", "Moderate", "Low",
+    )
 
 
 def test_plain_language_explanation_distinguishes_coverage_loss():

@@ -26,14 +26,15 @@ _CMAP = LinearSegmentedColormap.from_list(
 )
 _NORM = Normalize(vmin=-120, vmax=-70)
 
+# Keep in sync with web/js/colors.js TOWER_COLORS.
 _TOWER_IN = {
-    "new_site": "#15803d",
+    "new_site": "#16a34a",
     "expanded_site": "#c2410c",
-    "prior_site": "#475569",
+    "prior_site": "#64748b",
 }
 _TOWER_OUT = {
-    "new_site": "#2563eb",
-    "expanded_site": "#7c3aed",
+    "new_site": "#16a34a",
+    "expanded_site": "#c2410c",
     "prior_site": "#64748b",
 }
 

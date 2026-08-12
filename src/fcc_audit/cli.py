@@ -251,6 +251,67 @@ def _demo_web_defaults(cfg: Config, scored: pd.DataFrame) -> dict[str, Any]:
     }
 
 
+def _enrich_with_asr(
+    cfg: Config,
+    features: pd.DataFrame,
+    sites: pd.DataFrame,
+    current: str,
+    prior: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Merge ASR county labels into features and anchor inferred sites.
+
+    Fails soft: ASR download / parse errors leave features unchanged (aside from
+    default false labels) so a network blip cannot kill an overnight run.
+    """
+    log = logging.getLogger(__name__)
+    gt = (cfg.raw.get("groundtruth") or {}).get("asr") or {}
+    if not gt.get("enabled", False):
+        return features, sites
+    if features.empty:
+        return features, sites
+    try:
+        from .groundtruth_asr import (
+            _load_or_build_asr_df,
+            fetch_asr_labels,
+            merge_asr_into_features,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("ASR enrichment unavailable: %s", exc)
+        return features, sites
+
+    cache_dir = cfg.project_root / str(gt.get("cache_dir", "data/groundtruth/asr"))
+    vintage_dates = gt.get("vintage_dates") or {}
+    try:
+        labels = fetch_asr_labels(
+            prior_vintage=str(prior),
+            current_vintage=str(current),
+            cache_dir=cache_dir,
+            vintage_dates=vintage_dates,
+        )
+        features = merge_asr_into_features(features, labels)
+        log.info(
+            "ASR labels merged: %d counties with new structures in window",
+            int(labels["has_new_structure"].sum()) if not labels.empty and "has_new_structure" in labels else 0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("ASR label fetch failed (continuing without): %s", exc)
+        features = features.copy()
+        features["asr_has_new_structure"] = False
+        features["asr_new_structure_count"] = 0
+
+    try:
+        asr_df = _load_or_build_asr_df(cache_dir)
+        radius = float(gt.get("site_match_radius_m", cfg.towers.get("site_match_radius_m", 2000)))
+        if not sites.empty:
+            sites = attribute.anchor_sites_to_asr(sites, asr_df, radius_m=radius)
+            n_matched = int(sites["asr_matched"].sum()) if "asr_matched" in sites.columns else 0
+            log.info("ASR site anchoring: %d / %d inferred sites near a registered structure",
+                     n_matched, len(sites))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("ASR site anchoring failed (continuing without): %s", exc)
+    return features, sites
+
+
 def _analyze_unit(
     cfg, provider, service_label, cur_file, pri_file, counties, county_area_km2,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -277,17 +338,25 @@ def _analyze_unit(
     t_change = time.perf_counter() - t0
 
     t0 = time.perf_counter()
-    prior_sites = towers.infer_sites(pri9, cfg, label_prefix="P")
-    current_sites = towers.infer_sites(cur9, cfg, label_prefix="C")
-    current_sites = attribute.match_sites(
-        prior_sites, current_sites, float(cfg.towers["site_match_radius_m"])
-    )
-    # Compute empirical lobe reach from full-band coverage so fringe hexes
-    # (beyond the strong-signal core) are attributed to their tower rather
-    # than being mis-classified as 'unattributed'. A single matched tower
-    # will capture ~100% of its gained hexes after this step.
-    current_sites = towers.compute_lobe_reach(cur9, current_sites)
-    prior_sites = towers.compute_lobe_reach(pri9, prior_sites)
+    # Joint inference on the union footprint shares site identity across
+    # vintages so centroid jitter cannot manufacture "new" towers.
+    prior_sites, current_sites = towers.infer_sites_joint(pri9, cur9, cfg)
+    if current_sites.empty and prior_sites.empty:
+        # Fall back to independent inference + one-to-one matching.
+        prior_sites = towers.infer_sites(pri9, cfg, label_prefix="P")
+        current_sites = towers.infer_sites(cur9, cfg, label_prefix="C")
+        current_sites = attribute.match_sites(
+            prior_sites, current_sites, float(cfg.towers["site_match_radius_m"])
+        )
+        current_sites = towers.compute_lobe_reach(cur9, current_sites)
+        prior_sites = towers.compute_lobe_reach(pri9, prior_sites)
+    else:
+        # Joint path already classified site_class; refresh lobe reach per vintage.
+        current_sites = towers.compute_lobe_reach(cur9, current_sites)
+        prior_sites = towers.compute_lobe_reach(pri9, prior_sites)
+        current_sites = attribute.match_sites(
+            prior_sites, current_sites, float(cfg.towers["site_match_radius_m"])
+        )
     t_towers = time.perf_counter() - t0
 
     t0 = time.perf_counter()
@@ -947,6 +1016,7 @@ def cmd_run(cfg: Config, args) -> int:
         return 0
 
     features = pd.concat(all_feats, ignore_index=True)
+    features, sites = _enrich_with_asr(cfg, features, sites, current, prior)
     scored = score.score(features, cfg)
     scored = explain.add_explanations(scored)
     # Persist hex coverage only for flagged + top-N counties (big disk/I/O win).
@@ -1222,6 +1292,13 @@ def cmd_download(cfg: Config, args) -> int:
                 log.info("ok %s %s @ %s (%.1f MB)", provider.name, svc["label"], vintage, size / 1e6)
     print(f"\nDownloaded/cached {n_files} files ({total_bytes/1e9:.2f} GB), "
           f"{n_skipped} unavailable. Raw data under {cfg.path('raw')}")
+    if n_files == 0:
+        log.error(
+            "download produced 0 files (backend=%s). Check vintages, data/raw caches, "
+            "or use --backend redshift with a filled .env.",
+            cfg.backend,
+        )
+        return 1
     print("Now run offline:  python -m fcc_audit.cli run")
     return 0
 
@@ -1416,43 +1493,72 @@ def cmd_doctor(cfg: Config, args) -> int:
         f"({'ok' if free_gb >= 40 else 'low — national runs need tens of GB'})",
     )
 
-    # Redshift connectivity + configured vintage tables (skip when fixture backend).
-    if backend != "redshift":
-        _ok(
-            "redshift",
-            True,
-            f"skipped (source.backend={backend!r}; set redshift to exercise warehouse)",
-        )
-    else:
+    # Backend-specific connectivity / data-availability probes.
+    if backend == "redshift":
         try:
-            from .acquire import RedshiftSource
+            from .acquire import probe_redshift_schema
 
-            source = RedshiftSource(cfg)
-            source._validate_redshift_credentials()
-            available = source.list_vintages()
-            current = str(cfg.vintage_current or "")
-            prior = str(cfg.vintage_prior or "")
-            missing_v = [v for v in (current, prior) if v and v not in available]
-            if missing_v:
-                _ok(
-                    "redshift",
-                    False,
-                    f"connected but missing vintage table(s) {missing_v}; "
-                    f"available builds (newest first): {available[:8]}",
-                )
-            else:
-                _ok(
-                    "redshift",
-                    True,
-                    f"connected; vintages current={current} prior={prior} "
-                    f"visible among {len(available)} builds",
-                )
-            try:
-                source.close()
-            except Exception:  # noqa: BLE001
-                pass
+            ok, detail = probe_redshift_schema(cfg)
+            _ok("redshift", ok, detail)
         except Exception as exc:  # noqa: BLE001
             _ok("redshift", False, f"{type(exc).__name__}: {exc}")
+    elif backend == "files":
+        try:
+            from .acquire import FilesSource
+
+            source = FilesSource(cfg)
+            vintages = source.list_vintages()
+            current = str(cfg.vintage_current or "")
+            prior = str(cfg.vintage_prior or "")
+            missing_v = [v for v in (current, prior) if v and v not in vintages]
+            if not vintages:
+                _ok(
+                    "files",
+                    False,
+                    f"no vintage dirs under {source.raw_dir}; prefetch with "
+                    f"`--backend redshift download` or copy data/raw/ from an FCC machine",
+                )
+            elif missing_v:
+                _ok(
+                    "files",
+                    False,
+                    f"missing vintage dir(s) {missing_v} under {source.raw_dir}; "
+                    f"found {vintages[:8]}",
+                )
+            else:
+                providers = source.list_providers(current or vintages[0])
+                _ok(
+                    "files",
+                    True,
+                    f"raw cache OK at {source.raw_dir}; vintages "
+                    f"current={current or vintages[0]} prior={prior or (vintages[1] if len(vintages) > 1 else '?')}; "
+                    f"{len(providers)} provider dirs for current",
+                )
+        except Exception as exc:  # noqa: BLE001
+            _ok("files", False, f"{type(exc).__name__}: {exc}")
+    elif backend == "fcc":
+        _ok(
+            "fcc",
+            True,
+            "public FCC download backend (no Redshift); network required at run time",
+        )
+    elif backend == "fixture":
+        try:
+            from .acquire import FixtureSource
+
+            source = FixtureSource(cfg)
+            vintages = source.list_vintages()
+            _ok(
+                "fixture",
+                bool(vintages),
+                f"{len(vintages)} fixture vintage(s) under {source.dir}"
+                if vintages
+                else f"no fixtures under {source.dir}; run make-fixtures",
+            )
+        except Exception as exc:  # noqa: BLE001
+            _ok("fixture", False, f"{type(exc).__name__}: {exc}")
+    else:
+        _ok("backend", False, f"unknown source.backend={backend!r}")
 
     failed = [name for name, ok, _ in checks if not ok]
     print()
@@ -1472,7 +1578,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument("--config", default=None, help="path to pipeline.yaml")
     parser.add_argument(
-        "--backend", default=None, choices=["fcc", "redshift", "fixture"],
+        "--backend", default=None, choices=["files", "fcc", "redshift", "fixture"],
         help="override source.backend from config",
     )
     sub = parser.add_subparsers(dest="command", required=True)

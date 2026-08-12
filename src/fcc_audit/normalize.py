@@ -221,24 +221,33 @@ def assign_counties(
     buffer_m: float = 50_000.0,
     equal_area_crs: str = "EPSG:5070",
 ) -> pd.DataFrame:
-    """Attach county attributes via each hex centroid (point-in-polygon join).
+    """Attach county attributes via hex-polygon overlap (largest-area wins).
 
-    When *clip_to_states* is set, hexes outside a *buffer_m* fringe of those
-    states are dropped **using the same centroid pass** (no second H3 decode).
+    Each H3 cell becomes its boundary polygon and is joined to counties with
+    ``predicate="intersects"``. A hex straddling a boundary is assigned to the
+    county with the largest intersection area — avoiding centroid mis-tags.
+
+    When *clip_to_states* is set, hexes whose polygons do not intersect a
+    *buffer_m* fringe of those states are dropped (polygon, not centroid).
     """
     if hex_df.empty:
         return hex_df.assign(county_geoid=None, county_name=None, state_fips=None)
 
-    import numpy as np
+    from shapely.geometry import Polygon
 
-    base = hex_df[["h3", "signal_dbm"]].copy()
+    base = hex_df[["h3", "signal_dbm"]].copy().reset_index(drop=True)
     cell_ids = base["h3"].astype(str).tolist()
-    lats = np.empty(len(cell_ids), dtype=float)
-    lngs = np.empty(len(cell_ids), dtype=float)
-    for i, c in enumerate(cell_ids):
-        lat, lng = h3.cell_to_latlng(c)
-        lats[i] = lat
-        lngs[i] = lng
+    polys = []
+    for c in cell_ids:
+        try:
+            boundary = h3.cell_to_boundary(c)  # [(lat, lng), ...]
+            polys.append(Polygon([(lng, lat) for lat, lng in boundary]))
+        except Exception:
+            polys.append(None)
+    gdf = gpd.GeoDataFrame(base, geometry=polys, crs="EPSG:4326")
+    gdf = gdf[gdf.geometry.notna()].copy().reset_index(drop=True)
+    if gdf.empty:
+        return base.assign(county_geoid=None, county_name=None, state_fips=None)
 
     if clip_to_states not in (None, "all") and clip_to_states:
         wanted = {str(s).zfill(2) for s in clip_to_states}
@@ -246,42 +255,71 @@ def assign_counties(
         target = counties.loc[state_col.isin(wanted)]
         if not target.empty:
             geom = target.to_crs(equal_area_crs).geometry.union_all().buffer(float(buffer_m))
-            pts_proj = gpd.GeoSeries(
-                gpd.points_from_xy(lngs, lats), crs="EPSG:4326",
-            ).to_crs(equal_area_crs)
-            keep = pts_proj.intersects(geom).to_numpy()
+            keep = gdf.to_crs(equal_area_crs).geometry.intersects(geom).to_numpy()
             if not bool(keep.all()):
-                n_before = len(base)
-                base = base.loc[keep].reset_index(drop=True)
-                lats = lats[keep]
-                lngs = lngs[keep]
+                n_before = len(gdf)
+                gdf = gdf.loc[keep].reset_index(drop=True)
                 log.info(
                     "  clipped hexes to target buffer: %s -> %s (states=%s)",
-                    f"{n_before:,}", f"{len(base):,}", ",".join(sorted(wanted)),
+                    f"{n_before:,}", f"{len(gdf):,}", ",".join(sorted(wanted)),
                 )
-            if base.empty:
-                return base.assign(county_geoid=None, county_name=None, state_fips=None)
+            if gdf.empty:
+                return pd.DataFrame(columns=[
+                    "h3", "signal_dbm", "county_geoid", "county_name", "state_fips",
+                ])
 
-    pts = gpd.GeoDataFrame(
-        base,
-        geometry=gpd.points_from_xy(lngs, lats),
-        crs="EPSG:4326",
-    )
-    joined = gpd.sjoin(pts, counties, how="left", predicate="within")
-    if "index_right" in joined.columns:
-        joined = joined.drop(columns=["index_right"])
+    counties_use = counties[["county_geoid", "county_name", "state_fips", "geometry"]].copy()
+    counties_use = counties_use.reset_index(drop=True)
+    try:
+        joined = gpd.sjoin(gdf, counties_use, how="left", predicate="intersects")
+    except Exception:
+        cents = gdf.copy()
+        cents.geometry = cents.geometry.centroid
+        joined = gpd.sjoin(cents, counties_use, how="left", predicate="within")
+
+    # Largest-area county wins when a hex intersects multiple counties.
+    joined = joined.reset_index(names="_hex_i")
+    if "index_right" in joined.columns and joined["h3"].duplicated().any():
+        areas = []
+        hex_geoms = gdf.geometry
+        county_geoms = counties_use.geometry
+        for _, row in joined.iterrows():
+            right = row.get("index_right")
+            hi = int(row["_hex_i"])
+            if pd.isna(right):
+                areas.append(0.0)
+                continue
+            try:
+                inter = hex_geoms.iloc[hi].intersection(county_geoms.iloc[int(right)])
+                areas.append(float(inter.area) if not inter.is_empty else 0.0)
+            except Exception:
+                areas.append(0.0)
+        joined = joined.assign(_area=areas)
+        joined = joined.sort_values("_area", ascending=False).drop_duplicates(
+            subset=["h3"], keep="first"
+        )
+        joined = joined.drop(columns=["_area"], errors="ignore")
+    else:
+        joined = joined.drop_duplicates(subset=["h3"], keep="first")
+    joined = joined.drop(columns=["_hex_i"], errors="ignore")
+
+    joined = joined.drop(columns=["index_right", "geometry"], errors="ignore")
     for col in ["county_geoid", "county_name", "state_fips"]:
         right = f"{col}_right"
         if right in joined.columns:
             joined[col] = joined[right]
-            joined = joined.drop(
-                columns=[c for c in joined.columns if c.endswith("_right") or c.endswith("_left")]
-            )
+            joined = joined.drop(columns=[right], errors="ignore")
         elif col not in joined.columns:
             joined[col] = None
-    return pd.DataFrame(
-        joined[["h3", "signal_dbm", "county_geoid", "county_name", "state_fips"]]
-    )
+    # Drop any remaining join suffixes.
+    drop_cols = [c for c in joined.columns if c.endswith("_left") or c.endswith("_right")]
+    if drop_cols:
+        joined = joined.drop(columns=drop_cols, errors="ignore")
+    keep_cols = ["h3", "signal_dbm", "county_geoid", "county_name", "state_fips"]
+    for c in keep_cols:
+        if c not in joined.columns:
+            joined[c] = None
+    return pd.DataFrame(joined[keep_cols]).reset_index(drop=True)
 
 
 def filter_counties_to_states(counties: gpd.GeoDataFrame, states) -> gpd.GeoDataFrame:

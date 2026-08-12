@@ -194,7 +194,13 @@ def site_indices_serving_county(
 def match_sites(
     prior_sites: pd.DataFrame, current_sites: pd.DataFrame, radius_m: float
 ) -> pd.DataFrame:
-    """Label each current site as new_site / expanded_site / stable_site."""
+    """Label each current site as new_site / expanded_site / stable_site.
+
+    Uses a radius-gated Hungarian assignment (``linear_sum_assignment``) so
+    matching is one-to-one: two current sites cannot claim the same prior site.
+    Prefer :func:`towers.infer_sites_joint` when both vintages are available —
+    that path shares site identity by construction and skips this fallback.
+    """
     cur = current_sites.copy()
     if cur.empty:
         cur["matched_prior_id"] = []
@@ -202,33 +208,103 @@ def match_sites(
         cur["site_class"] = []
         return cur
 
+    # Already classified by joint inference — leave alone.
+    if "site_class" in cur.columns and cur["site_class"].notna().all():
+        if "matched_prior_id" in cur.columns and "match_dist_m" in cur.columns:
+            return cur
+
     if prior_sites.empty:
         cur["matched_prior_id"] = None
         cur["match_dist_m"] = np.nan
         cur["site_class"] = "new_site"
         return cur
 
-    tree = cKDTree(prior_sites[["x_m", "y_m"]].to_numpy())
-    dist, idx = tree.query(cur[["x_m", "y_m"]].to_numpy(), k=1)
+    from scipy.optimize import linear_sum_assignment
+
+    prior_xy = prior_sites[["x_m", "y_m"]].to_numpy(dtype=float)
+    cur_xy = cur[["x_m", "y_m"]].to_numpy(dtype=float)
+    # Pairwise distances; values beyond radius become a large sentinel so the
+    # assignment prefers in-radius pairs, then we reject the rest.
+    n_c, n_p = len(cur), len(prior_sites)
+    cost = np.full((n_c, n_p), radius_m * 10.0, dtype=float)
+    tree = cKDTree(prior_xy)
+    # Query a generous k so candidates within radius are available for assignment.
+    k = min(n_p, 8)
+    dists, idxs = tree.query(cur_xy, k=k)
+    if k == 1:
+        dists = dists.reshape(-1, 1)
+        idxs = idxs.reshape(-1, 1)
+    for ci in range(n_c):
+        for d, pi in zip(dists[ci], idxs[ci]):
+            if np.isfinite(d) and d <= radius_m:
+                cost[ci, int(pi)] = float(d)
+
+    row_ind, col_ind = linear_sum_assignment(cost)
+    matched_prior_for_cur: dict[int, tuple[int, float]] = {}
+    for ci, pi in zip(row_ind, col_ind):
+        d = float(cost[ci, pi])
+        if d <= radius_m:
+            matched_prior_for_cur[int(ci)] = (int(pi), d)
+
     matched_id = []
     site_class = []
     match_dist = []
-    for d, i, n_now in zip(dist, idx, cur["n_hexes"].to_numpy()):
-        if d > radius_m:
+    n_hexes = cur["n_hexes"].to_numpy()
+    for ci in range(n_c):
+        hit = matched_prior_for_cur.get(ci)
+        if hit is None:
             matched_id.append(None)
             site_class.append("new_site")
             match_dist.append(np.nan)
             continue
-        prior_row = prior_sites.iloc[int(i)]
+        pi, d = hit
+        prior_row = prior_sites.iloc[pi]
         n_prior = max(int(prior_row["n_hexes"]), 1)
-        growth = (n_now - n_prior) / n_prior
+        growth = (int(n_hexes[ci]) - n_prior) / n_prior
         matched_id.append(prior_row["site_id"])
-        match_dist.append(float(d))
+        match_dist.append(d)
         site_class.append("expanded_site" if growth >= _EXPANSION_GROWTH else "stable_site")
     cur["matched_prior_id"] = matched_id
     cur["match_dist_m"] = match_dist
     cur["site_class"] = site_class
     return cur
+
+
+def anchor_sites_to_asr(
+    sites: pd.DataFrame,
+    asr_structures: pd.DataFrame,
+    radius_m: float = 2000.0,
+) -> pd.DataFrame:
+    """Spatially join inferred sites to ASR registered structures.
+
+    Adds ``asr_matched`` (bool) and ``asr_distance_m`` (float). ASR rows need
+    ``lat`` / ``lng`` columns (from :func:`groundtruth_asr._load_or_build_asr_df`).
+    """
+    out = sites.copy()
+    if out.empty:
+        out["asr_matched"] = []
+        out["asr_distance_m"] = []
+        return out
+    out["asr_matched"] = False
+    out["asr_distance_m"] = np.nan
+    if asr_structures is None or asr_structures.empty:
+        return out
+    if "lat" not in asr_structures.columns or "lng" not in asr_structures.columns:
+        return out
+    asr = asr_structures.dropna(subset=["lat", "lng"]).copy()
+    if asr.empty:
+        return out
+    xs_a, ys_a = _FWD.transform(asr["lng"].to_numpy(dtype=float), asr["lat"].to_numpy(dtype=float))
+    tree = cKDTree(np.column_stack([xs_a, ys_a]))
+    if "x_m" not in out.columns or "y_m" not in out.columns:
+        xs, ys = _FWD.transform(out["lng"].to_numpy(dtype=float), out["lat"].to_numpy(dtype=float))
+        out["x_m"] = xs
+        out["y_m"] = ys
+    dist, _ = tree.query(out[["x_m", "y_m"]].to_numpy(dtype=float), k=1)
+    matched = dist <= float(radius_m)
+    out["asr_matched"] = matched
+    out["asr_distance_m"] = np.where(matched, dist, np.nan)
+    return out
 
 
 def attribute_changes(

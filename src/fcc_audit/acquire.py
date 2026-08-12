@@ -1,12 +1,14 @@
 """Data acquisition with a pluggable backend.
 
-Three backends implement the same :class:`DataSource` interface:
+Four backends implement the same :class:`DataSource` interface:
 
+* :class:`FilesSource` - reads cached hex parquet under ``data/raw/`` (the layout
+  written by a prior Redshift prefetch). Default for public / offline use; no
+  warehouse credentials required.
 * :class:`FccDownloadSource` - pulls Big-4 5G-NR vector files straight from the
-  FCC National Broadband Map public API. Works today (general internet + FCC.gov
-  reachable). This is the default.
+  FCC National Broadband Map public API.
 * :class:`RedshiftSource` - queries the same coverage data from Amazon Redshift.
-  Stubbed until AWS access is granted; enable via ``source.backend: redshift``.
+  Opt-in via ``source.backend: redshift`` (FCC staff with warehouse access).
 * :class:`FixtureSource` - reads synthetic GeoJSON for offline development / CI.
 
 Downstream stages depend only on the interface, so swapping backends is a
@@ -75,11 +77,12 @@ class CoverageFile:
       shapefile / GeoPackage / WKT table the normalize stage polyfills to H3.
       One file holds all speed tiers and environments for that technology; the
       normalize stage filters by tier (mindown/minup) and environment (environmnt).
-    * **Pre-indexed H3 hexes** (``is_hex=True``, the Redshift backend): a parquet
-      of columns ``h3`` (H3 cell id string) + ``signal_dbm`` for one already
-      resolved (provider, service, vintage). Because the warehouse already did
-      the H3 indexing, normalize SKIPS the (expensive) polygon polyfill and only
-      tags counties. ``hex_resolution`` records the H3 resolution of those cells.
+    * **Pre-indexed H3 hexes** (``is_hex=True``, the Redshift / files backends):
+      a parquet of columns ``h3`` (H3 cell id string) + ``signal_dbm`` for one
+      already resolved (provider, service, vintage). Because the warehouse already
+      did the H3 indexing, normalize SKIPS the (expensive) polygon polyfill and
+      only tags counties. ``hex_resolution`` records the H3 resolution of those
+      cells.
     """
 
     provider_id: int
@@ -1028,6 +1031,108 @@ class RedshiftSource(DataSource):
 
 
 # ---------------------------------------------------------------------------
+# Files backend (cached hex parquet from a prior Redshift prefetch)
+# ---------------------------------------------------------------------------
+class FilesSource(DataSource):
+    """Read hex parquet already written under ``data/raw/<vintage>/<provider_id>/``.
+
+    Layout matches :class:`RedshiftSource` caches (filenames may contain
+    ``_redshift_`` even when read via this backend). Prefetch once with
+    ``--backend redshift``, then ship ``data/raw/`` for public / offline runs.
+    """
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.raw_dir = cfg.path("raw")
+        self.hex_resolution: int = int(cfg.redshift.get("hex_resolution", 9))
+
+    def list_vintages(self) -> list[str]:
+        if not self.raw_dir.exists():
+            return []
+        builds: list[str] = []
+        for p in self.raw_dir.iterdir():
+            if not p.is_dir() or p.name.startswith("."):
+                continue
+            # Prefer numeric build ids (Redshift table suffixes); keep others too.
+            builds.append(p.name)
+        def _key(name: str) -> tuple[int, str]:
+            return (0, f"{int(name):012d}") if name.isdigit() else (1, name)
+        return sorted(builds, key=_key, reverse=True)
+
+    def list_providers(self, vintage: str) -> list[Provider]:
+        vdir = self.raw_dir / str(vintage)
+        if not vdir.exists():
+            return []
+        known = {p.id: p.name for p in self.cfg.known_providers}
+        ids: set[int] = set()
+        for p in vdir.iterdir():
+            if p.is_dir() and p.name.isdigit():
+                ids.add(int(p.name))
+        return [Provider(id=i, name=known.get(i, str(i))) for i in sorted(ids)]
+
+    def _find_hex_parquet(self, provider_id: int, technology: str, vintage: str) -> Path:
+        import pandas as pd
+
+        out_dir = self.raw_dir / str(vintage) / str(int(provider_id))
+        if not out_dir.exists():
+            raise FileNotFoundError(
+                f"No cached hex data for provider {provider_id} vintage {vintage} "
+                f"under {out_dir}. Prefetch with `--backend redshift download` "
+                f"or copy data/raw/ from an FCC machine."
+            )
+        safe = safe_service_name(technology)
+        # Accept any backend token in the filename (redshift / files / fcc).
+        candidates = sorted(out_dir.glob(f"{safe}_*_hex{self.hex_resolution}.parquet"))
+        # Prefer multi-state composed layers, then "all", then per-state slices.
+        def _rank(path: Path) -> tuple[int, int, str]:
+            name = path.name
+            if "_all_hex" in name:
+                return (0, 0, name)
+            # Composed multi-state: contains hyphens in the state token area.
+            stem = name[len(safe) + 1 :].rsplit(f"_hex{self.hex_resolution}", 1)[0]
+            # e.g. redshift_08-20-29 or redshift_st20
+            if "st" not in stem.split("_")[-1] and "-" in stem.split("_")[-1]:
+                return (1, -stem.count("-"), name)
+            if "_st" in name:
+                return (2, 0, name)
+            return (3, 0, name)
+
+        if not candidates:
+            raise FileNotFoundError(
+                f"No parquet for service {technology!r} under {out_dir} "
+                f"(looked for {safe}_*_hex{self.hex_resolution}.parquet)."
+            )
+        ranked = sorted(candidates, key=_rank)
+        # If only per-state slices exist, compose them on the fly.
+        top = ranked[0]
+        if "_st" in top.name and all("_st" in c.name for c in ranked):
+            frames = [pd.read_parquet(p) for p in ranked if p.stat().st_size > 0]
+            if not frames:
+                raise FileNotFoundError(f"Empty parquet caches under {out_dir} for {safe}")
+            combined = pd.concat(frames, ignore_index=True)
+            if "h3" in combined.columns:
+                combined = combined.drop_duplicates(subset=["h3"], keep="last")
+            states = self.cfg.states
+            if states not in (None, "all"):
+                scope = "-".join(sorted(str(s).zfill(2) for s in states))
+            else:
+                scope = "composed"
+            composed = out_dir / f"{safe}_files_{scope}_hex{self.hex_resolution}.parquet"
+            tmp = composed.with_suffix(composed.suffix + ".part")
+            combined.to_parquet(tmp, index=False)
+            tmp.replace(composed)
+            return composed
+        return top
+
+    def fetch(self, provider_id, technology, vintage) -> CoverageFile:
+        path = self._find_hex_parquet(int(provider_id), technology, vintage)
+        return CoverageFile(
+            provider_id, technology, vintage, path,
+            is_hex=True, hex_resolution=self.hex_resolution,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Fixture backend (offline development / CI)
 # ---------------------------------------------------------------------------
 class FixtureSource(DataSource):
@@ -1072,8 +1177,102 @@ class FixtureSource(DataSource):
         )
 
 
+def probe_redshift_schema(cfg: Config) -> tuple[bool, str]:
+    """Probe schema + hex/merged table access for doctor.
+
+    Distinguishes SQLSTATE ``3F000`` (schema missing — usually the wrong
+    ``REDSHIFT_DB``) from a missing vintage table.
+    """
+    source = RedshiftSource(cfg)
+    source._validate_redshift_credentials()
+    schema = source.schema
+    db = str(cfg.redshift.get("database") or "")
+    try:
+        available = source.list_vintages()
+    except Exception as exc:  # noqa: BLE001
+        msg = str(exc)
+        code = ""
+        if hasattr(exc, "args") and exc.args:
+            arg0 = exc.args[0]
+            if isinstance(arg0, dict):
+                code = str(arg0.get("C") or "")
+                msg = str(arg0.get("M") or msg)
+            elif isinstance(arg0, str):
+                msg = arg0
+        text = f"{type(exc).__name__}: {msg}"
+        if code == "3F000" or 'schema "' in msg.lower() or "does not exist" in msg.lower():
+            return (
+                False,
+                f"schema {schema!r} is not accessible in database {db!r} "
+                f"({text}). bdc_dataplatform lives in db_fcc_bdc — set "
+                f"REDSHIFT_DB=db_fcc_bdc (not db_fcc_bdp_ext).",
+            )
+        return False, text
+
+    current = str(cfg.vintage_current or "")
+    prior = str(cfg.vintage_prior or "")
+    missing_v = [v for v in (current, prior) if v and v not in available]
+    if missing_v:
+        try:
+            source.close()
+        except Exception:  # noqa: BLE001
+            pass
+        return (
+            False,
+            f"connected to {db!r} schema {schema!r} but missing vintage "
+            f"table(s) {missing_v}; available builds (newest first): {available[:8]}",
+        )
+
+    # Probe SELECT on the hex table and the merged provider-discovery table.
+    for vintage in (current, prior):
+        if not vintage:
+            continue
+        hex_table = source._hex_table(vintage)
+        try:
+            source._query_df(f"SELECT 1 FROM {hex_table} LIMIT 1")
+        except Exception as exc:  # noqa: BLE001
+            try:
+                source.close()
+            except Exception:  # noqa: BLE001
+                pass
+            msg = str(exc)
+            if "3F000" in msg or "does not exist" in msg.lower():
+                return (
+                    False,
+                    f"cannot SELECT from {hex_table} in database {db!r}: {msg}. "
+                    f"Confirm REDSHIFT_DB=db_fcc_bdc and schema={schema!r}.",
+                )
+            return False, f"hex table probe failed for {hex_table}: {exc}"
+        merged = f"{schema}.{source.merged_prefix}{vintage}"
+        try:
+            source._query_df(f"SELECT 1 FROM {merged} LIMIT 1")
+        except Exception as exc:  # noqa: BLE001
+            try:
+                source.close()
+            except Exception:  # noqa: BLE001
+                pass
+            return (
+                False,
+                f"merged/provider-discovery table {merged} not readable: {exc}. "
+                f"Provider discovery needs {source.merged_prefix}<build>.",
+            )
+
+    try:
+        source.close()
+    except Exception:  # noqa: BLE001
+        pass
+    return (
+        True,
+        f"connected to {db!r}; schema {schema!r} OK; vintages "
+        f"current={current} prior={prior} among {len(available)} builds; "
+        f"hex + merged tables readable",
+    )
+
+
 def get_source(cfg: Config) -> DataSource:
     backend = cfg.backend
+    if backend == "files":
+        return FilesSource(cfg)
     if backend == "fcc":
         return FccDownloadSource(cfg)
     if backend == "redshift":
