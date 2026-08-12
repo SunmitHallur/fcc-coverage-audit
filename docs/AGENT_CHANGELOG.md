@@ -5,6 +5,27 @@ changed, why, and what was verified. Append new dated sections at the top.
 
 ---
 
+## 2026-08-12 — Fix unreadable “inverted” web theme (`:root` missing)
+
+### Cause
+
+`web/css/styles.css` lost the opening `:root {` when styles were split out of
+`index.html`. CSS variables (`--ink`, `--bg`, `--panel`, …) never applied, so
+hardcoded dark panels (e.g. `#detail`) kept dark backgrounds while text fell
+back to browser default black → unreadable “inverted” look. National data was
+fine; this was CSS only.
+
+### Fix
+
+Restore `:root { … }`, set `color-scheme: dark`, and force `#detail { color: var(--ink) }`.
+
+### Laptop apply (no re-run needed)
+
+Replace `web/css/styles.css` from git `master`, hard-refresh the browser
+(`Ctrl+Shift+R`).
+
+---
+
 ## 2026-08-12 — Windows/OneDrive build-web rmtree lock
 
 ### Context
