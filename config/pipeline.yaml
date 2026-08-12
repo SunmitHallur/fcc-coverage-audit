@@ -35,17 +35,15 @@ source:
     database: "${REDSHIFT_DB}"
     user: "${REDSHIFT_USER}"
     password: "${REDSHIFT_PASSWORD}"
-    # The backend reads the warehouse's PRE-AGGREGATED H3 res-9 hex snapshots
-    # (`<schema>.<hex_table_prefix><build>`), one row per H3 cell with a 0/1
-    # coverage flag per (technology, speed tier, environment) and a comma-
-    # delimited `..._prov` list of the providers covering that cell. Because H3
-    # indexing is already done in the warehouse, the pipeline SKIPS polygon
-    # polyfill — only the covered cell ids come back to the laptop.
+    # Default: per-provider H3 res-9 intersection tables with real minsignal
+    # (`bbmap_mob_bb_mrgd_hex9_inter_<build>`). Set hex_table_format: tech_hex9s
+    # to use the older binary 0/1 + _prov snapshot tables instead.
     schema: "bdc_dataplatform"
-    hex_table_prefix: "bbmap_mobile_bb_tech_hex9s_"
+    hex_table_format: "mrgd_inter"   # "mrgd_inter" | "tech_hex9s"
+    hex_table_prefix: "bbmap_mob_bb_mrgd_hex9_inter_"
     hex_resolution: 9
-    # Companion raw table (per-provider polygons) used only for provider
-    # discovery when analysis.providers is "all".
+    # Companion raw table used as fallback for provider discovery when
+    # analysis.providers is "all" (mrgd prefers DISTINCT providerid).
     merged_table_prefix: "bbmap_mobile_bb_merged_all_"
     # FCC mobile environment code to read (0 or 1). Pick one consistently.
     environment: 0
@@ -53,8 +51,14 @@ source:
     # Redshift WLM safety). Overnight `download` uses this; batch `run` skips
     # when caches are already warm.
     prefetch_workers: 3
-    # Map each analysis service (by its `desc`) to the hex coverage column base;
-    # the environment suffix (_env0/_env1) is appended automatically.
+    # mrgd_inter: map each analysis service (by catalog `desc`) to FCC
+    # technology code + mindown Mbps on the intersection table.
+    service_mrgd_keys:
+      "5G-NR (7/1 Mbps)":  { technology: 500, mindown: 7 }
+      "5G-NR (35/3 Mbps)": { technology: 500, mindown: 35 }
+      "4G LTE":           { technology: 400, mindown: 5 }
+      "3G":               { technology: 300, mindown: 0 }
+    # tech_hex9s only: map service desc → coverage column base (_envN appended).
     service_hex_columns:
       "5G-NR (7/1 Mbps)": "tech5g_spd1"
       "5G-NR (35/3 Mbps)": "tech5g_spd2"
@@ -102,12 +106,12 @@ analysis:
   # largest build ids, which may be only days apart — set them explicitly to
   # compare two 6-month vintages).
   vintages:
-    # Redshift build ids (tech_hex9s suffix). Both are D25-vs-J25 (the FCC
-    # benchmark pair). 277 and 279 are accessible today; switch current to "283"
-    # (a newer D25 reprocessing) once that build's permissions land. For the `fcc`
-    # backend, swap these for the filing labels ("December 31, 2025" / "June 30, 2025").
-    current: "277"                 # D25 (as-of 2025-12-31); use "283" when accessible
-    prior: "279"                   # J25 (as-of 2025-06-30)
+    # Redshift build / Broadband Map Processing process ids (table-name suffix).
+    # 292 = D25 (Dec 31, 2025), 291 = J25 (June 30, 2025) on mrgd_hex9_inter_*.
+    # For the `fcc` backend, swap these for filing labels
+    # ("December 31, 2025" / "June 30, 2025").
+    current: "292"                 # D25 (as-of 2025-12-31)
+    prior: "291"                   # J25 (as-of 2025-06-30)
 
 # ---------------------------------------------------------------------------
 # Geography / indexing
@@ -228,10 +232,12 @@ groundtruth:
     enabled: true
     cache_dir: "data/groundtruth/asr"
     site_match_radius_m: 2000
-    # Map Redshift build ids (and filing labels) to calendar dates for the
-    # ASR construction window. Filing labels pass through as-is.
+    # Map Redshift process/build ids (and filing labels) to calendar dates for
+    # the ASR construction window. Filing labels pass through as-is.
     vintage_dates:
-      "277": "December 31, 2025"
+      "292": "December 31, 2025"   # D25 (mrgd_hex9_inter)
+      "291": "June 30, 2025"       # J25
+      "277": "December 31, 2025"   # older process id, same D25 window
       "279": "June 30, 2025"
       "283": "December 31, 2025"
 
@@ -241,10 +247,10 @@ groundtruth:
 # the FCC's own selected / not-selected decisions once real data is available.
 # ---------------------------------------------------------------------------
 benchmark:
-  # Redshift build ids: 277 = D25 (use "283" once accessible), 279 = J25. For the
+  # Redshift process ids: 292 = D25, 291 = J25 on mrgd_hex9_inter_*. For the
   # `fcc` backend instead use the filing labels:
   # { current: "December 31, 2025", prior: "June 30, 2025" }.
-  vintages: { current: "277", prior: "279" }   # D25 vs J25
+  vintages: { current: "292", prior: "291" }   # D25 vs J25
   service_label: "5G-NR 7/1"
   # Optional per-county provider_id: when set, the check looks at whether THAT
   # provider was flagged in the county; when null, any provider counts.

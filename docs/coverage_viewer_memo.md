@@ -102,7 +102,7 @@ Redshift hex tables (or FCC download)
   CSV deliverables + optional web bundle
 ```
 
-**Data source (current deployment):** BDC Redshift pre-aggregated H3 res-9 tables (`bbmap_mobile_bb_tech_hex9s_<build>`), filtered per provider via the warehouse’s comma-delimited provider list. Vintages are **build IDs** (e.g., 277 = D25, 279 = J25).
+**Data source (current deployment):** BDC Redshift per-provider H3 res-9 intersection tables (`bbmap_mob_bb_mrgd_hex9_inter_<build>`) with real `minsignal` (dBm). Vintages are Broadband Map Processing **process IDs** (e.g., 292 = D25, 291 = J25).
 
 **Primary flag logic (simplified):** A county is suspicious when it adds meaningful in-county coverage **and** a large share of that growth is claimed from **existing towers** without a corresponding new build — especially when combined with blanket fill-in or unattributed area. Legitimate **new-tower** buildouts reduce the score.
 
@@ -122,7 +122,7 @@ Redshift hex tables (or FCC download)
 
 - **Tower locations are inferred**, not ASR ground truth — use them to target tests, not as legal evidence of structure.
 - Coverage is **modeled** (propagation), not measured — the tool directs *where* to measure.
-- Hex-level signal from Redshift tech tables is **binary** (covered / not); graded signal requires polygon sources with `minsignal`.
+- Hex-level signal from mrgd tables carries warehouse **`minsignal`** bands; distance-estimated heat is only a fallback for flat/legacy caches.
 - Flags are **prioritization**, not proof of fraud — they narrow the field for field verification.
 
 ---
@@ -130,7 +130,7 @@ Redshift hex tables (or FCC download)
 ## 8. Questions / next steps
 
 - Run the full pipeline for additional providers or services via `config/pipeline.yaml` and `run_overnight.ps1`.
-- Swap vintage build IDs when newer Redshift snapshots are available (e.g., 283 for D25 when permitted).
+- Swap vintage process IDs when newer Redshift mrgd snapshots are available.
 - For a **real-data** sample of a few counties (not synthetic), use `tools/make_sample_coverage.py` on a machine that has run the pipeline and saved coverage parquet.
 
 ---

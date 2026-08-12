@@ -30,7 +30,7 @@ Common patterns:
 | Source | Type | Ingested by |
 |--------|------|-------------|
 | Cached hex parquet under `data/raw/` | Carrier-reported | `acquire.py` (`files` backend — **default**) |
-| FCC BDC hex tables (Redshift) | Carrier-reported | `acquire.py` (`redshift` — opt-in for FCC staff) |
+| FCC BDC mrgd H3 tables (Redshift) | Carrier-reported + `minsignal` dBm | `acquire.py` (`redshift` — opt-in for FCC staff) |
 | FCC public NBM downloads | Carrier-reported | `acquire.py` (`fcc`) |
 | FCC Antenna Structure Registration (ASR) | Independent federal register | `groundtruth_asr.py` (wired into `run` when `groundtruth.asr.enabled`) |
 | Ookla Open Data (speed tests) | Independent field measurements | `groundtruth_measured.py` (library; **not** wired into default `run`) |
@@ -40,6 +40,18 @@ Common patterns:
 anchors during `run` (fails soft if the download is unavailable). Measurement
 enrichment remains optional. Tile-CV reconcile helpers in `reconcile.py` stay
 off the default path (boundary-snap distance threshold is still used).
+
+### Redshift mrgd tables (default warehouse path)
+
+Staff runs use `bbmap_mob_bb_mrgd_hex9_inter_<process_id>` (Broadband Map
+Processing process ids: **292 = D25**, **291 = J25**). Each row is already
+resolved to `(providerid, technology, mindown, environmnt)` with warehouse
+**`minsignal`** (dBm). The acquire stage maps analysis services via
+`source.redshift.service_mrgd_keys` (e.g. 5G-NR 7/1 → technology 500 / mindown 7)
+and writes `data/raw/<vintage>/<provider_id>/*.parquet` with columns `h3` and
+`signal_dbm`. Site inference and detail heatmaps therefore see real signal bands;
+the web bundle’s distance-based estimate runs only when unique signal values are
+still flat (legacy binary caches).
 
 ---
 

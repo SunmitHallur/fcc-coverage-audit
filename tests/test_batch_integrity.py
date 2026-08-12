@@ -37,14 +37,36 @@ def test_redshift_empty_query_is_cached_as_valid_layer(tmp_path, monkeypatch):
     cfg.raw["source"]["backend"] = "redshift"
     cfg.set_states(["20"])
     source = RedshiftSource(cfg)
-    monkeypatch.setattr(source, "_query_df", lambda *_args, **_kwargs: pd.DataFrame(columns=["h3index"]))
+    assert source.is_mrgd
+    monkeypatch.setattr(
+        source, "_query_df",
+        lambda *_args, **_kwargs: pd.DataFrame(columns=["h3index", "minsignal"]),
+    )
 
-    layer = source.fetch(130077, "5G-NR (7/1 Mbps)", "277")
+    layer = source.fetch(130077, "5G-NR (7/1 Mbps)", "292")
 
     cached = pd.read_parquet(layer.local_path)
     assert cached.empty
     assert list(cached.columns) == ["h3", "signal_dbm"]
     assert layer.is_hex is True
+
+
+def test_write_hex_cache_round_trips_signal_dbm(tmp_path):
+    cfg = load_config()
+    cfg.project_root = tmp_path
+    source = RedshiftSource(cfg)
+    dest = tmp_path / "cache.parquet"
+    # Duplicate hex keeps max minsignal.
+    source._write_hex_cache(
+        dest,
+        ["8928308280fffff", "8928308281fffff", "8928308280fffff"],
+        [-110.0, -90.0, -100.0],
+    )
+    cached = pd.read_parquet(dest)
+    assert set(cached.columns) == {"h3", "signal_dbm"}
+    by_h3 = dict(zip(cached["h3"], cached["signal_dbm"]))
+    assert by_h3["8928308280fffff"] == -100.0
+    assert by_h3["8928308281fffff"] == -90.0
 
 
 def test_redshift_shared_scan_fans_out_all_providers(tmp_path, monkeypatch):
@@ -63,52 +85,66 @@ def test_redshift_shared_scan_fans_out_all_providers(tmp_path, monkeypatch):
         {"id": 130403, "name": "T-Mobile"},
     ]
     source = RedshiftSource(cfg)
+    assert source.is_mrgd
     calls: list[str] = []
 
     def fake_query(sql, params=()):
         calls.append(sql)
         assert "LIKE" not in sql.upper()
-        assert "tech5g_spd1_env0_prov" in sql
-        assert "tech4g_env0_prov" in sql
+        assert "minsignal" in sql.lower()
+        assert "providerid" in sql.lower()
+        assert "technology" in sql.lower()
+        assert "mindown" in sql.lower()
+        assert "environmnt" in sql.lower()
+        # Two hexes for 5G (tech 500 / mindown 7); one for LTE (400 / 5).
+        # Duplicate AT&T 5G hex with weaker signal → keep max.
         return pd.DataFrame({
-            "h3index": ["8928308280fffff", "8928308281fffff", "8928308283fffff"],
-            "tech5g_spd1_env0": [1, 1, 1],
-            "tech5g_spd1_env0_prov": ["130077", "130077,130403", "130403"],
-            "tech4g_env0": [0, 1, 0],
-            "tech4g_env0_prov": ["", "130077", ""],
+            "h3index": [
+                "8928308280fffff", "8928308281fffff", "8928308283fffff",
+                "8928308281fffff", "8928308280fffff",
+            ],
+            "providerid": [130077, 130077, 130403, 130403, 130077],
+            "technology": [500, 500, 500, 500, 400],
+            "mindown": [7, 7, 7, 7, 5],
+            "minsignal": [-110.0, -95.0, -100.0, -90.0, -105.0],
         })
 
     monkeypatch.setattr(source, "_query_df", fake_query)
-    source.prefetch(["277"], ["20"], [130077, 130403])
+    source.prefetch(["292"], ["20"], [130077, 130403])
 
     assert len(calls) == 1
     from fcc_audit.acquire import safe_service_name
     att_5g = pd.read_parquet(
-        tmp_path / "data/raw/277/130077"
+        tmp_path / "data/raw/292/130077"
         / f"{safe_service_name('5G-NR (7/1 Mbps)')}_redshift_st20_hex9.parquet"
     )
     tm_5g = pd.read_parquet(
-        tmp_path / "data/raw/277/130403"
+        tmp_path / "data/raw/292/130403"
         / f"{safe_service_name('5G-NR (7/1 Mbps)')}_redshift_st20_hex9.parquet"
     )
     att_4g = pd.read_parquet(
-        tmp_path / "data/raw/277/130077"
+        tmp_path / "data/raw/292/130077"
         / f"{safe_service_name('4G LTE')}_redshift_st20_hex9.parquet"
     )
     assert set(att_5g["h3"]) == {"8928308280fffff", "8928308281fffff"}
     assert set(tm_5g["h3"]) == {"8928308281fffff", "8928308283fffff"}
-    assert set(att_4g["h3"]) == {"8928308281fffff"}
+    assert set(att_4g["h3"]) == {"8928308280fffff"}
+    att_sig = dict(zip(att_5g["h3"], att_5g["signal_dbm"]))
+    assert att_sig["8928308280fffff"] == -110.0
+    assert att_sig["8928308281fffff"] == -95.0
+    tm_sig = dict(zip(tm_5g["h3"], tm_5g["signal_dbm"]))
+    assert tm_sig["8928308281fffff"] == -90.0
 
     # Second prefetch must not hit Redshift again.
-    source.prefetch(["277"], ["20"], [130077, 130403])
+    source.prefetch(["292"], ["20"], [130077, 130403])
     assert len(calls) == 1
 
     # fetch() after warm caches must compose locally — no new warehouse scans.
-    layer = source.fetch(130077, "5G-NR (7/1 Mbps)", "277")
+    layer = source.fetch(130077, "5G-NR (7/1 Mbps)", "292")
     assert len(calls) == 1
-    assert set(pd.read_parquet(layer.local_path)["h3"]) == {
-        "8928308280fffff", "8928308281fffff",
-    }
+    cached = pd.read_parquet(layer.local_path)
+    assert set(cached["h3"]) == {"8928308280fffff", "8928308281fffff"}
+    assert set(cached["signal_dbm"]) == {-110.0, -95.0}
 
 
 def test_redshift_single_provider_uses_direct_queries(tmp_path, monkeypatch):
@@ -126,19 +162,25 @@ def test_redshift_single_provider_uses_direct_queries(tmp_path, monkeypatch):
 
     def fake_query(sql, params=()):
         calls.append(sql)
-        assert "LIKE" in sql.upper()
-        assert "tech5g_spd1_env0 = 1" in sql.replace(" ", "") or "tech5g_spd1_env0=1" in sql.replace(" ", "") or "tech5g_spd1_env0 = 1" in sql
-        return pd.DataFrame({"h3index": ["8928308280fffff", "8928308281fffff"]})
+        assert "LIKE" not in sql.upper()
+        assert "minsignal" in sql.lower()
+        assert "providerid = %s" in sql.lower() or "providerid=%s" in sql.replace(" ", "").lower()
+        assert "technology" in sql.lower() and "mindown" in sql.lower()
+        return pd.DataFrame({
+            "h3index": ["8928308280fffff", "8928308281fffff"],
+            "minsignal": [-100.0, -90.0],
+        })
 
     monkeypatch.setattr(source, "_query_df", fake_query)
-    source.prefetch(["277", "279"], ["20"], [130077])
+    source.prefetch(["292", "291"], ["20"], [130077])
     # 2 vintages × 1 state × 1 provider × 1 service = 2 direct queries
     assert len(calls) == 2
-    assert all("LIKE" in c.upper() for c in calls)
 
-    layer = source.fetch(130077, "5G-NR (7/1 Mbps)", "277")
+    layer = source.fetch(130077, "5G-NR (7/1 Mbps)", "292")
     assert len(calls) == 2  # warm
-    assert len(pd.read_parquet(layer.local_path)) == 2
+    cached = pd.read_parquet(layer.local_path)
+    assert len(cached) == 2
+    assert set(cached["signal_dbm"]) == {-100.0, -90.0}
 
 
 def test_redshift_query_error_propagates_without_cache(tmp_path, monkeypatch):
@@ -152,7 +194,7 @@ def test_redshift_query_error_propagates_without_cache(tmp_path, monkeypatch):
 
     monkeypatch.setattr(source, "_query_df", denied)
     with pytest.raises(PermissionError, match="denied"):
-        source.fetch(130077, "5G-NR (7/1 Mbps)", "277")
+        source.fetch(130077, "5G-NR (7/1 Mbps)", "292")
     assert not list((tmp_path / "data" / "raw").rglob("*.parquet"))
     assert not list((tmp_path / "data" / "raw").rglob("*.part"))
 
@@ -168,7 +210,7 @@ def test_redshift_provider_discovery_error_propagates(tmp_path, monkeypatch):
     )
 
     with pytest.raises(PermissionError, match="denied"):
-        source.list_providers("277")
+        source.list_providers("292")
 
 
 def test_successful_all_empty_units_are_completed(tmp_path, monkeypatch):
@@ -326,20 +368,23 @@ def test_redshift_prefetch_all_expands_to_national_fips(tmp_path, monkeypatch):
     seen_states: list[str | None] = []
 
     def fake_query(sql, params=()):
-        # state_fips param is first when present
+        # mrgd: state_fips is first param, then environmnt
         state = params[0] if params else None
         seen_states.append(state)
+        assert "minsignal" in sql.lower()
         return pd.DataFrame({
             "h3index": ["8928308280fffff"],
-            "tech5g_spd1_env0": [1],
-            "tech5g_spd1_env0_prov": ["130077,130403"],
+            "providerid": [130077],
+            "technology": [500],
+            "mindown": [7],
+            "minsignal": [-100.0],
         })
 
     monkeypatch.setattr(source, "_query_df", fake_query)
-    source.prefetch(["277"], "all", [130077, 130403], max_workers=1)
+    source.prefetch(["292"], "all", [130077, 130403], max_workers=1)
 
     assert set(seen_states) == NATIONAL_STATE_FIPS
-    assert source.caches_ready(["277"], "all", [130077, 130403])
+    assert source.caches_ready(["292"], "all", [130077, 130403])
 
 
 def test_redshift_prefetch_parallel_shared_scans(tmp_path, monkeypatch):
@@ -361,13 +406,15 @@ def test_redshift_prefetch_parallel_shared_scans(tmp_path, monkeypatch):
         calls.append(params)
         return pd.DataFrame({
             "h3index": ["8928308280fffff"],
-            "tech5g_spd1_env0": [1],
-            "tech5g_spd1_env0_prov": ["130077"],
+            "providerid": [130077],
+            "technology": [500],
+            "mindown": [7],
+            "minsignal": [-100.0],
         })
 
     # Each parallel worker creates its own RedshiftSource; patch the class method.
     monkeypatch.setattr(RedshiftSource, "_query_df", lambda self, sql, params=(): fake_query(sql, params))
-    source.prefetch(["277"], ["20", "31"], [130077, 130403], max_workers=2)
+    source.prefetch(["292"], ["20", "31"], [130077, 130403], max_workers=2)
     assert len(calls) == 2
     assert {c[0] for c in calls} == {"20", "31"}
 

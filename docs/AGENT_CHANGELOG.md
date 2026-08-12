@@ -5,6 +5,50 @@ changed, why, and what was verified. Append new dated sections at the top.
 
 ---
 
+## 2026-08-12 — Redshift mrgd + real minsignal (292/291)
+
+### Why
+
+Warehouse tables `bbmap_mob_bb_mrgd_hex9_inter_<build>` already expose per-provider
+rows with real **`minsignal`** (dBm). The pipeline had been reading binary
+`bbmap_mobile_bb_tech_hex9s_*` and `_write_hex_cache` forced `signal_dbm=0.0`, so
+detail maps used distance-estimated pseudo-RSRP.
+
+Process ids (Broadband Map Processing): **292 = D25**, **291 = J25** (replacing
+older 277/279 for the same filing windows).
+
+### What changed
+
+- `config/pipeline.yaml`: `hex_table_format: mrgd_inter`,
+  `hex_table_prefix: bbmap_mob_bb_mrgd_hex9_inter_`, `service_mrgd_keys`,
+  vintages `current: "292"` / `prior: "291"`.
+- `RedshiftSource`: direct + shared prefetch SELECT `h3index, minsignal` (and
+  fan-out columns); caches persist real `signal_dbm`; max minsignal on hex dupes;
+  provider discovery prefers `DISTINCT providerid` from mrgd (merged_all fallback).
+- `probe_redshift_schema` / doctor: probes mrgd columns; merged table not required
+  for mrgd format.
+- Tests updated for mrgd SQL; `_write_hex_cache` signal round-trip covered.
+- Docs: README, methodology, coverage viewer memo.
+
+Legacy `hex_table_format: tech_hex9s` path remains for binary snapshots.
+
+### Verify (FCC laptop)
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+$env:PYTHONPATH = "src"
+Remove-Item -Recurse -Force .\data\processed\* -ErrorAction SilentlyContinue
+python -m fcc_audit.cli --backend redshift doctor
+python -m fcc_audit.cli --backend redshift download --states 39 --prefetch-workers 2
+python -m fcc_audit.cli --backend redshift run --states 39 --workers 2 --skip-prefetch --build-web
+```
+
+Confirm a top county detail JSON has varied hex signal encodings (not one flat
+value) and the UI does not show the “estimated from distance” note. Old
+`data/raw/277|279` caches are unused; new runs write `data/raw/291|292`.
+
+---
+
 ## 2026-08-12 — Fix unreadable “inverted” web theme (`:root` missing)
 
 ### Cause
@@ -130,8 +174,8 @@ Redshift download path, and Linux server deploy readiness.
 5. Soft skips on missing filings (`skipped_no_filing`) can still yield “successful”
    empty analysis units — intentional for sparse providers, but dangerous if *all*
    units skip; watch overnight logs.
-6. Vintage build-id ordering (`277` current vs `279` prior) must match warehouse
-   metadata; confirm with `list-vintages` once creds exist.
+6. Vintage process-id ordering (`292` current / D25 vs `291` prior / J25) must
+   match warehouse metadata; confirm with `list-vintages` once creds exist.
 
 ### Deploy checklist (Linux / Mike’s server)
 

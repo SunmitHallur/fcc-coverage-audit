@@ -93,8 +93,9 @@ python -m fcc_audit.cli --backend redshift doctor    # warehouse + schema probe
 (`files` / `fcc` / `redshift` / `fixture`), CPU count (suggests `--workers`),
 and free disk. For Redshift it also probes schema access — distinguishing
 SQLSTATE `3F000` ("schema does not exist", usually wrong `REDSHIFT_DB`) from a
-missing vintage table — and verifies the hex + merged provider-discovery tables
-are readable. Schema `bdc_dataplatform` lives in **`db_fcc_bdc`**, not
+missing vintage table — and verifies the mrgd hex table columns
+(`h3index`, `providerid`, `technology`, `mindown`, `minsignal`, …) are
+readable. Schema `bdc_dataplatform` lives in **`db_fcc_bdc`**, not
 `db_fcc_bdp_ext`.
 
 Smoke one small batch before overnight:
@@ -182,10 +183,10 @@ python -m fcc_audit.cli run                      # download + analyze, Big 4 + a
 python -m fcc_audit.cli run --states 01,02       # one state batch (keep Redshift caches)
 python -m fcc_audit.cli run --states 01,02 --cleanup-raw   # FCC only: bound disk
 python -m fcc_audit.cli build-web                # rebuild web bundle from ALL batches
-python -m fcc_audit.cli run --current "277" --prior "279"   # Redshift build ids
+python -m fcc_audit.cli run --current "292" --prior "291"   # Redshift build ids (D25/J25)
 ```
 
-Vintages depend on backend: Redshift uses hex-table build ids (e.g. `"277"`);
+Vintages depend on backend: Redshift uses hex-table build ids (e.g. `"292"`);
 FCC uses `filing_subtype` labels (e.g. `"December 31, 2025"`). `download` and
 `run` are both resumable — already-downloaded files and interim parquet are
 cached and skipped, so an interrupted run picks up where it left off.
@@ -342,20 +343,21 @@ REDSHIFT_USER=...
 REDSHIFT_PASSWORD=...
 ```
 
-The backend reads the warehouse's **pre-aggregated H3 res-9 hex snapshots**
-(`<schema>.bbmap_mobile_bb_tech_hex9s_<build>`) — one row per H3 cell with a
-`0/1` coverage flag per `(technology, speed tier, environment)` and a comma-
-delimited `..._prov` list of the providers covering that cell. Since the
-warehouse already did the H3 indexing, the pipeline **skips polygon polyfill**
-and only pulls back the covered cell ids (tiny), instead of the tens of millions
-of raw polygons per layer. Coverage is a flat band (these tables carry no
-modeled signal), so tower inference works from contiguous-coverage blobs.
+The backend reads the warehouse's **per-provider H3 res-9 intersection tables**
+(`<schema>.bbmap_mob_bb_mrgd_hex9_inter_<build>`) — one row per
+`(h3index, providerid, technology, mindown, environmnt)` with real
+**`minsignal`** (dBm). Cached parquet is `h3` + `signal_dbm` (= `minsignal`).
+Since the warehouse already did the H3 indexing, the pipeline **skips polygon
+polyfill**. Detail maps use warehouse dBm bands; distance-based signal estimate
+is only a fallback when caches are still flat (legacy `tech_hex9s`).
 
 Configure `source.redshift` in `config/pipeline.yaml`: `schema`,
-`hex_table_prefix`, `environment` (0/1), and the `service_hex_columns` map (e.g.
-`"5G-NR (7/1 Mbps)" -> tech5g_spd1`). The table-name suffix is a **build id** and
-serves as the vintage token — set `analysis.vintages.current/prior` to two build
-ids (e.g. `175` and `140`) that are ~6 months apart.
+`hex_table_format: mrgd_inter`, `hex_table_prefix`, `environment` (0/1), and
+`service_mrgd_keys` (e.g. `"5G-NR (7/1 Mbps)" → technology 500 / mindown 7`).
+The table-name suffix is a Broadband Map Processing **process id** and serves as
+the vintage token — default `analysis.vintages` are **`292` (D25)** and
+**`291` (J25)**. Set `hex_table_format: tech_hex9s` only if you need the older
+binary 0/1 + `_prov` snapshots.
 
 Run the pipeline and serve locally:
 
@@ -412,10 +414,13 @@ The data layer is pluggable. Once your AWS Redshift access is granted:
 
 1. `pip install -r requirements.txt` (`redshift-connector` is included).
 2. Copy `.env.example` → `.env` and fill `REDSHIFT_*` (same values as your DBeaver connection).
-3. Set `source.redshift.schema` / `hex_table_prefix` / `environment` /
-   `service_hex_columns` in `config/pipeline.yaml`, and set two build ids in
-   `analysis.vintages` (the numeric suffix on the `..._tech_hex9s_<build>` tables).
+3. Set `source.redshift.schema` / `hex_table_format` / `hex_table_prefix` /
+   `environment` / `service_mrgd_keys` in `config/pipeline.yaml`, and set two
+   process ids in `analysis.vintages` (suffix on `..._mrgd_hex9_inter_<build>`,
+   e.g. `292` / `291`).
 4. Set `source.backend: redshift` (or run with `--backend redshift`).
+5. Wipe stale `data/raw/277|279` (or re-download) so caches are under `291|292`
+   with real `signal_dbm`.
 
 Nothing else in the pipeline changes. **This is the recommended path for an
 all-providers / all-technologies national run**, because it avoids pulling ~1 TB

@@ -391,41 +391,38 @@ class FccDownloadSource(DataSource):
 # Redshift backend (enable once AWS access is granted)
 # ---------------------------------------------------------------------------
 class RedshiftSource(DataSource):
-    """Reads coverage from the warehouse's pre-aggregated H3 res-9 hex tables.
+    """Reads coverage from warehouse H3 res-9 tables (mrgd_inter or tech_hex9s).
 
-    The BDC data platform publishes national res-9 hex snapshots
-    (``<schema>.bbmap_mobile_bb_tech_hex9s_<build>``), one row per H3 cell with:
+    **Default (``hex_table_format: mrgd_inter``):** per-provider intersection
+    tables ``bbmap_mob_bb_mrgd_hex9_inter_<build>`` with real ``minsignal``
+    (dBm). Rows are filtered by ``providerid``, ``technology``, ``mindown``,
+    and ``environmnt``. Cached parquet is ``h3`` + ``signal_dbm``.
 
-    * ``h3index``  - the H3 res-9 cell id (string, same form the ``h3`` lib uses),
-    * ``state_fips`` - the cell's state,
-    * per (technology, speed tier, environment) a ``0/1`` coverage flag column
-      (e.g. ``tech5g_spd1_env0``) plus a companion ``..._prov`` column holding a
-      COMMA-DELIMITED list of the provider ids that cover the cell for that service.
+    **Legacy (``hex_table_format: tech_hex9s``):** binary 0/1 + ``_prov`` list
+    snapshots ``bbmap_mobile_bb_tech_hex9s_<build>``. Caches get flat
+    ``signal_dbm=0`` (viewer may estimate heat from inferred sites).
 
     **Performance:** each (vintage, state) is scanned **once** for all configured
-    services (``SELECT h3index, …_prov … WHERE state_fips=? AND (flags)``). Provider
-    membership is filtered in Python into per-provider parquet caches. That replaces
-    the old per-provider ``LIKE %,<id>,%`` query pattern (~12× fewer warehouse scans
-    for Big-4 × 3 services). Call :meth:`prefetch` before ``run --workers N`` so
-    analyze workers never compete for Redshift connections.
+    providers/services, then fanned out in Python. Call :meth:`prefetch` before
+    ``run --workers N`` so analyze workers do not compete for Redshift.
 
-    The table suffix ``<build>`` is a monotonic build/process id and serves as
-    the **vintage token**: set ``analysis.vintages.current/prior`` to two builds.
-
-    Because the warehouse already did the H3 indexing, this backend returns the
-    covered cells for one (provider, service) directly and the pipeline SKIPS the
-    expensive polygon polyfill (see ``CoverageFile.is_hex``). These hex tables
-    carry only a 0/1 coverage flag (no modeled signal), so coverage is treated as
-    a flat band; tower inference then works from contiguous-coverage blobs.
+    The table suffix ``<build>`` is the Broadband Map Processing process id and
+    serves as the vintage token (e.g. 292 = D25, 291 = J25).
     """
 
-    # Map an analysis service (by its catalog `desc`) to the hex table's coverage
-    # column base. The environment suffix (`_env0`/`_env1`) is appended per config.
+    # tech_hex9s: service desc → coverage column base (_envN appended).
     _DEFAULT_SERVICE_COLUMNS: dict[str, str] = {
         "5G-NR (7/1 Mbps)": "tech5g_spd1",
         "5G-NR (35/3 Mbps)": "tech5g_spd2",
         "4G LTE": "tech4g",
         "3G": "tech3g",
+    }
+    # mrgd_inter: service desc → FCC technology code + mindown Mbps.
+    _DEFAULT_MRGD_KEYS: dict[str, dict[str, int]] = {
+        "5G-NR (7/1 Mbps)": {"technology": 500, "mindown": 7},
+        "5G-NR (35/3 Mbps)": {"technology": 500, "mindown": 35},
+        "4G LTE": {"technology": 400, "mindown": 5},
+        "3G": {"technology": 300, "mindown": 0},
     }
 
     def __init__(self, cfg: Config):
@@ -433,7 +430,18 @@ class RedshiftSource(DataSource):
         self.rs = cfg.redshift
         self.raw_dir = cfg.path("raw")
         self.schema: str = self.rs.get("schema", "bdc_dataplatform")
-        self.hex_prefix: str = self.rs.get("hex_table_prefix", "bbmap_mobile_bb_tech_hex9s_")
+        self.hex_format: str = str(self.rs.get("hex_table_format") or "mrgd_inter").strip().lower()
+        if self.hex_format not in ("mrgd_inter", "tech_hex9s"):
+            raise RuntimeError(
+                f"Unknown source.redshift.hex_table_format={self.hex_format!r}; "
+                "use 'mrgd_inter' or 'tech_hex9s'."
+            )
+        default_prefix = (
+            "bbmap_mob_bb_mrgd_hex9_inter_"
+            if self.hex_format == "mrgd_inter"
+            else "bbmap_mobile_bb_tech_hex9s_"
+        )
+        self.hex_prefix: str = self.rs.get("hex_table_prefix", default_prefix)
         self.merged_prefix: str = self.rs.get("merged_table_prefix", "bbmap_mobile_bb_merged_all_")
         self.environment: int = int(self.rs.get("environment", 0))
         self.hex_resolution: int = int(self.rs.get("hex_resolution", 9))
@@ -441,7 +449,20 @@ class RedshiftSource(DataSource):
             **self._DEFAULT_SERVICE_COLUMNS,
             **(self.rs.get("service_hex_columns") or {}),
         }
+        raw_mrgd = self.rs.get("service_mrgd_keys") or {}
+        self.service_mrgd_keys: dict[str, dict[str, int]] = {
+            **self._DEFAULT_MRGD_KEYS,
+        }
+        for desc, keys in raw_mrgd.items():
+            self.service_mrgd_keys[str(desc)] = {
+                "technology": int(keys["technology"]),
+                "mindown": int(keys["mindown"]),
+            }
         self._conn = None
+
+    @property
+    def is_mrgd(self) -> bool:
+        return self.hex_format == "mrgd_inter"
 
     def _validate_redshift_credentials(self) -> None:
         """Fail fast with a clear setup hint when .env was not loaded."""
@@ -519,6 +540,16 @@ class RedshiftSource(DataSource):
             )
         return f"{base}_env{self.environment}"
 
+    def _service_mrgd_key(self, service_desc: str) -> tuple[int, int]:
+        keys = self.service_mrgd_keys.get(service_desc)
+        if keys is None:
+            raise RuntimeError(
+                f"No Redshift mrgd key mapped for service {service_desc!r}. Add it "
+                f"under source.redshift.service_mrgd_keys (known: "
+                f"{sorted(self.service_mrgd_keys)})."
+            )
+        return int(keys["technology"]), int(keys["mindown"])
+
     def list_vintages(self) -> list[str]:  # pragma: no cover - live only
         """Available hex-snapshot build ids, newest (largest) first."""
         df = self._query_df(
@@ -534,24 +565,38 @@ class RedshiftSource(DataSource):
         return [str(b) for b in sorted(builds, reverse=True)]
 
     def list_providers(self, vintage: str) -> list[Provider]:  # pragma: no cover - live only
-        """Discover providers from the matching raw build (distinct providerid).
+        """Discover providers for a build (distinct providerid).
 
-        The hex tables encode providers only as delimited strings, so provider
-        discovery uses the companion ``bbmap_mobile_bb_merged_all_<build>`` table.
-        Discovery failures propagate: silently substituting a provider list can
-        make a credential/schema failure look like a successful partial run.
+        Prefer the mrgd intersection table when ``hex_table_format=mrgd_inter``;
+        fall back to ``bbmap_mobile_bb_merged_all_<build>`` for tech_hex9s or if
+        the mrgd DISTINCT query fails.
         """
         known = {p.id: p.name for p in self.cfg.known_providers}
-        df = self._query_df(
-            f"SELECT DISTINCT providerid, provider_name "
-            f"FROM {self.schema}.{self.merged_prefix}{vintage}"
-        )
-        if df.empty:
-            raise RuntimeError(f"Redshift provider discovery returned no providers for {vintage}")
         out: dict[int, str] = {}
-        for _, row in df.iterrows():
-            pid = int(row["providerid"])
-            out[pid] = known.get(pid, str(row.get("provider_name") or pid))
+        if self.is_mrgd:
+            try:
+                df = self._query_df(
+                    f"SELECT DISTINCT providerid FROM {self._hex_table(vintage)}"
+                )
+                if not df.empty:
+                    col = "providerid" if "providerid" in df.columns else df.columns[0]
+                    for pid in df[col].tolist():
+                        i = int(pid)
+                        out[i] = known.get(i, str(i))
+            except Exception:  # noqa: BLE001
+                out = {}
+        if not out:
+            df = self._query_df(
+                f"SELECT DISTINCT providerid, provider_name "
+                f"FROM {self.schema}.{self.merged_prefix}{vintage}"
+            )
+            if df.empty:
+                raise RuntimeError(
+                    f"Redshift provider discovery returned no providers for {vintage}"
+                )
+            for _, row in df.iterrows():
+                pid = int(row["providerid"])
+                out[pid] = known.get(pid, str(row.get("provider_name") or pid))
         return [Provider(id=i, name=n) for i, n in sorted(out.items())]
 
     def _state_cache_path(
@@ -587,15 +632,25 @@ class RedshiftSource(DataSource):
             ]
         return [p.id for p in self.cfg.providers]
 
-    def _write_hex_cache(self, dest: Path, hexes) -> None:
+    def _write_hex_cache(self, dest: Path, hexes, signals=None) -> None:
+        """Write ``h3`` + ``signal_dbm`` parquet. ``signals=None`` → flat 0.0."""
         import pandas as pd
 
         dest.parent.mkdir(parents=True, exist_ok=True)
-        series = pd.Series(hexes, dtype="string")
-        cached = pd.DataFrame({
-            "h3": series,
-            "signal_dbm": pd.Series(0.0, index=series.index, dtype="float64"),
-        })
+        series = pd.Series(list(hexes) if hexes is not None else [], dtype="string")
+        if signals is None:
+            sig = pd.Series(0.0, index=series.index, dtype="float64")
+        else:
+            sig = pd.to_numeric(pd.Series(list(signals), index=series.index), errors="coerce")
+            sig = sig.fillna(0.0).astype("float64")
+        cached = pd.DataFrame({"h3": series, "signal_dbm": sig})
+        if not cached.empty and "h3" in cached.columns:
+            # Keep strongest band when a hex appears more than once.
+            cached = (
+                cached.sort_values("signal_dbm", ascending=False)
+                .drop_duplicates(subset=["h3"], keep="first")
+                .reset_index(drop=True)
+            )
         tmp = dest.with_suffix(dest.suffix + ".part")
         cached.to_parquet(tmp, index=False)
         tmp.replace(dest)
@@ -653,24 +708,23 @@ class RedshiftSource(DataSource):
         vintage: str,
         state: str | None,
         service_descs: list[str] | None = None,
+        provider_ids: list[int] | None = None,
     ) -> Path:
-        """Pull every configured service's flags+provider lists for one state in ONE query.
+        """One warehouse scan per (vintage, state); fan-out writes provider caches.
 
-        Avoids per-provider ``LIKE`` scans. Downstream fan-out writes the existing
-        per-(provider, service, state) parquet caches from this shared frame.
+        **mrgd_inter:** rows are ``h3, providerid, technology, mindown, minsignal``.
+        **tech_hex9s:** flag + ``_prov`` list columns (legacy).
         """
-        import pandas as pd
-
         descs = list(service_descs) if service_descs is not None else self._configured_service_descs()
         if not descs:
             raise RuntimeError("No analysis.services configured for Redshift fetch")
+        pids = [int(p) for p in (provider_ids or self._configured_provider_ids())]
 
         dest = self._shared_slice_path(vintage, state, descs)
         if self._cache_ready(dest):
             return dest
 
         dest.parent.mkdir(parents=True, exist_ok=True)
-        # Directory lock so parallel workers cannot double-query the same slice.
         lock_dir = Path(str(dest) + ".lock")
         while True:
             if self._cache_ready(dest):
@@ -680,7 +734,6 @@ class RedshiftSource(DataSource):
                 break
             except FileExistsError:
                 try:
-                    # Recover from a crashed holder (lock dirs are empty markers).
                     if time.time() - lock_dir.stat().st_mtime > 7200:
                         lock_dir.rmdir()
                         continue
@@ -691,78 +744,156 @@ class RedshiftSource(DataSource):
         try:
             if self._cache_ready(dest):
                 return dest
-
-            table = self._hex_table(vintage)
-            select_parts = ["h3index"]
-            flag_ors: list[str] = []
-            flag_aliases: list[str] = []
-            prov_aliases: list[str] = []
-            for desc in descs:
-                col = self._service_column(desc)
-                flag_aliases.append(col)
-                prov_aliases.append(f"{col}_prov")
-                select_parts.append(f"{col} AS {col}")
-                select_parts.append(f"{col}_prov AS {col}_prov")
-                flag_ors.append(f"{col} = 1")
-
-            where = [f"({' OR '.join(flag_ors)})"]
-            params: list = []
-            if state is not None:
-                where.insert(0, "state_fips = %s")
-                params.append(str(state).zfill(2))
-
-            sql = (
-                f"SELECT {', '.join(select_parts)} FROM {table} "
-                f"WHERE {' AND '.join(where)}"
-            )
-            log.info(
-                "  redshift SHARED scan %s states=%s services=%d (no per-provider LIKE)",
-                vintage, state or "all", len(descs),
-            )
-            df = self._query_df(sql, tuple(params))
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            if df.empty:
-                empty = pd.DataFrame({"h3": pd.Series(dtype="string")})
-                for alias in flag_aliases:
-                    empty[alias] = pd.Series(dtype="float64")
-                for alias in prov_aliases:
-                    empty[alias] = pd.Series(dtype="string")
-                tmp = dest.with_suffix(dest.suffix + ".part")
-                empty.to_parquet(tmp, index=False)
-                tmp.replace(dest)
-                return dest
-
-            rename = {c: c.lower() for c in df.columns}
-            df = df.rename(columns=rename)
-            if "h3index" not in df.columns:
-                raise RuntimeError(
-                    f"Redshift shared scan for {table} did not return h3index"
-                )
-            out = pd.DataFrame({"h3": df["h3index"].astype(str)})
-            for alias in flag_aliases:
-                key = alias.lower()
-                out[alias] = (
-                    pd.to_numeric(df[key], errors="coerce").fillna(0).astype("int8")
-                    if key in df.columns
-                    else pd.Series(0, index=out.index, dtype="int8")
-                )
-            for alias in prov_aliases:
-                key = alias.lower()
-                out[alias] = (
-                    df[key].astype("string")
-                    if key in df.columns
-                    else pd.Series(pd.NA, index=out.index, dtype="string")
-                )
-            tmp = dest.with_suffix(dest.suffix + ".part")
-            out.to_parquet(tmp, index=False)
-            tmp.replace(dest)
-            log.info("  shared slice cached %s (%s rows)", dest.name, f"{len(out):,}")
-            return dest
+            if self.is_mrgd:
+                return self._write_shared_slice_mrgd(dest, vintage, state, descs, pids)
+            return self._write_shared_slice_tech(dest, vintage, state, descs)
         finally:
             try:
                 lock_dir.rmdir()
             except OSError:
                 pass
+
+    def _write_shared_slice_mrgd(
+        self,
+        dest: Path,
+        vintage: str,
+        state: str | None,
+        descs: list[str],
+        provider_ids: list[int],
+    ) -> Path:
+        import pandas as pd
+
+        keys = {s: self._service_mrgd_key(s) for s in descs}
+        pairs = sorted(set(keys.values()))
+        pair_clauses = " OR ".join(
+            f"(technology = {t} AND mindown = {m})" for t, m in pairs
+        )
+        pid_list = ", ".join(str(i) for i in sorted(set(provider_ids))) if provider_ids else "-1"
+        table = self._hex_table(vintage)
+        where = [
+            f"environmnt = %s",
+            f"providerid IN ({pid_list})",
+            f"({pair_clauses})",
+        ]
+        params: list = [self.environment]
+        if state is not None:
+            where.insert(0, "state_fips = %s")
+            params.insert(0, str(state).zfill(2))
+        sql = (
+            f"SELECT h3index, providerid, technology, mindown, minsignal "
+            f"FROM {table} WHERE {' AND '.join(where)}"
+        )
+        log.info(
+            "  redshift SHARED mrgd %s state=%s providers=%d services=%d",
+            vintage, state or "all", len(provider_ids), len(descs),
+        )
+        df = self._query_df(sql, tuple(params))
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        empty_cols = {
+            "h3": pd.Series(dtype="string"),
+            "providerid": pd.Series(dtype="int64"),
+            "technology": pd.Series(dtype="int64"),
+            "mindown": pd.Series(dtype="int64"),
+            "minsignal": pd.Series(dtype="float64"),
+        }
+        if df.empty:
+            out = pd.DataFrame(empty_cols)
+        else:
+            rename = {c: c.lower() for c in df.columns}
+            df = df.rename(columns=rename)
+            for need in ("h3index", "providerid", "technology", "mindown", "minsignal"):
+                if need not in df.columns:
+                    raise RuntimeError(
+                        f"Redshift mrgd shared scan for {table} missing column {need}"
+                    )
+            out = pd.DataFrame({
+                "h3": df["h3index"].astype(str),
+                "providerid": pd.to_numeric(df["providerid"], errors="coerce").fillna(0).astype("int64"),
+                "technology": pd.to_numeric(df["technology"], errors="coerce").fillna(0).astype("int64"),
+                "mindown": pd.to_numeric(df["mindown"], errors="coerce").fillna(0).astype("int64"),
+                "minsignal": pd.to_numeric(df["minsignal"], errors="coerce").fillna(0.0).astype("float64"),
+            })
+        tmp = dest.with_suffix(dest.suffix + ".part")
+        out.to_parquet(tmp, index=False)
+        tmp.replace(dest)
+        log.info("  shared mrgd slice cached %s (%s rows)", dest.name, f"{len(out):,}")
+        return dest
+
+    def _write_shared_slice_tech(
+        self,
+        dest: Path,
+        vintage: str,
+        state: str | None,
+        descs: list[str],
+    ) -> Path:
+        import pandas as pd
+
+        table = self._hex_table(vintage)
+        select_parts = ["h3index"]
+        flag_ors: list[str] = []
+        flag_aliases: list[str] = []
+        prov_aliases: list[str] = []
+        for desc in descs:
+            col = self._service_column(desc)
+            flag_aliases.append(col)
+            prov_aliases.append(f"{col}_prov")
+            select_parts.append(f"{col} AS {col}")
+            select_parts.append(f"{col}_prov AS {col}_prov")
+            flag_ors.append(f"{col} = 1")
+
+        where = [f"({' OR '.join(flag_ors)})"]
+        params: list = []
+        if state is not None:
+            where.insert(0, "state_fips = %s")
+            params.append(str(state).zfill(2))
+
+        sql = (
+            f"SELECT {', '.join(select_parts)} FROM {table} "
+            f"WHERE {' AND '.join(where)}"
+        )
+        log.info(
+            "  redshift SHARED tech_hex9s %s state=%s services=%d",
+            vintage, state or "all", len(descs),
+        )
+        df = self._query_df(sql, tuple(params))
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if df.empty:
+            empty = pd.DataFrame({"h3": pd.Series(dtype="string")})
+            for alias in flag_aliases:
+                empty[alias] = pd.Series(dtype="float64")
+            for alias in prov_aliases:
+                empty[alias] = pd.Series(dtype="string")
+            tmp = dest.with_suffix(dest.suffix + ".part")
+            empty.to_parquet(tmp, index=False)
+            tmp.replace(dest)
+            return dest
+
+        rename = {c: c.lower() for c in df.columns}
+        df = df.rename(columns=rename)
+        if "h3index" not in df.columns:
+            raise RuntimeError(
+                f"Redshift shared scan for {table} did not return h3index"
+            )
+        out = pd.DataFrame({"h3": df["h3index"].astype(str)})
+        for alias in flag_aliases:
+            key = alias.lower()
+            out[alias] = (
+                pd.to_numeric(df[key], errors="coerce").fillna(0).astype("int8")
+                if key in df.columns
+                else pd.Series(0, index=out.index, dtype="int8")
+            )
+        for alias in prov_aliases:
+            key = alias.lower()
+            out[alias] = (
+                df[key].astype("string")
+                if key in df.columns
+                else pd.Series(pd.NA, index=out.index, dtype="string")
+            )
+        tmp = dest.with_suffix(dest.suffix + ".part")
+        out.to_parquet(tmp, index=False)
+        tmp.replace(dest)
+        log.info("  shared slice cached %s (%s rows)", dest.name, f"{len(out):,}")
+        return dest
 
     def _fetch_direct_state_slice(
         self,
@@ -783,19 +914,60 @@ class RedshiftSource(DataSource):
         if self._cache_ready(dest):
             return dest
 
-        col = self._service_column(technology)
         table = self._hex_table(vintage)
+        log.info(
+            "  redshift DIRECT %s provider %s %s state=%s format=%s",
+            vintage, provider_id, technology, state or "all", self.hex_format,
+        )
+        t0 = time.perf_counter()
+        if self.is_mrgd:
+            tech, mindown = self._service_mrgd_key(technology)
+            where = [
+                "providerid = %s",
+                "technology = %s",
+                "mindown = %s",
+                "environmnt = %s",
+            ]
+            params: list = [int(provider_id), tech, mindown, self.environment]
+            if state is not None:
+                where.insert(0, "state_fips = %s")
+                params.insert(0, str(state).zfill(2))
+            sql = (
+                f"SELECT h3index, minsignal FROM {table} WHERE "
+                + " AND ".join(where)
+            )
+            df = self._query_df(sql, tuple(params))
+            elapsed = time.perf_counter() - t0
+            if df.empty:
+                self._write_hex_cache(dest, [])
+                n = 0
+            else:
+                rename = {c: c.lower() for c in df.columns}
+                df = df.rename(columns=rename)
+                if "h3index" not in df.columns:
+                    raise RuntimeError(
+                        f"Redshift direct mrgd query for {table} missing h3index"
+                    )
+                if "minsignal" not in df.columns:
+                    raise RuntimeError(
+                        f"Redshift direct mrgd query for {table} missing minsignal"
+                    )
+                hexes = df["h3index"].astype(str).tolist()
+                signals = df["minsignal"].tolist()
+                self._write_hex_cache(dest, hexes, signals)
+                n = len(hexes)
+            log.info(
+                "  direct cache %s (%s hexes in %.1fs)", dest.name, f"{n:,}", elapsed,
+            )
+            return dest
+
+        col = self._service_column(technology)
         where = [f"{col} = 1", f"',' || {col}_prov || ',' LIKE %s"]
-        params: list = [f"%,{int(provider_id)},%"]
+        params = [f"%,{int(provider_id)},%"]
         if state is not None:
             where.insert(0, "state_fips = %s")
             params.insert(0, str(state).zfill(2))
         sql = f"SELECT h3index FROM {table} WHERE " + " AND ".join(where)
-        log.info(
-            "  redshift DIRECT %s provider %s %s state=%s",
-            vintage, provider_id, technology, state or "all",
-        )
-        t0 = time.perf_counter()
         df = self._query_df(sql, tuple(params))
         elapsed = time.perf_counter() - t0
         if df.empty:
@@ -803,7 +975,6 @@ class RedshiftSource(DataSource):
             n = 0
         else:
             if "h3index" not in df.columns:
-                # connector may lower-case
                 cols = {c.lower(): c for c in df.columns}
                 if "h3index" not in cols:
                     raise RuntimeError(
@@ -835,9 +1006,12 @@ class RedshiftSource(DataSource):
         if self._provider_state_caches_complete(vintage, state, pids, descs):
             return
 
-        # Pass service_descs explicitly (thread-safe; do not mutate cfg.services).
-        shared_path = self._ensure_shared_slice(vintage, state, descs)
+        shared_path = self._ensure_shared_slice(vintage, state, descs, pids)
         shared = pd.read_parquet(shared_path)
+
+        if self.is_mrgd:
+            self._fanout_mrgd_shared(shared, vintage, state, pids, descs)
+            return
 
         for desc in descs:
             col = self._service_column(desc)
@@ -857,6 +1031,45 @@ class RedshiftSource(DataSource):
                 )
                 mask = covered & self._provider_mask(shared[prov_col], int(pid))
                 self._write_hex_cache(dest, shared.loc[mask, "h3"])
+
+    def _fanout_mrgd_shared(
+        self,
+        shared,
+        vintage: str,
+        state: str | None,
+        provider_ids: list[int],
+        descs: list[str],
+    ) -> None:
+        """Fan mrgd shared rows into per-(provider, service) caches with max minsignal."""
+        import pandas as pd
+
+        keys = {s: self._service_mrgd_key(s) for s in descs}
+        for desc in descs:
+            tech, mindown = keys[desc]
+            for pid in provider_ids:
+                out_dir = self.raw_dir / str(vintage) / str(pid)
+                dest = self._state_cache_path(out_dir, desc, state)
+                if self._cache_ready(dest):
+                    continue
+                if shared.empty or "providerid" not in shared.columns:
+                    self._write_hex_cache(dest, [])
+                    continue
+                mask = (
+                    (shared["providerid"].astype("int64") == int(pid))
+                    & (shared["technology"].astype("int64") == int(tech))
+                    & (shared["mindown"].astype("int64") == int(mindown))
+                )
+                sub = shared.loc[mask]
+                if sub.empty:
+                    self._write_hex_cache(dest, [])
+                    continue
+                hexes = sub["h3"].astype(str).tolist()
+                signals = (
+                    pd.to_numeric(sub["minsignal"], errors="coerce")
+                    .fillna(0.0)
+                    .tolist()
+                )
+                self._write_hex_cache(dest, hexes, signals)
 
     def _prefetch_shared_job(
         self,
@@ -987,7 +1200,14 @@ class RedshiftSource(DataSource):
             if frames:
                 combined = pd.concat(frames, ignore_index=True)
                 if "h3" in combined.columns:
-                    combined = combined.drop_duplicates(subset=["h3"], keep="last")
+                    if "signal_dbm" in combined.columns:
+                        combined = (
+                            combined.sort_values("signal_dbm", ascending=False)
+                            .drop_duplicates(subset=["h3"], keep="first")
+                            .reset_index(drop=True)
+                        )
+                    else:
+                        combined = combined.drop_duplicates(subset=["h3"], keep="last")
             else:
                 combined = pd.DataFrame({
                     "h3": pd.Series(dtype="string"),
@@ -1178,10 +1398,13 @@ class FixtureSource(DataSource):
 
 
 def probe_redshift_schema(cfg: Config) -> tuple[bool, str]:
-    """Probe schema + hex/merged table access for doctor.
+    """Probe schema + hex table access for doctor.
 
     Distinguishes SQLSTATE ``3F000`` (schema missing — usually the wrong
-    ``REDSHIFT_DB``) from a missing vintage table.
+    ``REDSHIFT_DB``) from a missing vintage table. For ``mrgd_inter``, also
+    checks required columns (``h3index``, ``providerid``, ``technology``,
+    ``mindown``, ``minsignal``, ``environmnt``, ``state_fips``). Merged-all
+    tables are optional when mrgd provider discovery works.
     """
     source = RedshiftSource(cfg)
     source._validate_redshift_credentials()
@@ -1223,13 +1446,20 @@ def probe_redshift_schema(cfg: Config) -> tuple[bool, str]:
             f"table(s) {missing_v}; available builds (newest first): {available[:8]}",
         )
 
-    # Probe SELECT on the hex table and the merged provider-discovery table.
+    mrgd_cols = (
+        "h3index", "providerid", "technology", "mindown",
+        "minsignal", "environmnt", "state_fips",
+    )
     for vintage in (current, prior):
         if not vintage:
             continue
         hex_table = source._hex_table(vintage)
         try:
-            source._query_df(f"SELECT 1 FROM {hex_table} LIMIT 1")
+            if source.is_mrgd:
+                col_list = ", ".join(mrgd_cols)
+                source._query_df(f"SELECT {col_list} FROM {hex_table} LIMIT 1")
+            else:
+                source._query_df(f"SELECT 1 FROM {hex_table} LIMIT 1")
         except Exception as exc:  # noqa: BLE001
             try:
                 source.close()
@@ -1243,6 +1473,11 @@ def probe_redshift_schema(cfg: Config) -> tuple[bool, str]:
                     f"Confirm REDSHIFT_DB=db_fcc_bdc and schema={schema!r}.",
                 )
             return False, f"hex table probe failed for {hex_table}: {exc}"
+
+        if source.is_mrgd:
+            # Merged-all is only a fallback; warn in message if unreadable.
+            continue
+
         merged = f"{schema}.{source.merged_prefix}{vintage}"
         try:
             source._query_df(f"SELECT 1 FROM {merged} LIMIT 1")
@@ -1257,15 +1492,20 @@ def probe_redshift_schema(cfg: Config) -> tuple[bool, str]:
                 f"Provider discovery needs {source.merged_prefix}<build>.",
             )
 
+    fmt = source.hex_format
     try:
         source.close()
     except Exception:  # noqa: BLE001
         pass
+    detail = (
+        f"mrgd columns ({', '.join(mrgd_cols)}) readable"
+        if fmt == "mrgd_inter"
+        else "hex + merged tables readable"
+    )
     return (
         True,
-        f"connected to {db!r}; schema {schema!r} OK; vintages "
-        f"current={current} prior={prior} among {len(available)} builds; "
-        f"hex + merged tables readable",
+        f"connected to {db!r}; schema {schema!r} OK; format={fmt}; vintages "
+        f"current={current} prior={prior} among {len(available)} builds; {detail}",
     )
 
 
