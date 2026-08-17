@@ -50,26 +50,35 @@ Supports **Python 3.9 through 3.14**. Same install command everywhere — pins a
 version-gated in `requirements.txt`. Verified on macOS/Windows (3.13/3.14) and
 with a real 3.9.25 venv for RHEL 9 handoff.
 
-### macOS / Windows / modern Linux (Python 3.11+)
+### One-time (clone / first machine)
+
+Do this once after `git clone` or the first checkout. Skip on later days — you
+do **not** recreate the venv or rewrite `.env` after a normal `git pull`.
+
+#### macOS / Windows / modern Linux (Python 3.11+)
 
 ```bash
+git clone <repo-url>
+cd fcc-coverage-audit
 python3 -m venv .venv
 source .venv/bin/activate            # Windows: .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 pip install -r requirements.txt
-export PYTHONPATH=src                 # Windows: $env:PYTHONPATH="src"
+cp .env.example .env                 # Windows: copy .env.example .env
+# fill REDSHIFT_* only if you will use --backend redshift
 ```
 
-### RHEL 9 / EL9 (stock Python 3.9.25)
+#### RHEL 9 / EL9 (stock Python 3.9.25)
 
 Use the locked tree so you get the exact dependency versions tested for handoff:
 
 ```bash
+git clone <repo-url>
+cd fcc-coverage-audit
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 pip install -r requirements-py39.lock.txt
-export PYTHONPATH=src
 cp .env.example .env   # then fill REDSHIFT_* from your warehouse INI
 ```
 
@@ -82,12 +91,34 @@ REDSHIFT_USER=…
 REDSHIFT_PASSWORD=…
 ```
 
-Preflight before any long run:
+**Offline wheelhouse** (if the server cannot reach PyPI — still one-time):
 
 ```bash
-python -m fcc_audit.cli doctor                       # default: files backend
-python -m fcc_audit.cli --backend redshift doctor    # warehouse + schema probe
+# on a connected machine with the same Python 3.9
+pip download -r requirements-py39.lock.txt -d wheelhouse \
+  --python-version 3.9 --platform manylinux2014_x86_64 --only-binary=:all:
+# copy wheelhouse/ + requirements-py39.lock.txt to the server, then:
+pip install --no-index --find-links wheelhouse -r requirements-py39.lock.txt
 ```
+
+### Every time (after `git pull`)
+
+```bash
+git pull
+source .venv/bin/activate            # Windows: .\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt      # no-op if unchanged; picks up new pins
+                                     # RHEL 9: pip install -r requirements-py39.lock.txt
+export PYTHONPATH=src                # Windows: $env:PYTHONPATH="src"
+```
+
+Then pick the command you actually need:
+
+| Goal | Command |
+|------|---------|
+| Preflight | `python -m fcc_audit.cli doctor` (add `--backend redshift` on the warehouse) |
+| Smoke one state | `--backend files run --states 20 --workers 2` (cached parquet) or `--backend redshift run --states 20 --workers 2` |
+| Full national | `./run_overnight.sh` (Linux) or `.\run_overnight.ps1` (Windows) |
+| View the map | `cd web && python3 -m http.server 8000` → http://127.0.0.1:8000 |
 
 `doctor` checks the interpreter, heavy imports, the **active** backend
 (`files` / `fcc` / `redshift` / `fixture`), CPU count (suggests `--workers`),
@@ -98,26 +129,10 @@ missing vintage table — and verifies the mrgd hex table columns
 readable. Schema `bdc_dataplatform` lives in **`db_fcc_bdc`**, not
 `db_fcc_bdp_ext`.
 
-Smoke one small batch before overnight:
-
-```bash
-# Public / offline: cached hex parquet under data/raw/ (no Redshift)
-python -m fcc_audit.cli --backend files run --states 20 --workers 2
-
-# FCC staff with warehouse access:
-python -m fcc_audit.cli --backend redshift run --states 20 --workers 2
-./run_overnight.sh          # full national (Linux)
-```
-
-**Offline wheelhouse** (if the server cannot reach PyPI):
-
-```bash
-# on a connected machine with the same Python 3.9
-pip download -r requirements-py39.lock.txt -d wheelhouse \
-  --python-version 3.9 --platform manylinux2014_x86_64 --only-binary=:all:
-# copy wheelhouse/ + requirements-py39.lock.txt to the server, then:
-pip install --no-index --find-links wheelhouse -r requirements-py39.lock.txt
-```
+You do **not** need to re-run the national pipeline after every pull. Pull +
+`pip install` is enough if you only want the latest code; `run` / overnight
+only when you want new scores. Viewing the map uses whatever is already in
+`web/public/data/`.
 
 ### 1. Try it offline first (no FCC / Redshift access needed)
 
@@ -287,9 +302,9 @@ If you only care about the FCC's current funding focus, keep it to **5G-NR**
 open data/outputs/priority_ranking_*.csv
 open data/outputs/summary_*.md
 
-# Interactive web app (production — county choropleth + plain-language explanations)
+# Interactive web app (county choropleth + plain-language explanations)
 cd web && python3 -m http.server 8000
-# then open http://localhost:8000
+# then open http://127.0.0.1:8000
 
 # Legacy dashboard (point markers)
 cd dashboard && python3 -m http.server 8000
@@ -321,6 +336,8 @@ counties highlighted in red.
 
 On a locked-down work machine, skip Vercel entirely. The website is static files
 under `web/` — no server-side code, no external hosting required.
+
+#### One-time (first clone only)
 
 ```powershell
 git clone <your-repo-url>
@@ -359,17 +376,29 @@ the vintage token — default `analysis.vintages` are **`292` (D25)** and
 **`291` (J25)**. Set `hex_table_format: tech_hex9s` only if you need the older
 binary 0/1 + `_prov` snapshots.
 
-Run the pipeline and serve locally:
+#### Every time (after `git pull`)
 
 ```powershell
+git pull
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
 $env:PYTHONPATH = "src"
-python -m fcc_audit.cli --backend redshift run --build-web
-cd web
-python -m http.server 8000
-# open http://localhost:8000
+python -m fcc_audit.cli --backend redshift doctor
 ```
 
-Or double-click `run.bat` after setting `source.backend: redshift` in the config.
+Then only the step you need:
+
+```powershell
+# Re-run analysis (hours). Skip if you only pulled code / CSS.
+python -m fcc_audit.cli --backend redshift run --build-web
+# or double-click run.bat  (full national overnight)
+
+# View the map (seconds). Needs web/public/data/ from a prior run.
+cd web
+python -m http.server 8000
+# open http://127.0.0.1:8000
+```
+
 VS Code: open the folder, let it pick up `.vscode/settings.json` (sets
 `PYTHONPATH=src`), then **Terminal → Run Task** for *Run pipeline (Redshift)*,
 *Build web bundle*, or *Serve website locally*.
