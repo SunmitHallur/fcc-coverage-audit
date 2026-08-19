@@ -11,6 +11,9 @@ This document explains how the pipeline detects potentially gamed FCC Broadband 
 
 The goal is **defensibility**: any flag the system produces should be explainable in plain language, reproducible from the committed inputs, and corroborated by at least one independent data source.
 
+Formulas, why each step exists, and paper citations:
+[docs/formulas.md](formulas.md) · [README — Mathematics](../README.md#mathematics-of-each-step).
+
 ---
 
 ## 1. What "gaming" means in this context
