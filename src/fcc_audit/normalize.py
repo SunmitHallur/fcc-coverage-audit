@@ -13,11 +13,13 @@ reporting, and can re-index to res-9 for finer tower clustering.
 from __future__ import annotations
 
 import logging
+import time
 import zipfile
 from pathlib import Path
 
 import geopandas as gpd
 import h3
+import numpy as np
 import pandas as pd
 
 from .acquire import CoverageFile, safe_service_name as safe
@@ -213,96 +215,85 @@ def county_areas_km2(counties: gpd.GeoDataFrame, equal_area_crs: str = "EPSG:507
     return dict(zip(counties["county_geoid"].astype(str), areas))
 
 
-def assign_counties(
-    hex_df: pd.DataFrame,
-    counties: gpd.GeoDataFrame,
-    *,
-    clip_to_states=None,
-    buffer_m: float = 50_000.0,
-    equal_area_crs: str = "EPSG:5070",
-) -> pd.DataFrame:
-    """Attach county attributes via hex-polygon overlap (largest-area wins).
+# Projected buffer polygons keyed by (states, buffer_m, crs). Reused across
+# provider×service×vintage calls in the same worker (the old path rebuilt this
+# on every layer, including a union_all of several large western states).
+_BUFFER_GEOM_CACHE: dict[tuple, object] = {}
+_ALBERS_TRANSFORMER: dict[str, object] = {}
 
-    Each H3 cell becomes its boundary polygon and is joined to counties with
-    ``predicate="intersects"``. A hex straddling a boundary is assigned to the
-    county with the largest intersection area — avoiding centroid mis-tags.
 
-    When *clip_to_states* is set, hexes whose polygons do not intersect a
-    *buffer_m* fringe of those states are dropped (polygon, not centroid).
-    """
-    if hex_df.empty:
-        return hex_df.assign(county_geoid=None, county_name=None, state_fips=None)
-
-    from shapely.geometry import Polygon
-
-    base = hex_df[["h3", "signal_dbm"]].copy().reset_index(drop=True)
-    cell_ids = base["h3"].astype(str).tolist()
-    polys = []
-    for c in cell_ids:
+def _cells_to_latlng(cell_ids: list[str]) -> tuple[list[str], np.ndarray, np.ndarray]:
+    """Return valid cells with WGS84 lat/lng arrays. Invalid ids are dropped."""
+    n = len(cell_ids)
+    lats = np.empty(n, dtype=np.float64)
+    lngs = np.empty(n, dtype=np.float64)
+    keep = np.ones(n, dtype=bool)
+    for i, cell in enumerate(cell_ids):
         try:
-            boundary = h3.cell_to_boundary(c)  # [(lat, lng), ...]
-            polys.append(Polygon([(lng, lat) for lat, lng in boundary]))
+            lat, lng = h3.cell_to_latlng(cell)
+            lats[i] = lat
+            lngs[i] = lng
         except Exception:
-            polys.append(None)
-    gdf = gpd.GeoDataFrame(base, geometry=polys, crs="EPSG:4326")
-    gdf = gdf[gdf.geometry.notna()].copy().reset_index(drop=True)
-    if gdf.empty:
-        return base.assign(county_geoid=None, county_name=None, state_fips=None)
+            keep[i] = False
+    if bool(keep.all()):
+        return cell_ids, lats, lngs
+    idx = np.flatnonzero(keep)
+    return [cell_ids[i] for i in idx], lats[idx], lngs[idx]
 
-    if clip_to_states not in (None, "all") and clip_to_states:
-        wanted = {str(s).zfill(2) for s in clip_to_states}
-        state_col = counties["state_fips"].astype(str).str.zfill(2)
-        target = counties.loc[state_col.isin(wanted)]
-        if not target.empty:
-            geom = target.to_crs(equal_area_crs).geometry.union_all().buffer(float(buffer_m))
-            keep = gdf.to_crs(equal_area_crs).geometry.intersects(geom).to_numpy()
-            if not bool(keep.all()):
-                n_before = len(gdf)
-                gdf = gdf.loc[keep].reset_index(drop=True)
-                log.info(
-                    "  clipped hexes to target buffer: %s -> %s (states=%s)",
-                    f"{n_before:,}", f"{len(gdf):,}", ",".join(sorted(wanted)),
-                )
-            if gdf.empty:
-                return pd.DataFrame(columns=[
-                    "h3", "signal_dbm", "county_geoid", "county_name", "state_fips",
-                ])
 
-    counties_use = counties[["county_geoid", "county_name", "state_fips", "geometry"]].copy()
-    counties_use = counties_use.reset_index(drop=True)
+def _albers_xy(lngs: np.ndarray, lats: np.ndarray, equal_area_crs: str):
+    """Project WGS84 points to *equal_area_crs* (meters). Cached transformer."""
+    from pyproj import Transformer
+
+    transformer = _ALBERS_TRANSFORMER.get(equal_area_crs)
+    if transformer is None:
+        transformer = Transformer.from_crs("EPSG:4326", equal_area_crs, always_xy=True)
+        _ALBERS_TRANSFORMER[equal_area_crs] = transformer
+    return transformer.transform(lngs, lats)
+
+
+def _points_in_geom(x, y, geom):
+    """Vectorized point-in-polygon without allocating Shapely Point objects."""
+    import shapely
+
+    if hasattr(shapely, "intersects_xy"):
+        return np.asarray(shapely.intersects_xy(geom, x, y), dtype=bool)
+    return np.asarray(shapely.contains_xy(geom, x, y), dtype=bool)
+
+
+def _target_buffer_geom(
+    counties: gpd.GeoDataFrame,
+    wanted: set[str],
+    buffer_m: float,
+    equal_area_crs: str,
+):
+    """Union of *wanted* states, buffered by *buffer_m* meters in Albers."""
+    key = (tuple(sorted(wanted)), float(buffer_m), equal_area_crs)
+    cached = _BUFFER_GEOM_CACHE.get(key)
+    if cached is not None:
+        return cached
+    state_col = counties["state_fips"].astype(str).str.zfill(2)
+    target = counties.loc[state_col.isin(wanted)]
+    if target.empty:
+        _BUFFER_GEOM_CACHE[key] = None
+        return None
+    geom = target.to_crs(equal_area_crs).geometry.union_all().buffer(float(buffer_m))
     try:
-        joined = gpd.sjoin(gdf, counties_use, how="left", predicate="intersects")
+        import shapely
+
+        shapely.prepare(geom)
     except Exception:
-        cents = gdf.copy()
-        cents.geometry = cents.geometry.centroid
-        joined = gpd.sjoin(cents, counties_use, how="left", predicate="within")
+        pass
+    _BUFFER_GEOM_CACHE[key] = geom
+    return geom
 
-    # Largest-area county wins when a hex intersects multiple counties.
-    joined = joined.reset_index(names="_hex_i")
-    if "index_right" in joined.columns and joined["h3"].duplicated().any():
-        areas = []
-        hex_geoms = gdf.geometry
-        county_geoms = counties_use.geometry
-        for _, row in joined.iterrows():
-            right = row.get("index_right")
-            hi = int(row["_hex_i"])
-            if pd.isna(right):
-                areas.append(0.0)
-                continue
-            try:
-                inter = hex_geoms.iloc[hi].intersection(county_geoms.iloc[int(right)])
-                areas.append(float(inter.area) if not inter.is_empty else 0.0)
-            except Exception:
-                areas.append(0.0)
-        joined = joined.assign(_area=areas)
-        joined = joined.sort_values("_area", ascending=False).drop_duplicates(
-            subset=["h3"], keep="first"
-        )
-        joined = joined.drop(columns=["_area"], errors="ignore")
-    else:
+
+def _tidy_sjoin(joined: gpd.GeoDataFrame) -> pd.DataFrame:
+    """Keep one row per h3 and the county attribute columns."""
+    if joined.empty:
+        return pd.DataFrame(columns=["h3", "county_geoid", "county_name", "state_fips"])
+    if "h3" in joined.columns and joined["h3"].duplicated().any():
         joined = joined.drop_duplicates(subset=["h3"], keep="first")
-    joined = joined.drop(columns=["_hex_i"], errors="ignore")
-
     joined = joined.drop(columns=["index_right", "geometry"], errors="ignore")
     for col in ["county_geoid", "county_name", "state_fips"]:
         right = f"{col}_right"
@@ -311,15 +302,112 @@ def assign_counties(
             joined = joined.drop(columns=[right], errors="ignore")
         elif col not in joined.columns:
             joined[col] = None
-    # Drop any remaining join suffixes.
     drop_cols = [c for c in joined.columns if c.endswith("_left") or c.endswith("_right")]
     if drop_cols:
         joined = joined.drop(columns=drop_cols, errors="ignore")
-    keep_cols = ["h3", "signal_dbm", "county_geoid", "county_name", "state_fips"]
+    keep_cols = ["h3", "county_geoid", "county_name", "state_fips"]
     for c in keep_cols:
         if c not in joined.columns:
             joined[c] = None
     return pd.DataFrame(joined[keep_cols]).reset_index(drop=True)
+
+
+def assign_counties(
+    hex_df: pd.DataFrame,
+    counties: gpd.GeoDataFrame,
+    *,
+    clip_to_states=None,
+    buffer_m: float = 50_000.0,
+    equal_area_crs: str = "EPSG:5070",
+) -> pd.DataFrame:
+    """Attach county attributes via hex **centroid** point-in-polygon.
+
+    Matches ``docs/validation_benchmark.md``: a hex belongs to the county that
+    contains its center. Res-9 cells are ~0.1 km², so this agrees with
+    largest-area polygon overlap except on the thin county-boundary fringe.
+
+    The previous implementation built a Shapely polygon for every hex, reprojected
+    millions of vertices, ``sjoin``-intersected counties, then scored overlaps
+    with Python ``iterrows`` — that path dominated national overnight runtime
+    (hours per provider×service). Centroids + a vectorized spatial join are the
+    same county tags for scoring, at point-in-polygon cost.
+
+    When *clip_to_states* is set, hexes whose centroids fall outside a
+    *buffer_m* fringe of those states are dropped. With a 50 km buffer the
+    centroid-vs-polygon difference is ~one hex (~0.2 km) and is ignored.
+    """
+    if hex_df.empty:
+        return hex_df.assign(county_geoid=None, county_name=None, state_fips=None)
+
+    t0 = time.monotonic()
+    base = hex_df[["h3", "signal_dbm"]].copy()
+    base["h3"] = base["h3"].astype(str)
+    unique_cells = base["h3"].drop_duplicates().tolist()
+    cells, lats, lngs = _cells_to_latlng(unique_cells)
+    if not cells:
+        return pd.DataFrame(columns=[
+            "h3", "signal_dbm", "county_geoid", "county_name", "state_fips",
+        ])
+
+    n_before_clip = len(cells)
+    if clip_to_states not in (None, "all") and clip_to_states:
+        wanted = {str(s).zfill(2) for s in clip_to_states}
+        geom = _target_buffer_geom(counties, wanted, float(buffer_m), equal_area_crs)
+        if geom is not None:
+            x, y = _albers_xy(lngs, lats, equal_area_crs)
+            keep = _points_in_geom(x, y, geom)
+            if not bool(keep.all()):
+                cells = [c for c, k in zip(cells, keep) if k]
+                lats = lats[keep]
+                lngs = lngs[keep]
+                log.info(
+                    "  clipped hexes to target buffer: %s -> %s (states=%s)",
+                    f"{n_before_clip:,}", f"{len(cells):,}", ",".join(sorted(wanted)),
+                )
+            if not cells:
+                return pd.DataFrame(columns=[
+                    "h3", "signal_dbm", "county_geoid", "county_name", "state_fips",
+                ])
+
+    pts = gpd.GeoDataFrame(
+        {"h3": cells},
+        geometry=gpd.points_from_xy(lngs, lats),
+        crs="EPSG:4326",
+    )
+    counties_use = counties[["county_geoid", "county_name", "state_fips", "geometry"]].copy()
+    counties_use = counties_use.reset_index(drop=True)
+    try:
+        joined = gpd.sjoin(pts, counties_use, how="left", predicate="within")
+    except Exception:
+        joined = gpd.sjoin(pts, counties_use, how="left", predicate="intersects")
+    tagged = _tidy_sjoin(joined)
+
+    # Coastal / water-gap centroids: retry remaining misses with intersects.
+    missing = tagged["county_geoid"].isna()
+    if bool(missing.any()):
+        miss_ids = set(tagged.loc[missing, "h3"].astype(str))
+        miss_pts = pts[pts["h3"].astype(str).isin(miss_ids)]
+        if not miss_pts.empty:
+            try:
+                hit = gpd.sjoin(miss_pts, counties_use, how="left", predicate="intersects")
+            except Exception:
+                hit = miss_pts.assign(county_geoid=None, county_name=None, state_fips=None)
+            hit_tagged = _tidy_sjoin(hit)
+            tagged = pd.concat(
+                [tagged.loc[~missing], hit_tagged],
+                ignore_index=True,
+            )
+            tagged = tagged.drop_duplicates(subset=["h3"], keep="first")
+
+    how = "inner" if (clip_to_states not in (None, "all") and clip_to_states) else "left"
+    out = base.merge(tagged, on="h3", how=how)
+    elapsed = time.monotonic() - t0
+    if n_before_clip >= 100_000 or elapsed >= 2.0:
+        log.info(
+            "  assigned counties for %s hexes in %.1fs",
+            f"{len(out):,}", elapsed,
+        )
+    return out.reset_index(drop=True)
 
 
 def filter_counties_to_states(counties: gpd.GeoDataFrame, states) -> gpd.GeoDataFrame:
@@ -346,28 +434,23 @@ def clip_hexes_to_target_buffer(
     if hex_df.empty or target_states == "all" or not target_states:
         return hex_df
     wanted = {str(s).zfill(2) for s in target_states}
-    state_col = counties["state_fips"].astype(str).str.zfill(2)
-    target = counties.loc[state_col.isin(wanted)]
-    if target.empty:
+    geom = _target_buffer_geom(counties, wanted, float(buffer_m), equal_area_crs)
+    if geom is None:
         return hex_df
-    import numpy as np
 
-    geom = target.to_crs(equal_area_crs).geometry.union_all().buffer(float(buffer_m))
     cell_ids = hex_df["h3"].astype(str).tolist()
-    lats = np.empty(len(cell_ids), dtype=float)
-    lngs = np.empty(len(cell_ids), dtype=float)
-    for i, c in enumerate(cell_ids):
-        lat, lng = h3.cell_to_latlng(c)
-        lats[i] = lat
-        lngs[i] = lng
-    pts = gpd.GeoSeries(
-        gpd.points_from_xy(lngs, lats),
-        crs="EPSG:4326",
-    ).to_crs(equal_area_crs)
-    keep = pts.intersects(geom)
+    cells, lats, lngs = _cells_to_latlng(cell_ids)
+    if len(cells) != len(cell_ids):
+        # Invalid cells dropped from latlng; keep original row alignment via mask.
+        valid = set(cells)
+        hex_df = hex_df.loc[hex_df["h3"].astype(str).isin(valid)].reset_index(drop=True)
+        cell_ids = hex_df["h3"].astype(str).tolist()
+        cells, lats, lngs = _cells_to_latlng(cell_ids)
+    x, y = _albers_xy(lngs, lats, equal_area_crs)
+    keep = _points_in_geom(x, y, geom)
     if bool(keep.all()):
         return hex_df
-    out = hex_df.loc[keep.to_numpy()].reset_index(drop=True)
+    out = hex_df.iloc[np.flatnonzero(keep)].reset_index(drop=True)
     log.info(
         "  clipped hexes to target buffer: %s -> %s (states=%s)",
         f"{len(hex_df):,}", f"{len(out):,}", ",".join(sorted(wanted)),
@@ -500,12 +583,12 @@ def normalize_layers(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Normalize one (provider, service) file into BOTH resolutions in one pass.
 
-    Polyfilling polygons to H3 is the pipeline's most expensive step. Instead of
-    indexing the source twice (once per resolution), we polyfill once at the finer
-    ``site_res`` and derive the coarser ``county_res`` table by rolling each fine
-    cell up to its H3 parent (strongest signal wins). County tags are still
-    assigned per resolution via centroid point-in-polygon, so semantics are
-    unchanged. Each resolution caches to parquet for instant resumes.
+    Polyfilling polygons to H3 is the pipeline's most expensive step for the
+    ``fcc`` (shapefile) backend. Instead of indexing the source twice (once per
+    resolution), we polyfill once at the finer ``site_res`` and derive the
+    coarser ``county_res`` table by rolling each fine cell up to its H3 parent.
+    County tags are assigned via centroid point-in-polygon. Each resolution
+    caches to parquet for instant resumes.
 
     Returns ``(county_res_df, site_res_df)``.
     """

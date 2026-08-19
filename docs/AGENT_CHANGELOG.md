@@ -5,6 +5,40 @@ changed, why, and what was verified. Append new dated sections at the top.
 
 ---
 
+## 2026-08-19 — Normalize county-tag was the overnight bottleneck
+
+### Why
+
+National overnight logs showed **normalize = 98–99% of each provider×service
+unit** (1.3–4.0 hours; Verizon 4G LTE 14,308s). Change/towers/attr were
+10–95s. Root cause: `assign_counties` built a Shapely polygon for every H3
+cell (millions), reprojected vertices to Albers for the 50 km clip, then
+`sjoin(intersects)` + Python `iterrows()` intersection-area to break ties.
+Redshift input is already hex centroids; methodology already says centroid
+assignment.
+
+### What changed
+
+- `assign_counties` / `clip_hexes_to_target_buffer`: vectorized centroid
+  lat/lng → Albers `intersects_xy` clip → `sjoin(within)`. Cache the
+  state-buffer polygon per worker. Unmatched (coastal) centroids retry
+  `intersects`.
+- Tests: `tests/test_normalize.py`.
+
+### Verify
+
+```bash
+PYTHONPATH=src pytest tests/test_normalize.py tests/test_pipeline.py -q
+```
+
+On the FCC laptop, copy `src/fcc_audit/normalize.py` (and the NaN-tower
+`explain.py` / `cli.py` fix if that tree still crashes after hours). Existing
+`data/interim/hex_*.parquet` caches skip this path; remaining batches pick it
+up automatically. Optional: delete interim hex caches to retag border hexes
+with centroids.
+
+---
+
 ## 2026-08-19 — Overnight crash on NaN tower counts
 
 ### Why
