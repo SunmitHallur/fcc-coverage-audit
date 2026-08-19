@@ -5,6 +5,33 @@ changed, why, and what was verified. Append new dated sections at the top.
 
 ---
 
+## 2026-08-19 — Gaming detection: ASR snap, fewer false flags
+
+### Why
+
+Engineer slides (Pearl River / Middlesex selected; Edmunds / Menard not) are
+June→December *change physics*, not a frozen county list — providers may have
+resubmitted. Reviewers would rather miss some gaming than chase false flags.
+Missing ASR is not a census (rooftops). Inferred pins should land on a mast
+when one is nearby.
+
+### What changed
+
+- `anchor_sites_to_asr` snaps a pin onto ASR within 500 m and collapses
+  multiple peaks that hit the same structure. 2 km is match-only, not snap.
+- `asr_no_new_structure` weight 0 — absence of a registration does not flag.
+- Same-site implausibility no longer uses unattributed share (inference misses
+  were 100% unattributed). Flag percentile 0.95 (was 0.90).
+- Tests encode slide physics, not “these FIPS must still be flagged.”
+
+### Verify
+
+```bash
+PYTHONPATH=src pytest tests/test_gaming_patterns.py tests/test_attribute.py tests/test_score.py tests/test_towers.py -q
+```
+
+---
+
 ## 2026-08-19 — Tower inference QA round 2 (T2/T3 + eval gate)
 
 ### Why

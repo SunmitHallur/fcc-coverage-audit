@@ -628,6 +628,7 @@ def build_county_detail(
                 hit = by_coord.get((round(float(s["lat"]), 5), round(float(s["lng"]), 5)))
                 if hit is not None:
                     s["asr_matched"] = bool(hit.get("asr_matched", False))
+                    s["asr_snapped"] = bool(hit.get("asr_snapped", False))
                     dist = hit.get("asr_distance_m")
                     s["asr_distance_m"] = (
                         float(dist) if dist is not None and math.isfinite(float(dist)) else None

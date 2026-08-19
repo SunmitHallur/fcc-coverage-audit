@@ -196,10 +196,9 @@ def score(features: pd.DataFrame, cfg: Config) -> pd.DataFrame:
         f: _bounded_feature(df[f], ranges.get(f, 1.0)) for f in present
     })
     total_abs_weight = sum(abs(float(weights[f])) for f in present)
-    # Normalize by the actual weight mass so the score spans [0, 1] when all
-    # calibrated features fire at full strength. (Previously max(1.0, …) was a
-    # no-op when weights summed to <1 and left scores trapped near ~0.3.)
-    denominator = max(total_abs_weight, _EPS)
+    # Keep at least 1.0 so dropping a disabled weight (e.g. ASR=0) cannot
+    # inflate another feature past the 0.25 cap.
+    denominator = max(total_abs_weight, 1.0)
     risk = pd.Series(0.0, index=df.index)
     for feature in present:
         weight = float(weights[feature])

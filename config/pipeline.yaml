@@ -180,7 +180,7 @@ reconcile:
 # ---------------------------------------------------------------------------
 scoring:
   # A county-provider is "flagged" if its anomaly percentile is at/above this.
-  flag_percentile: 0.90
+  flag_percentile: 0.95
   # Fraction of new coverage attributed to SAME existing sites above which the
   # same-site growth signal fires. Must ALSO be paired with an implausibility
   # gate (below) — high same-site share alone is normal 6-month growth.
@@ -190,7 +190,10 @@ scoring:
   # single-tower expansions (antenna/carrier upgrades, modest lobe growth).
   suspicious_same_site_min_county_frac: 0.05   # added_frac_of_county threshold
   suspicious_same_site_min_blanket: 0.20        # blanket_fillin threshold
-  suspicious_same_site_min_unattributed: 0.20   # unattributed_share threshold
+  # Disabled as a flag gate: inference misses look like 100% unattributed
+  # and were minting false "coverage from nowhere" reviews. Unattributed
+  # remains a score feature only.
+  suspicious_same_site_min_unattributed: 1.01
   # Magnitude gate (learned from FCC examples): a county must add at least this
   # much in-county 5G coverage to be eligible for flagging. Prevents flagging
   # near-empty counties (e.g. Edmunds, SD) or non-area-increasing signal shifts
@@ -225,7 +228,9 @@ scoring:
     # signal_jump_implausibility: 0.0   # available; off (Menard-type degradation ignored)
     # historical_volatility: 0.10       # enable once >2 vintages are processed
     # --- independent ground-truth corroboration ---
-    asr_no_new_structure: 0.12        # no registered structure built in window
+    # 0: missing ASR is not a census of rooftops/small cells and must not
+    # flag a county that otherwise looks like ordinary growth.
+    asr_no_new_structure: 0.0
     # measurement_gap: 0.10             # coverage claimed but nobody measured it
 
 # ---------------------------------------------------------------------------
@@ -236,6 +241,9 @@ groundtruth:
     enabled: true
     cache_dir: "data/groundtruth/asr"
     site_match_radius_m: 2000
+    # Move inferred pins onto the mast when uniquely this close. Wider than
+    # this is recorded as asr_matched but not snapped (urban macros ~1 km).
+    site_snap_radius_m: 500
     # Map Redshift process/build ids (and filing labels) to calendar dates for
     # the ASR construction window. Filing labels pass through as-is.
     vintage_dates:

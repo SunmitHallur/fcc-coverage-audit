@@ -155,7 +155,7 @@ scoring:
 ### 5c. Ground truth amplification
 
 When ASR and/or measured coverage data is available, the anomaly features include:
-- `asr_no_new_structure` (weight 0.12): the combination of large growth + no registered tower construction is a strong signal.
+- `asr_no_new_structure` (weight 0.0): missing ASR is not a census of rooftops/small cells and does not flag a county by itself. When a registered mast is within 500 m, inferred pins snap onto it.
 - `measurement_gap` (weight 0.10): coverage claimed but not observed in field data is suspicious.
 
 These do **not** independently flag a county — they amplify the score of an already-anomalous filing.
@@ -166,13 +166,13 @@ These do **not** independently flag a county — they amplify the score of an al
 
 | Parameter | Default | Rationale |
 |-----------|---------|-----------|
-| `flag_percentile` | 0.90 | Top 10% of anomaly scores; keeps false-positive rate manageable for a small review team |
+| `flag_percentile` | 0.95 | Top 5% of anomaly scores; prefer missing some gaming over sending reviewers on false flags |
 | `min_added_km2_to_flag` | 10.0 km² | Ignore trivial / near-empty county changes (FCC-validated) |
 | `suspicious_same_site_growth` | 0.50 | 50% same-site share is not itself suspicious; only the combination matters |
 | `min_site_hexes` | 35 (at H3 res 9) | ~3.7 km² minimum blob to infer a site at res 9; prevents noise |
 | `peak_separation_m` | 500 | Minimum spacing between accepted *signal* peaks within one footprint (NMS); independent of cross-vintage match. Depth NMS on blobs ≥4000 hexes uses 2 km so county-scale fill does not tile at 500 m |
 | `site_match_radius_m` | 2000 | Cross-vintage site identity match radius |
-| Feature weight: `asr_no_new_structure` | 0.12 | Active when ASR labels merge successfully; soft-disabled if ASR fetch fails |
+| Feature weight: `asr_no_new_structure` | 0.0 | Disabled as a score driver; ASR is used to snap nearby pins, not to flag |
 
 ---
 

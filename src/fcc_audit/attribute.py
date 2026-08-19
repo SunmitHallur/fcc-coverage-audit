@@ -274,24 +274,34 @@ def anchor_sites_to_asr(
     sites: pd.DataFrame,
     asr_structures: pd.DataFrame,
     radius_m: float = 2000.0,
+    snap_radius_m: float = 500.0,
 ) -> pd.DataFrame:
-    """Spatially join inferred sites to ASR registered structures.
+    """Join inferred sites to ASR structures and snap pins onto nearby masts.
 
-    Adds ``asr_matched`` (bool) and ``asr_distance_m`` (float). ASR rows need
-    ``lat`` / ``lng`` columns (from :func:`groundtruth_asr._load_or_build_asr_df`).
+    Within ``snap_radius_m``, the site coordinate is replaced by the ASR
+    lat/lng so reviewer pins land on the registered structure. Multiple
+    inferred peaks that snap to the *same* ASR (cloverleaf petals, 500 m
+    NMS splits of one compound) collapse to one site. Matches between
+    snap and ``radius_m`` are recorded but not moved — 2 km is too wide
+    to steal a pin from a neighboring urban macro.
+
+    Adds ``asr_matched`` / ``asr_distance_m`` / ``asr_snapped``. ASR rows
+    need ``lat`` / ``lng``.
     """
-    out = sites.copy()
+    out = sites.reset_index(drop=True).copy()
     if out.empty:
-        out["asr_matched"] = []
-        out["asr_distance_m"] = []
+        out["asr_matched"] = False
+        out["asr_distance_m"] = np.nan
+        out["asr_snapped"] = False
         return out
     out["asr_matched"] = False
     out["asr_distance_m"] = np.nan
+    out["asr_snapped"] = False
     if asr_structures is None or asr_structures.empty:
         return out
     if "lat" not in asr_structures.columns or "lng" not in asr_structures.columns:
         return out
-    asr = asr_structures.dropna(subset=["lat", "lng"]).copy()
+    asr = asr_structures.dropna(subset=["lat", "lng"]).reset_index(drop=True)
     if asr.empty:
         return out
     xs_a, ys_a = _FWD.transform(asr["lng"].to_numpy(dtype=float), asr["lat"].to_numpy(dtype=float))
@@ -300,10 +310,44 @@ def anchor_sites_to_asr(
         xs, ys = _FWD.transform(out["lng"].to_numpy(dtype=float), out["lat"].to_numpy(dtype=float))
         out["x_m"] = xs
         out["y_m"] = ys
-    dist, _ = tree.query(out[["x_m", "y_m"]].to_numpy(dtype=float), k=1)
-    matched = dist <= float(radius_m)
+    dist, idx = tree.query(out[["x_m", "y_m"]].to_numpy(dtype=float), k=1)
+    dist = np.asarray(dist, dtype=float)
+    idx = np.asarray(idx, dtype=int)
+    snap_m = float(snap_radius_m)
+    match_m = max(float(radius_m), snap_m)
+    matched = dist <= match_m
+    snapped = dist <= snap_m
     out["asr_matched"] = matched
     out["asr_distance_m"] = np.where(matched, dist, np.nan)
+    out["asr_snapped"] = snapped
+    if not snapped.any():
+        return out
+
+    asr_lat = asr["lat"].to_numpy(dtype=float)
+    asr_lng = asr["lng"].to_numpy(dtype=float)
+    snap_rows = np.flatnonzero(snapped)
+    out.loc[out.index[snap_rows], "lat"] = asr_lat[idx[snap_rows]]
+    out.loc[out.index[snap_rows], "lng"] = asr_lng[idx[snap_rows]]
+    xs_s, ys_s = _FWD.transform(
+        out.loc[out.index[snap_rows], "lng"].to_numpy(dtype=float),
+        out.loc[out.index[snap_rows], "lat"].to_numpy(dtype=float),
+    )
+    out.loc[out.index[snap_rows], "x_m"] = xs_s
+    out.loc[out.index[snap_rows], "y_m"] = ys_s
+
+    # Collapse peaks that landed on the same mast. Keep the largest lobe.
+    asr_key = np.full(len(out), -1, dtype=int)
+    asr_key[snap_rows] = idx[snap_rows]
+    out["_asr_key"] = asr_key
+    keep_idx = []
+    n_hex = out["n_hexes"].to_numpy(dtype=float) if "n_hexes" in out.columns else np.ones(len(out))
+    for key, grp in out.reset_index().groupby("_asr_key", sort=False):
+        if int(key) < 0:
+            keep_idx.extend(grp["index"].tolist())
+            continue
+        best = int(grp.iloc[int(np.argmax(n_hex[grp["index"].to_numpy()]))]["index"])
+        keep_idx.append(best)
+    out = out.loc[keep_idx].drop(columns=["_asr_key"]).reset_index(drop=True)
     return out
 
 
