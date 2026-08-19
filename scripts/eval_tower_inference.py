@@ -5,6 +5,7 @@ Downloads are expected under data/raw/<vintage>/<provider_id>/ already
 """
 from __future__ import annotations
 
+import argparse
 import h3
 import json
 import logging
@@ -42,6 +43,22 @@ COUNTIES = [
     ("20161", "Riley, KS"),
     ("49005", "Cache, UT"),
 ]
+# Locations used by the synthetic gate (must not be only the unit-test point).
+SYNTH_LOCS = [
+    ("unit_ks", 38.50, -98.50),
+    ("atlanta", 33.75, -84.39),
+    ("seattle", 47.61, -122.33),
+    ("manhattan_ks", 39.18, -96.57),
+    ("newark", 40.74, -74.17),
+    ("monroe_la", 32.51, -92.12),
+    ("logan_ut", 41.74, -111.83),
+    ("wichita", 37.69, -97.34),
+]
+# Regression floors for 8-county signal-mode (cell-like ASR). These are
+# "do not get worse than the post-T1–T4 report", not a 25% pin-accuracy claim.
+GATE_MEDIAN_PREC_250 = 0.05
+GATE_MEDIAN_PREC_500 = 0.10
+GATE_MAX_CLOSE_PAIR_COLLAPSE = 0.65
 ASR_MATCH_M = 2000.0
 ASR_RADII_M = (250.0, 500.0, 1000.0, 2000.0)
 CELLISH_TYPES = {"TOWER", "MTOWER", "LTOWER", "POLE", "MAST", "GTOWER", "BANT"}
@@ -65,6 +82,31 @@ def _match(src: np.ndarray, dst: np.ndarray, radius_m: float) -> tuple[np.ndarra
     dist, _ = tree.query(src, k=1)
     dist = np.asarray(dist, dtype=float)
     return dist, dist <= radius_m
+
+
+def _close_pair_collapse(
+    asr_xy: np.ndarray,
+    site_xy: np.ndarray,
+    pair_radius_m: float = ASR_MATCH_M,
+) -> dict:
+    """Share of ASR pairs closer than ``pair_radius_m`` that share a nearest site."""
+    n = len(asr_xy)
+    if n < 2 or len(site_xy) == 0:
+        return {"n_pairs": 0, "n_collapsed": 0, "rate": None}
+    tree_asr = cKDTree(asr_xy)
+    pairs = tree_asr.query_pairs(pair_radius_m)
+    if not pairs:
+        return {"n_pairs": 0, "n_collapsed": 0, "rate": None}
+    tree_s = cKDTree(site_xy)
+    _, nn = tree_s.query(asr_xy, k=1)
+    nn = np.asarray(nn, dtype=int)
+    collapsed = sum(1 for i, j in pairs if nn[i] == nn[j])
+    n_pairs = len(pairs)
+    return {
+        "n_pairs": int(n_pairs),
+        "n_collapsed": int(collapsed),
+        "rate": float(collapsed / n_pairs),
+    }
 
 
 def _match_at_radii(
@@ -247,6 +289,7 @@ def evaluate_county(
         rec_all = _match_at_radii(asr_xy, sxy)
         prec_cell = _match_at_radii(sxy, asr_cell_xy)
         rec_cell = _match_at_radii(asr_cell_xy, sxy)
+        collapse = _close_pair_collapse(asr_cell_xy, sxy)
 
         lobes = _lobe_counts(sites, work)
         provider_rows.append({
@@ -262,6 +305,7 @@ def evaluate_county(
             "recall_by_radius_m": {k: v["rate"] for k, v in rec_all.items()},
             "cellish_precision_by_radius_m": {k: v["rate"] for k, v in prec_cell.items()},
             "cellish_recall_by_radius_m": {k: v["rate"] for k, v in rec_cell.items()},
+            "close_pair_collapse": collapse,
             "lobes": lobes,
         })
 
@@ -300,6 +344,11 @@ def evaluate_county(
 
     shared = _shared_clusters(sites_by_pid)
     n_sites_total = int(sum(r["n_sites"] for r in provider_rows))
+    if not all_sites.empty:
+        all_xy = _xy(all_sites["lat"], all_sites["lng"])
+        county_collapse = _close_pair_collapse(asr_cell_xy, all_xy)
+    else:
+        county_collapse = {"n_pairs": 0, "n_collapsed": 0, "rate": None}
     return {
         "geoid": geoid,
         "county": name,
@@ -311,81 +360,233 @@ def evaluate_county(
         "n_sites_all_providers": n_sites_total,
         "asr_recall_in_footprint": footprint_recall,
         "cellish_recall_in_footprint": cellish_footprint_recall,
+        "close_pair_collapse": county_collapse,
         "shared": shared,
         "providers": provider_rows,
     }
 
 
-def main() -> int:
+def _petal_cloverleaf_hex(lat: float, lng: float) -> pd.DataFrame:
+    hub = h3.latlng_to_cell(lat, lng, 9)
+    cells = set(h3.grid_disk(hub, 4))
+    origins = []
+    for ang in (0.0, 120.0, 240.0):
+        dlat = (4.0 / 110.57) * np.cos(np.radians(ang))
+        dlng = (4.0 / (111.32 * np.cos(np.radians(lat)))) * np.sin(np.radians(ang))
+        origin = h3.latlng_to_cell(lat + dlat, lng + dlng, 9)
+        origins.append(origin)
+        cells |= set(h3.grid_disk(origin, 10))
+    rows = []
+    for c in cells:
+        d_pet = min(h3.grid_distance(o, c) for o in origins)
+        rows.append({"h3": c, "signal_dbm": -78.0 - 2.5 * d_pet, "county_geoid": "20001"})
+    return pd.DataFrame(rows)
+
+
+def _signal_pair_hex(lat: float, lng: float, sep_km: float, ring: int = 10) -> pd.DataFrame:
+    t1 = (lat, lng)
+    t2 = (lat, lng + sep_km / (111.32 * np.cos(np.radians(lat))))
+    rows = []
+    for la, lo in (t1, t2):
+        origin = h3.latlng_to_cell(la, lo, 9)
+        for c in h3.grid_disk(origin, ring):
+            d = h3.grid_distance(origin, c)
+            rows.append({"h3": c, "signal_dbm": -80.0 - 2.0 * d, "county_geoid": "20001"})
+    return pd.DataFrame(rows).sort_values("signal_dbm", ascending=False).drop_duplicates("h3")
+
+
+def run_synthetic_gates(cfg) -> dict:
+    """Location-general T2/T3 checks that do not need coverage zips."""
+    cfg.raw["geography"]["site_h3_resolution"] = 9
+    t2 = []
+    for name, lat, lng in SYNTH_LOCS:
+        n = int(len(infer_sites(_petal_cloverleaf_hex(lat, lng), cfg, "T")))
+        t2.append({"location": name, "n_sites": n, "ok": n == 1})
+    t3 = []
+    for sep in (0.4, 0.8, 1.6):
+        expect = 1 if sep < 0.6 else 2
+        for name, lat, lng in SYNTH_LOCS:
+            n = int(len(infer_sites(_signal_pair_hex(lat, lng, sep), cfg, "T")))
+            t3.append({
+                "location": name, "sep_km": sep, "n_sites": n,
+                "ok": n == expect,
+            })
+    t2_pass = sum(1 for r in t2 if r["ok"])
+    t3_08 = sum(1 for r in t3 if r["sep_km"] == 0.8 and r["ok"])
+    t3_16 = sum(1 for r in t3 if r["sep_km"] == 1.6 and r["ok"])
+    t3_04 = sum(1 for r in t3 if r["sep_km"] == 0.4 and r["ok"])
+    failures = []
+    if t2_pass < len(SYNTH_LOCS):
+        failures.append(f"T2 cloverleaf {t2_pass}/{len(SYNTH_LOCS)} merge to 1 site")
+    if t3_08 < len(SYNTH_LOCS):
+        failures.append(f"T3 0.8 km {t3_08}/{len(SYNTH_LOCS)} split to 2 sites")
+    if t3_16 < len(SYNTH_LOCS):
+        failures.append(f"T3 1.6 km {t3_16}/{len(SYNTH_LOCS)} split to 2 sites")
+    return {
+        "t2": t2,
+        "t3": t3,
+        "t2_pass": t2_pass,
+        "t3_0p8_pass": t3_08,
+        "t3_1p6_pass": t3_16,
+        "t3_0p4_stay_one": t3_04,
+        "n_locs": len(SYNTH_LOCS),
+        "failures": failures,
+        "ok": not failures,
+    }
+
+
+def _gate_county_reports(reports: list[dict]) -> list[str]:
+    """Fail on 250/500 m cellish precision and close-pair collapse, not 2 km recall."""
+    sig = [r for r in reports if r.get("mode") == "signal"]
+    if not sig:
+        return ["no signal-mode county rows to gate"]
+    prec250, prec500, collapse = [], [], []
+    for r in sig:
+        if r.get("close_pair_collapse") and r["close_pair_collapse"].get("rate") is not None:
+            collapse.append(r["close_pair_collapse"]["rate"])
+        for p in r.get("providers") or []:
+            c250 = (p.get("cellish_precision_by_radius_m") or {}).get("250")
+            c500 = (p.get("cellish_precision_by_radius_m") or {}).get("500")
+            if c250 is not None:
+                prec250.append(c250)
+            if c500 is not None:
+                prec500.append(c500)
+    fails = []
+    if prec250:
+        med = float(np.median(prec250))
+        if med < GATE_MEDIAN_PREC_250:
+            fails.append(
+                f"median cellish 250 m precision {med:.3f} < {GATE_MEDIAN_PREC_250}"
+            )
+    else:
+        fails.append("no 250 m cellish precision values")
+    if prec500:
+        med = float(np.median(prec500))
+        if med < GATE_MEDIAN_PREC_500:
+            fails.append(
+                f"median cellish 500 m precision {med:.3f} < {GATE_MEDIAN_PREC_500}"
+            )
+    if collapse:
+        med = float(np.median(collapse))
+        if med > GATE_MAX_CLOSE_PAIR_COLLAPSE:
+            fails.append(
+                f"median close-pair collapse {med:.3f} > {GATE_MAX_CLOSE_PAIR_COLLAPSE}"
+            )
+    return fails
+
+
+def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+    parser = argparse.ArgumentParser(description="Tower-inference eval + gate")
+    parser.add_argument(
+        "--synthetics-only", action="store_true",
+        help="Run T2/T3 location synthetics only (no coverage zips).",
+    )
+    parser.add_argument(
+        "--gate", action="store_true",
+        help="Exit 1 if synthetic or 250/500 m / collapse thresholds fail.",
+    )
+    args = parser.parse_args(argv)
+
     cfg = load_config()
     cfg.raw["geography"]["site_h3_resolution"] = 9
-    raw_root = cfg.path("raw") / VINTAGE
     eval_dir = ROOT / "data" / "eval"
-    hex_dir = eval_dir / "hex"
-    hex_dir.mkdir(parents=True, exist_ok=True)
+    eval_dir.mkdir(parents=True, exist_ok=True)
 
-    counties = load_counties(cfg)
-    asr = load_asr_structures(ROOT / "data" / "groundtruth" / "asr")
-    asr_xy_all = _xy(asr["lat"], asr["lng"]) if not asr.empty else np.empty((0, 2))
+    synth = run_synthetic_gates(cfg)
+    log.info(
+        "synthetics T2=%s/%s T3_0.8=%s/%s T3_1.6=%s/%s",
+        synth["t2_pass"], synth["n_locs"],
+        synth["t3_0p8_pass"], synth["n_locs"],
+        synth["t3_1p6_pass"], synth["n_locs"],
+    )
+    (eval_dir / "tower_inference_synthetics.json").write_text(
+        json.dumps(synth, indent=2)
+    )
 
-    safe = safe_service_name(SERVICE)
-    zip_by_pid: dict[int, dict[str, Path]] = {}
-    for pid, _name in PROVIDERS:
-        zip_by_pid[pid] = {}
-        for geoid, _label in COUNTIES:
-            st = geoid[:2]
-            z = raw_root / str(pid) / f"{safe}_{st}.zip"
-            if not z.exists():
-                raise FileNotFoundError(z)
-            zip_by_pid[pid][st] = z
+    reports: list[dict] = []
+    county_fails: list[str] = []
+    if not args.synthetics_only:
+        raw_root = cfg.path("raw") / VINTAGE
+        hex_dir = eval_dir / "hex"
+        hex_dir.mkdir(parents=True, exist_ok=True)
+        counties = load_counties(cfg)
+        asr = load_asr_structures(ROOT / "data" / "groundtruth" / "asr")
+        safe = safe_service_name(SERVICE)
+        zip_by_pid: dict[int, dict[str, Path]] = {}
+        missing_zips = []
+        for pid, _name in PROVIDERS:
+            zip_by_pid[pid] = {}
+            for geoid, _label in COUNTIES:
+                st = geoid[:2]
+                z = raw_root / str(pid) / f"{safe}_{st}.zip"
+                if not z.exists():
+                    missing_zips.append(str(z))
+                else:
+                    zip_by_pid[pid][st] = z
+        if missing_zips:
+            log.warning("skipping county eval, missing zips: %s", missing_zips[:3])
+        else:
+            for flatten in (True, False):
+                mode = "binary" if flatten else "signal"
+                log.info("=== mode %s ===", mode)
+                for geoid, name in COUNTIES:
+                    row = counties[counties["county_geoid"].astype(str) == geoid]
+                    if row.empty:
+                        log.warning("missing county geom %s", geoid)
+                        continue
+                    geom = row.iloc[0].geometry
+                    asr_c = asr[asr["county_geoid"].astype(str) == geoid]
+                    asr_xy = _xy(asr_c["lat"], asr_c["lng"]) if not asr_c.empty else np.empty((0, 2))
+                    if not asr_c.empty and "structure_type" in asr_c.columns:
+                        asr_cell = asr_c[asr_c["structure_type"].isin(CELLISH_TYPES)]
+                    else:
+                        asr_cell = asr_c
+                    asr_cell_xy = (
+                        _xy(asr_cell["lat"], asr_cell["lng"]) if not asr_cell.empty else np.empty((0, 2))
+                    )
+                    zips = {pid: zip_by_pid[pid][geoid[:2]] for pid, _ in PROVIDERS}
+                    log.info("eval %s %s (%s ASR, %s cellish)", geoid, name, len(asr_c), len(asr_cell))
+                    rec = evaluate_county(
+                        geoid=geoid,
+                        name=name,
+                        county_geom=geom,
+                        asr_xy=asr_xy,
+                        asr_cell_xy=asr_cell_xy,
+                        asr_in_county=asr_c,
+                        cfg=cfg,
+                        zip_by_pid=zips,
+                        cache_dir=hex_dir,
+                        flatten=flatten,
+                    )
+                    rec["mode"] = mode
+                    reports.append(rec)
+                    log.info(
+                        "  sites=%s  ASR-fp recall=%s  collapse=%s",
+                        rec["n_sites_all_providers"],
+                        rec["asr_recall_in_footprint"],
+                        rec.get("close_pair_collapse"),
+                    )
+            out = eval_dir / "tower_inference_report.json"
+            out.write_text(json.dumps(reports, indent=2, default=str))
+            print(json.dumps(reports, indent=2, default=str))
+            print(f"wrote {out}")
+            county_fails = _gate_county_reports(reports)
+    # County 250/500 m + collapse gate only when we actually scored counties.
 
-    reports = []
-    for flatten in (True, False):
-        mode = "binary" if flatten else "signal"
-        log.info("=== mode %s ===", mode)
-        for geoid, name in COUNTIES:
-            row = counties[counties["county_geoid"].astype(str) == geoid]
-            if row.empty:
-                log.warning("missing county geom %s", geoid)
-                continue
-            geom = row.iloc[0].geometry
-            asr_c = asr[asr["county_geoid"].astype(str) == geoid]
-            asr_xy = _xy(asr_c["lat"], asr_c["lng"]) if not asr_c.empty else np.empty((0, 2))
-            if not asr_c.empty and "structure_type" in asr_c.columns:
-                asr_cell = asr_c[asr_c["structure_type"].isin(CELLISH_TYPES)]
-            else:
-                asr_cell = asr_c
-            asr_cell_xy = (
-                _xy(asr_cell["lat"], asr_cell["lng"]) if not asr_cell.empty else np.empty((0, 2))
-            )
-            zips = {pid: zip_by_pid[pid][geoid[:2]] for pid, _ in PROVIDERS}
-            log.info("eval %s %s (%s ASR, %s cellish)", geoid, name, len(asr_c), len(asr_cell))
-            rec = evaluate_county(
-                geoid=geoid,
-                name=name,
-                county_geom=geom,
-                asr_xy=asr_xy,
-                asr_cell_xy=asr_cell_xy,
-                asr_in_county=asr_c,
-                cfg=cfg,
-                zip_by_pid=zips,
-                cache_dir=hex_dir,
-                flatten=flatten,
-            )
-            rec["mode"] = mode
-            reports.append(rec)
-            log.info(
-                "  sites=%s  ASR-fp recall=%s  shared clusters=%s",
-                rec["n_sites_all_providers"],
-                rec["asr_recall_in_footprint"],
-                rec["shared"]["n_clusters_2plus"],
-            )
+    print(json.dumps({"synthetics": {
+        k: synth[k] for k in (
+            "t2_pass", "t3_0p8_pass", "t3_1p6_pass", "t3_0p4_stay_one",
+            "n_locs", "failures", "ok",
+        )
+    }, "county_gate_failures": county_fails}, indent=2))
 
-    out = eval_dir / "tower_inference_report.json"
-    out.write_text(json.dumps(reports, indent=2, default=str))
-    print(json.dumps(reports, indent=2, default=str))
-    print(f"wrote {out}")
+    if args.gate:
+        fails = list(synth["failures"]) + county_fails
+        if fails:
+            log.error("GATE FAIL: %s", "; ".join(fails))
+            return 1
+        log.info("GATE PASS")
     return 0
 
 

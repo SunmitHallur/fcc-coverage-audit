@@ -345,41 +345,74 @@ def test_lobe_reach_skips_projection_for_flat_signal():
     out = compute_lobe_reach(hex_df, sites)
     assert float(out.iloc[0]["lobe_reach_m"]) >= 4000.0 * 2.5
 
-def test_signal_petal_peaked_cloverleaf_is_one_site(cfg):
-    """Directional minsignal peaks in petals must still merge to the hub."""
-    lat, lng = 38.50, -98.50
+SYNTH_LOCS = [
+    ("unit_ks", 38.50, -98.50),
+    ("atlanta", 33.75, -84.39),
+    ("seattle", 47.61, -122.33),
+    ("manhattan_ks", 39.18, -96.57),
+    ("newark", 40.74, -74.17),
+    ("monroe_la", 32.51, -92.12),
+    ("logan_ut", 41.74, -111.83),
+    ("wichita", 37.69, -97.34),
+]
+
+
+def _petal_hex(lat, lng):
     hub = h3.latlng_to_cell(lat, lng, 9)
     cells = set(h3.grid_disk(hub, 4))
-    petal_origins = []
+    origins = []
     for ang in (0.0, 120.0, 240.0):
         dlat = (4.0 / 110.57) * np.cos(np.radians(ang))
         dlng = (4.0 / (111.32 * np.cos(np.radians(lat)))) * np.sin(np.radians(ang))
         origin = h3.latlng_to_cell(lat + dlat, lng + dlng, 9)
-        petal_origins.append(origin)
+        origins.append(origin)
         cells |= set(h3.grid_disk(origin, 10))
     rows = []
     for c in cells:
-        d_pet = min(h3.grid_distance(o, c) for o in petal_origins)
+        d_pet = min(h3.grid_distance(o, c) for o in origins)
         rows.append({"h3": c, "signal_dbm": -78.0 - 2.5 * d_pet, "county_geoid": "20001"})
-    sites = infer_sites(pd.DataFrame(rows), cfg, "T")
-    assert len(sites) == 1, f"petal-peaked cloverleaf split into {len(sites)} sites"
+    return pd.DataFrame(rows)
+
+
+@pytest.mark.parametrize("name,lat,lng", SYNTH_LOCS)
+def test_signal_petal_peaked_cloverleaf_is_one_site_everywhere(cfg, name, lat, lng):
+    """T2: petal-peaked 3-sector must merge at more than the unit-test lat/lng."""
+    sites = infer_sites(_petal_hex(lat, lng), cfg, "T")
+    assert len(sites) == 1, f"{name}: petal cloverleaf split into {len(sites)} sites"
     assert _km_to(sites.iloc[0]["lat"], sites.iloc[0]["lng"], (lat, lng)) < 2.0
 
 
-def test_two_towers_at_0p8_and_1p6_km_stay_split(cfg):
-    """Peak NMS (~800 m) must not collapse macros closer than the 2 km match radius."""
-    for sep_km in (0.8, 1.6):
-        t1 = (38.50, -98.50)
-        t2 = (38.50, -98.50 + sep_km / (111.32 * np.cos(np.radians(38.50))))
-        cells = set()
-        for lat, lng in (t1, t2):
-            cells |= set(h3.grid_disk(h3.latlng_to_cell(lat, lng, 9), 16))
-        df = pd.DataFrame({"h3": sorted(cells), "signal_dbm": 0.0, "county_geoid": "20001"})
-        sites = infer_sites(df, cfg, "T")
-        assert len(sites) == 2, f"{sep_km} km pair collapsed to {len(sites)} site(s)"
-        for s in sites.to_dict("records"):
-            nearest = min(_km_to(s["lat"], s["lng"], t) for t in (t1, t2))
-            assert nearest < 2.0
+@pytest.mark.parametrize("sep_km,expect", [(0.8, 2), (1.6, 2)])
+@pytest.mark.parametrize("name,lat,lng", SYNTH_LOCS)
+def test_signal_close_macros_split_everywhere(cfg, name, lat, lng, sep_km, expect):
+    """T3: 0.8/1.6 km signal-peaked macros split at every US test location."""
+    t2_lng = lng + sep_km / (111.32 * np.cos(np.radians(lat)))
+    rows = []
+    for la, lo in ((lat, lng), (lat, t2_lng)):
+        origin = h3.latlng_to_cell(la, lo, 9)
+        for c in h3.grid_disk(origin, 10):
+            d = h3.grid_distance(origin, c)
+            rows.append({"h3": c, "signal_dbm": -80.0 - 2.0 * d, "county_geoid": "20001"})
+    df = pd.DataFrame(rows).sort_values("signal_dbm", ascending=False).drop_duplicates("h3")
+    sites = infer_sites(df, cfg, "T")
+    assert len(sites) == expect, (
+        f"{name} {sep_km} km: got {len(sites)} sites, expected {expect}"
+    )
+
+
+@pytest.mark.parametrize("name,lat,lng", SYNTH_LOCS)
+def test_signal_sub_cell_pair_does_not_fragment(cfg, name, lat, lng):
+    """0.4 km is inside one/two H3-9 cells; must not mint a third site."""
+    t2_lng = lng + 0.4 / (111.32 * np.cos(np.radians(lat)))
+    rows = []
+    for la, lo in ((lat, lng), (lat, t2_lng)):
+        origin = h3.latlng_to_cell(la, lo, 9)
+        for c in h3.grid_disk(origin, 10):
+            d = h3.grid_distance(origin, c)
+            rows.append({"h3": c, "signal_dbm": -80.0 - 2.0 * d, "county_geoid": "20001"})
+    df = pd.DataFrame(rows).sort_values("signal_dbm", ascending=False).drop_duplicates("h3")
+    sites = infer_sites(df, cfg, "T")
+    assert 1 <= len(sites) <= 2, f"{name} 0.4 km: got {len(sites)} sites"
 
 
 def test_joint_union_prefers_current_signal(cfg):

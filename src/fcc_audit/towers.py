@@ -79,9 +79,15 @@ _CLOVER_MAX_SIDE_M = 10_000.0
 # Signal field is "discriminative" enough to split on local maxima.
 _SIGNAL_SPLIT_RANGE_DB = 5.0
 # Default minimum separation between accepted peaks (meters). Independent of
-# ``site_match_radius_m`` (cross-vintage identity), so urban macros closer
-# than 2 km can still split.
-_MIN_PEAK_SEPARATION_M = 800.0
+# ``site_match_radius_m`` (cross-vintage identity). 500 m is ~1.4 H3-9 cells
+# so 0.8 km urban macros can split after hex snapping; 800 m collapsed them
+# at half of US test locations. Large *depth* plateaus use a wider gate.
+_MIN_PEAK_SEPARATION_M = 500.0
+# Depth-field NMS for huge connected blobs (county-wide fill). 500 m tiling
+# of a saturated interior plateau minted urban fake sites (Sedgwick T-Mobile
+# 24 → 167). Signal maxima still use _MIN_PEAK_SEPARATION_M.
+_LARGE_BLOB_DEPTH_SEP_M = 2000.0
+_LARGE_BLOB_HEXES = 4000
 # Signal-field saddle prominence (dB) for dropping overlap shoulders.
 _MIN_SIGNAL_PROMINENCE_DB = 3.0
 # Binary Redshift footprints can be multi-million-hex mega-blobs; full
@@ -339,7 +345,9 @@ def _n_sector_signature(
     frac = float(occ.mean())
     if n_sectors == 2:
         return starts_occ == 2 and starts_gap == 2 and 0.18 <= frac <= 0.80
-    return starts_occ == 3 and starts_gap == 3 and 0.35 <= frac <= 0.90
+    # 0.28 (not 0.35): Albers-warped petals at some longitudes occupy ~6/18
+    # bins (Logan UT core frac 0.33) while still having three clear gaps.
+    return starts_occ == 3 and starts_gap == 3 and 0.28 <= frac <= 0.90
 
 
 def _three_sector_signature(
@@ -428,6 +436,9 @@ def _merge_cloverleaf_peaks(
     xs: np.ndarray,
     ys: np.ndarray,
     min_separation_m: float,
+    *,
+    core_xs: np.ndarray | None = None,
+    core_ys: np.ndarray | None = None,
 ) -> list[str]:
     """Replace petal-peaks of a 2- or 3-sector site with one site at the hub.
 
@@ -440,6 +451,10 @@ def _merge_cloverleaf_peaks(
     Cloverleaf side lengths are absolute meters (not scaled by peak NMS) so a
     tighter urban peak gate does not shrink the merge window below real petal
     spans (~7 km for 4 km petals at 120°).
+
+    ``xs``/``ys`` are the full footprint (2-sector + far-side test). Weak
+    between-petal hexes fill angular gaps, so 3-sector uses ``core_xs``/
+    ``core_ys`` when given.
     """
     n = len(peaks)
     if n < 2:
@@ -448,6 +463,8 @@ def _merge_cloverleaf_peaks(
     tree = cKDTree(pxy)
     max_side = _CLOVER_MAX_SIDE_M
     min_side = _CLOVER_MIN_SIDE_M
+    tri_xs = core_xs if core_xs is not None else xs
+    tri_ys = core_ys if core_ys is not None else ys
     triples: list[tuple[float, int, int, int, float, float]] = []
     for i in range(n):
         near = [j for j in tree.query_ball_point(pxy[i], max_side) if j > i]
@@ -472,7 +489,9 @@ def _merge_cloverleaf_peaks(
                 radius = float(np.mean([
                     np.hypot(pxy[t][0] - cx, pxy[t][1] - cy) for t in (i, j, k)
                 ]))
-                if not _n_sector_signature(cx, cy, xs, ys, radius * 0.15, radius * 1.40, 3):
+                if not _n_sector_signature(
+                    cx, cy, tri_xs, tri_ys, radius * 0.15, radius * 1.40, 3,
+                ):
                     continue
                 triples.append((radius, i, j, k, float(cx), float(cy)))
     triples.sort(key=lambda t: -t[0])
@@ -568,8 +587,11 @@ def _peaks_for_component(
     use_depth = signal_flat or sig_range < _SIGNAL_SPLIT_RANGE_DB
     if not use_depth:
         score = {c: float(signal_by_cell[c]) for c in comp}
+        # Ignore fringe local maxes: only peaks within 10 dB of the hottest
+        # cell. Two macros both peaked at -80 still both qualify.
+        min_score = float(sigs.max() - 10.0)
         peaks, plat_frac = _find_score_peaks(
-            comp, score, xy_by_cell, peak_sep, min_score=float(sigs.min()),
+            comp, score, xy_by_cell, peak_sep, min_score=min_score,
         )
         if not (plat_frac >= 0.45 and len(peaks) <= 1):
             local_xy = {c: xy_by_cell[c] for c in comp}
@@ -577,8 +599,13 @@ def _peaks_for_component(
                 peaks, score, local_xy, min_prominence=_MIN_SIGNAL_PROMINENCE_DB,
             )
             return peaks, None
+    depth_sep = (
+        max(peak_sep, _LARGE_BLOB_DEPTH_SEP_M)
+        if len(comp) >= _LARGE_BLOB_HEXES
+        else peak_sep
+    )
     depth = _boundary_depth(set(comp))
-    peaks = _find_depth_peaks(comp, depth, xy_by_cell, min_separation_m=peak_sep)
+    peaks = _find_depth_peaks(comp, depth, xy_by_cell, min_separation_m=depth_sep)
     return peaks, depth
 
 
@@ -736,6 +763,8 @@ def infer_sites(
     full_ys = np.array([xy_by_cell[c][1] for c in full_cells], dtype=float)
 
     if len(all_peaks) >= 2:
+        core_xs = np.array([xy_by_cell[c][0] for c in cell_list], dtype=float)
+        core_ys = np.array([xy_by_cell[c][1] for c in cell_list], dtype=float)
         merged_peaks = _merge_cloverleaf_peaks(
             list(dict.fromkeys(all_peaks)),
             xy_by_cell,
@@ -743,6 +772,8 @@ def infer_sites(
             full_xs,
             full_ys,
             peak_sep,
+            core_xs=core_xs,
+            core_ys=core_ys,
         )
     else:
         merged_peaks = list(dict.fromkeys(all_peaks))

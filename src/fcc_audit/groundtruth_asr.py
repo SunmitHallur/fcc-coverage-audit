@@ -330,6 +330,36 @@ def _build_county_geoid(state_code: str, county_code: str) -> str | None:
         return None
 
 
+# Bump when RA/CO column map or join key changes so a leftover parquet
+# from a previous parser cannot silently keep ground-elevation heights.
+_ASR_PARSE_VERSION = 2
+_REQUIRED_ASR_COLS = (
+    "unique_id", "lat", "lng", "county_geoid", "status_code",
+    "height_m", "structure_type", "registration_number",
+)
+
+
+def _asr_cache_is_current(parsed_cache: Path, cache_dir: Path) -> bool:
+    """False when parquet is missing, stale relative to RA/CO, or old schema."""
+    if not parsed_cache.exists():
+        return False
+    try:
+        df = pd.read_parquet(parsed_cache)
+    except Exception:
+        return False
+    if any(c not in df.columns for c in _REQUIRED_ASR_COLS):
+        return False
+    marker = cache_dir / ".asr_parse_version"
+    if not marker.exists() or marker.read_text().strip() != str(_ASR_PARSE_VERSION):
+        return False
+    cache_mtime = parsed_cache.stat().st_mtime
+    for src_name in ("RA.dat", "CO.dat"):
+        src = cache_dir / src_name
+        if src.exists() and src.stat().st_mtime > cache_mtime + 1.0:
+            return False
+    return True
+
+
 def load_asr_structures(
     cache_dir: Path | str = Path("data/groundtruth/asr"),
     *,
@@ -344,18 +374,20 @@ def load_asr_structures(
     """
     cache_dir = Path(cache_dir)
     parsed_cache = cache_dir / "asr_structures.parquet"
-    if parsed_cache.exists():
+    if _asr_cache_is_current(parsed_cache, cache_dir):
         df = pd.read_parquet(parsed_cache)
     else:
+        if parsed_cache.exists():
+            log.info("rebuilding ASR cache (schema/source newer than %s)", parsed_cache)
+            parsed_cache.unlink()
         co_path, ra_path = _download_asr_bundle(cache_dir)
         df = _parse_asr_joined(co_path, ra_path)
-        keep = [
-            "unique_id", "lat", "lng", "county_geoid", "event_date",
-            "status_code", "height_m", "structure_type", "registration_number",
-        ]
-        keep = [c for c in keep if c in df.columns]
-        df = df[keep].copy()
+        keep = [c for c in _REQUIRED_ASR_COLS if c in df.columns]
+        extra = [c for c in ("event_date",) if c in df.columns]
+        df = df[keep + extra].copy()
+        cache_dir.mkdir(parents=True, exist_ok=True)
         df.to_parquet(parsed_cache, index=False)
+        (cache_dir / ".asr_parse_version").write_text(str(_ASR_PARSE_VERSION))
         log.info("cached %d ASR structures -> %s", len(df), parsed_cache)
 
     if status_codes:

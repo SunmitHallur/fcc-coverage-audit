@@ -37,8 +37,14 @@ jobs:
           pytest tests/test_pipeline.py tests/test_validate.py tests/test_attribute.py \
                  tests/test_web_bundle.py tests/test_property.py \
                  tests/test_identity.py tests/test_score.py tests/test_serve.py \
+                 tests/test_towers.py tests/test_groundtruth_asr.py \
             -v --tb=short -x --timeout=120 \
             --cov=fcc_audit --cov-report=term-missing --cov-fail-under=40
+        env:
+          PYTHONPATH: src
+
+      - name: Tower-inference synthetic gate
+        run: python scripts/eval_tower_inference.py --synthetics-only --gate
         env:
           PYTHONPATH: src
 

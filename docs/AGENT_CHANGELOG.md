@@ -5,6 +5,43 @@ changed, why, and what was verified. Append new dated sections at the top.
 
 ---
 
+## 2026-08-19 — Tower inference QA round 2 (T2/T3 + eval gate)
+
+### Why
+
+The first QA patch closed T1/T4 and unit tests, but was not done: petal
+cloverleafs still split at 6/8 US locations, 0.8 km macros split at only
+3/8, eval `main()` always returned 0, and CI never ran tower/ASR tests or
+the eval script. Flag features also moved (rural over-merge, urban over-split).
+
+### What changed
+
+- 3-sector cloverleaf signature uses the *relative core* ring (weak hub hexes
+  on the full footprint fill angular gaps). Occupied-bin floor 0.28 so
+  Albers-warped petals (Logan UT) still merge. Tests parametrize 8 locations.
+- `peak_separation_m: 500` so 0.8 km signal-peaked macros survive hex snap.
+  Signal peaks require score within 10 dB of the blob max. Depth NMS on
+  blobs ≥4000 hexes uses 2 km (Sedgwick-style county fill).
+- ASR parquet is rebuilt if required columns, `.asr_parse_version`, or RA/CO
+  mtime say the cache is stale.
+- Eval gate: `--gate` exits 1 on synthetic T2/T3 failures; with coverage zips
+  also fails on median cellish 250/500 m precision floors and close-pair
+  collapse (not 2 km union footprint recall). CI runs
+  `tests/test_towers.py`, `tests/test_groundtruth_asr.py`, and
+  `python scripts/eval_tower_inference.py --synthetics-only --gate`.
+
+### Verify
+
+```bash
+PYTHONPATH=src pytest tests/test_towers.py tests/test_groundtruth_asr.py tests/test_identity.py tests/test_pipeline.py -q
+PYTHONPATH=src python scripts/eval_tower_inference.py --synthetics-only --gate
+```
+
+250 m pin accuracy and Kansas ASR-pair collapse are still not closed; this
+round gates synthetics + CI so they cannot regress silently.
+
+---
+
 ## 2026-08-19 — Tower inference QA fixes
 
 ### Why
