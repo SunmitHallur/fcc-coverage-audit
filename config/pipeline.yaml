@@ -179,7 +179,9 @@ reconcile:
 # Gaming-risk scoring / prioritization
 # ---------------------------------------------------------------------------
 scoring:
-  # A county-provider is "flagged" if its anomaly percentile is at/above this.
+  # Ranking badge only (top 5% of priority_score). The binary review flag is
+  # the same-site implausibility path — not "whoever is in the 95th percentile
+  # of this batch" — so a state of ordinary 3% growth does not mint flags.
   flag_percentile: 0.95
   # Fraction of new coverage attributed to SAME existing sites above which the
   # same-site growth signal fires. Must ALSO be paired with an implausibility

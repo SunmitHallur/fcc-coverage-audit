@@ -5,6 +5,32 @@ changed, why, and what was verified. Append new dated sections at the top.
 
 ---
 
+## 2026-08-19 — Extensive physics catalog (not screenshot FIPS)
+
+### Why
+
+Sixteen engineer-slide counties are too few to pin weights. Ordinary 3%
+same-site growth is the common case; a percentile-only flag minted reviews
+whenever *someone* occupied the top 5% of a batch.
+
+### What changed
+
+- `tests/gaming_scenarios.py`: 15 review + 30 skip named feature rows, plus a
+  seeded 120-county ordinary background.
+- `tests/test_gaming_catalog.py`: catalog precision/recall, ranking, all-ordinary
+  cohort (0 flags), and a 14-case hex geometry grid (lobe merge, modest growth,
+  new macros, huge-county dilution).
+- Binary `flag_for_review` is the same-site implausibility path only.
+  `flag_percentile` remains a severity badge. Failed site inference does not flag.
+
+### Verify
+
+```bash
+PYTHONPATH=src pytest tests/test_gaming_catalog.py tests/test_gaming_patterns.py tests/test_score.py -q
+```
+
+---
+
 ## 2026-08-19 — Calibrate weights on live Verizon 7/1 (382 counties)
 
 ### Why

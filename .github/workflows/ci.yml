@@ -38,7 +38,7 @@ jobs:
                  tests/test_web_bundle.py tests/test_property.py \
                  tests/test_identity.py tests/test_score.py tests/test_serve.py \
                  tests/test_towers.py tests/test_groundtruth_asr.py \
-                 tests/test_gaming_patterns.py \
+                 tests/test_gaming_patterns.py tests/test_gaming_catalog.py \
             -v --tb=short -x --timeout=120 \
             --cov=fcc_audit --cov-report=term-missing --cov-fail-under=40
         env:

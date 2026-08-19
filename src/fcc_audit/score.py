@@ -152,9 +152,6 @@ def build_features(
     return df
 
 
-_SMALL_COHORT_N = 50
-
-
 def _bounded_feature(s: pd.Series, operating_range: float = 1.0) -> pd.Series:
     """Map risk inputs to a fixed [0, 1] scale without cohort dependence.
 
@@ -220,14 +217,9 @@ def score(features: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     df["priority_score"] = df["risk_score"]
 
     flag_pct = float(cfg.scoring["flag_percentile"])
-    # Small cohorts (pilots / single-state batches): percentile alone is unstable
-    # (n=1 previously set threshold=0 and flagged everything eligible). Require
-    # the absolute same-site implausibility path instead.
-    small_cohort = len(df) < _SMALL_COHORT_N
-    if small_cohort:
-        threshold = float("inf")
-    else:
-        threshold = float(df["priority_score"].quantile(flag_pct))
+    # Percentile is ranking / severity only. Binary flag is the same-site
+    # implausibility path so a batch of ordinary 3% growth cannot mint flags
+    # just because *someone* occupies the 95th percentile.
     susp = float(cfg.scoring["suspicious_same_site_growth"])
     min_added = float(cfg.scoring.get("min_added_km2_to_flag", 0.0))
 
@@ -257,15 +249,12 @@ def score(features: pd.DataFrame, cfg: Config) -> pd.DataFrame:
             | (df["unattributed_share"].fillna(0.0) >= min_unattributed)
         )
     )
-    if small_cohort:
-        suspicious = same_site_implausible
-    else:
-        suspicious = (df["priority_score"] >= threshold) | same_site_implausible
+    suspicious = same_site_implausible
 
     # Growth explained by new towers is legitimate build, not same-site gaming.
     # Cross-border was the original special case; in-county new macros (Edmunds-
-    # style resubmits / real 6-month construction) must also be excluded or the
-    # percentile path flags every large new-site jump.
+    # style resubmits / real 6-month construction) must also be excluded or a
+    # large new-site jump looks like the highest-scoring county in the batch.
     new_site_explained = (
         (df["new_site_share"].fillna(0.0) >= 0.50)
         & (df["new_towers"].fillna(0).astype(int) >= 1)
@@ -275,7 +264,18 @@ def score(features: pd.DataFrame, cfg: Config) -> pd.DataFrame:
         & (df["new_towers"].fillna(0).astype(int) >= 1)
         & (df.get("new_towers_cross_border", 0).fillna(0).astype(int) >= 1)
     )
-    df["flag_for_review"] = eligible & suspicious & ~cross_border_build & ~new_site_explained
+    if "inference_insufficient" in df.columns:
+        insuf = df["inference_insufficient"]
+        if insuf.dtype == object:
+            insuf = insuf.map(lambda v: bool(v) if pd.notna(v) else False)
+        else:
+            insuf = insuf.fillna(False)
+        insuf = insuf.astype(bool)
+    else:
+        insuf = pd.Series(False, index=df.index)
+    df["flag_for_review"] = (
+        eligible & suspicious & ~cross_border_build & ~new_site_explained & ~insuf
+    )
     df["flag_reason"] = df.apply(_reason, axis=1, susp=susp)
 
     # Distribution-aware severity badges (honest for an unsupervised anomaly rank).

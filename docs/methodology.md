@@ -131,7 +131,14 @@ legitimacy features can only decrease it. Each feature's maximum possible score
 swing is 0.25, and the score for a county does not change when unrelated
 counties are added to or removed from the run.
 
-Flagging threshold: the `flag_percentile` percentile of all priority scores across the run (default: top 10%). This is intentionally conservative: we prefer fewer high-confidence flags over many uncertain ones.
+Flagging is **not** “top 5% of this batch.” An all-ordinary state of 3% same-site
+growth must produce **zero** binary flags; `flag_percentile` only labels severity
+(Top 5% / Top 10%) so reviewers can sort. The binary `flag_for_review` is the
+implausibility path in §5b, minus majority new-site buildout and failed inference.
+
+Physics coverage lives in `tests/gaming_scenarios.py` (45 named review/skip
+cases plus a 120-county ordinary background) and `tests/test_gaming_catalog.py`
+(hex geometry grid). Screenshot FIPS are too few to pin weights.
 
 ### 5b. Implausibility gates for same-site growth
 
@@ -168,7 +175,7 @@ These do **not** independently flag a county — they amplify the score of an al
 
 | Parameter | Default | Rationale |
 |-----------|---------|-----------|
-| `flag_percentile` | 0.95 | Top 5% of anomaly scores; prefer missing some gaming over sending reviewers on false flags |
+| `flag_percentile` | 0.95 | Severity badge only (top 5% of scores). Binary flag is implausibility, not percentile |
 | `min_added_km2_to_flag` | 10.0 km² | Ignore trivial / near-empty county changes (FCC-validated) |
 | `suspicious_same_site_growth` | 0.50 | 50% same-site share is not itself suspicious; only the combination matters |
 | `suspicious_same_site_min_county_frac` | 0.075 | Live Verizon 7/1 J25→D25: catches Middlesex 7.8% urban fill; misses 3–6% modest growth |
