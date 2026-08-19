@@ -532,7 +532,7 @@ not a published fraud model and not frozen to old FCC slide labels.
 ### 1. Index coverage on H3
 
 Warehouse tables are already H3 resolution 9. Mean cell area
-\(A_{\mathrm{hex}}=0.105332513\,\mathrm{km}^2\)
+$A_{\mathrm{hex}}=0.105332513\,\mathrm{km}^2$
 ([H3 restable](https://h3geo.org/docs/core-library/restable/)). A polygon
 backend includes a cell iff its **centroid** is inside the polygon
 ([`polygonToCells`](https://h3geo.org/docs/api/regions/)).
@@ -544,23 +544,23 @@ backend includes a cell iff its **centroid** is inside the polygon
 
 ### 2. Change detection
 
-For hex sets prior \(P\) and current \(C\), with signal \(s\) in dBm:
+For hex sets prior $P$ and current $C$, with signal $s$ in dBm:
 
-\[
+$$
 \mathrm{new}=C\setminus P,\quad
 \mathrm{lost}=P\setminus C,\quad
 \mathrm{upgraded}=\{h\in P\cap C: s_C-s_P\ge 5\,\mathrm{dB}\}.
-\]
+$$
 
-County \(g\):
+County $g$:
 
-\[
+$$
 \mathrm{added\_km}^2 = (|C_g|-|P_g|)\,A_{\mathrm{hex}},\qquad
 f_{\mathrm{added}}=\mathrm{added\_km}^2/\mathrm{area}(g),\qquad
 \rho=\mathrm{added\_km}^2/\mathrm{prior\_km}^2
-\]
+$$
 
-(\(\rho=+\infty\) if prior area is 0 and something was added). The 5 dB upgrade
+($\rho=+\infty$ if prior area is 0 and something was added). The 5 dB upgrade
 gate is an engineering noise floor, not a 3GPP spec. The **flag** uses this
 **net** `added_km2`; growth *shares* below count only `new` and `upgraded`
 hexes.
@@ -571,11 +571,11 @@ Sites are not published. This is **not** Okumura–Hata path loss; the filing
 already is a heatmap. We invert lobe shape → pin.
 
 **Relative core.** Walk this layer’s dBm bands from hottest to weakest until
-\(\approx 35\%\) of hexes are kept (clamped to 18–60%). Binary layers use the
+$\approx 35\%$ of hexes are kept (clamped to 18–60%). Binary layers use the
 whole footprint and split on shape.
 
 **Blobs.** 6-connected components on H3 (`grid_disk` radius 1) via DFS/BFS.
-Drop blobs smaller than 35 hexes at res 9 (\(\approx 3.7\,\mathrm{km}^2\)).
+Drop blobs smaller than 35 hexes at res 9 ($\approx 3.7\,\mathrm{km}^2$).
 
 - Rosenfeld (1970), connectivity in digital pictures: <https://doi.org/10.1145/321556.321570>
 
@@ -587,9 +587,9 @@ Interior maxima are candidate masts.
 
 **Peaks.** Local maxima, then greedy non-maximum suppression:
 
-\[
+$$
 d_{\mathrm{NMS}}=\begin{cases}500\,\mathrm{m} & \text{signal peaks}\\ 2000\,\mathrm{m} & \text{depth peaks on blobs }\ge 4000\text{ hexes.}\end{cases}
-\]
+$$
 
 - Neubeck & Van Gool (2006), NMS: <https://doi.org/10.1109/ICPR.2006.479>
   (greedy distance NMS; not their 2-D scan algorithm)
@@ -603,84 +603,84 @@ pin sits on the **peak cell**, not the mass centroid.
 ### 4. Attribute growth to new vs same site
 
 Each `new` or `upgraded` hex goes to the nearest pin in Albers if
-\(d\le \mathrm{lobe\_reach}\) (95th percentile of that site’s hex distances,
-floor \(3\,\mathrm{km}\); else \(1.6\times\) core reach). `stable_site`
+$d\le \mathrm{lobe\_reach}$ (95th percentile of that site’s hex distances,
+floor $3\,\mathrm{km}$; else $1.6\times$ core reach). `stable_site`
 hexes are not counted as expanded growth.
 
 - Bentley (1975), k-d trees: <https://doi.org/10.1145/361002.361007>
 
-\[
+$$
 \mathrm{same\_site}=\frac{A_{\mathrm{expanded}}}{A_+},\quad
 \mathrm{new\_site}=\frac{A_{\mathrm{new}}}{A_+},\quad
 \mathrm{unattributed}=\frac{A_{\mathrm{un}}}{A_+}.
-\]
+$$
 
 Fallback vintage matching (if joint inference is unavailable): linear
-assignment with cost \(d\) inside \(2\,\mathrm{km}\), else a large sentinel.
+assignment with cost $d$ inside $2\,\mathrm{km}$, else a large sentinel.
 
 - Kuhn (1955), assignment problem: <https://doi.org/10.1002/nav.3800020109>
 - Crouse (2016), solver SciPy actually runs: <https://doi.org/10.1109/TAES.2016.140952>
 
-**ASR snap.** Unique registered mast within \(750\,\mathrm{m}\) (no second
-ASR inside 750 m unless \(\ge 1.5\times\) farther). Missing ASR does **not**
+**ASR snap.** Unique registered mast within $750\,\mathrm{m}$ (no second
+ASR inside 750 m unless $\ge 1.5\times$ farther). Missing ASR does **not**
 flag (`asr_no_new_structure` weight 0). Bulk file:
 <https://data.fcc.gov/download/pub/uls/complete/r_tower.zip>
 
-**Boundary snap.** Share of new hexes within \(1.5\,\mathrm{km}\) of the
+**Boundary snap.** Share of new hexes within $1.5\,\mathrm{km}$ of the
 county outline.
 
 ### 5. Score and flag
 
 Relative jump, squashed and absolute-gated so a tiny fill cannot look like
-\(+\infty\%\):
+$+\infty\%$:
 
-\[
+$$
 \tilde{\rho}=\frac{\rho}{1+\rho},\qquad
 \mathrm{magnitude}=\tilde{\rho}\cdot\min(f_{\mathrm{added}}/0.05,\,1).
-\]
+$$
 
 Blanket fill-in:
 
-\[
+$$
 \mathrm{blanket}=(f_C-f_P)_+\cdot(1-f_P).
-\]
+$$
 
-Each feature is \(\hat{x}=\mathrm{clip}(x/r,0,1)\) (e.g. \(r=0.15\) for
-added fraction of county). Weights \(|w|\le 0.25\). Let
-\(D=\max(\sum|w|,1)\):
+Each feature is $\hat{x}=\mathrm{clip}(x/r,0,1)$ (e.g. $r=0.15$ for
+added fraction of county). Weights $|w|\le 0.25$. Let
+$D=\max(\sum|w|,1)$:
 
-\[
+$$
 c_f=\begin{cases} w\hat{x}/D & w\ge 0\\ |w|(1-\hat{x})/D & w<0 \end{cases},\qquad
 S=\sum c_f.
-\]
+$$
 
-Default weights: added fraction \(+0.25\), magnitude \(+0.10\), blanket
-\(+0.14\), same-site \(+0.22\), unattributed \(0\), boundary \(+0.08\),
-new-site \(-0.22\), ASR \(0\).
+Default weights: added fraction $+0.25$, magnitude $+0.10$, blanket
+$+0.14$, same-site $+0.22$, unattributed $0$, boundary $+0.08$,
+new-site $-0.22$, ASR $0$.
 
 **Binary flag is not a percentile.** `flag_percentile` is a severity badge
 only. Flag iff:
 
-\[
+$$
 \begin{aligned}
 &\mathrm{added\_km}^2\ge 10 \;\land\; \mathrm{same\_site}\ge 0.50\\
 &\quad\land\; (f_{\mathrm{added}}\ge 0.075 \lor \mathrm{blanket}\ge 0.20)\\
 &\quad\land\; \text{not majority new-site build}\\
 &\quad\land\; \text{not failed inference}.
 \end{aligned}
-\]
+$$
 
-Majority new-site: \(\mathrm{new\_site\_share}\ge 0.50\) with \(\ge 1\) new
-tower, or \(\ge 0.35\) with \(\ge 1\) new tower of which at least one is
-cross-border. Gates were set so Middlesex-scale urban fill (\(\approx 7.8\%\)
+Majority new-site: $\mathrm{new\_site\_share}\ge 0.50$ with $\ge 1$ new
+tower, or $\ge 0.35$ with $\ge 1$ new tower of which at least one is
+cross-border. Gates were set so Middlesex-scale urban fill ($\approx 7.8\%$
 of county) can flag and 3–6% modest growth does not.
 
 This is a **monotone scorecard**, not Isolation Forest and not a trained
-classifier. Reviewers can read \(c_f\) as “how much this feature moved the
+classifier. Reviewers can read $c_f$ as “how much this feature moved the
 score.”
 
 Optional vector-vs-tile check (off overnight) uses Jaccard
-\(\mathrm{IoU}=|A\cap B|/|A\cup B|\)
+$\mathrm{IoU}=|A\cap B|/|A\cup B|$
 ([Jaccard 1901](https://doi.org/10.5169/seals-266450)).
 
 ---
