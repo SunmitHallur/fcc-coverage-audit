@@ -5,6 +5,55 @@ changed, why, and what was verified. Append new dated sections at the top.
 
 ---
 
+## 2026-08-19 — Overnight crash on NaN tower counts
+
+### Why
+
+Western national batches finished hours of normalize, then died in
+`explain_row`: `int(nan)` on `prior_towers`. Units with 0 inferred sites
+omitted the column; concat with T-Mobile/Verizon filled NaN. `nan or 0`
+is still NaN.
+
+### What changed
+
+- Always fill tower-count columns with 0 before score/explain.
+- `_int0` in `explain_row`; save scores even if explanations fail.
+- Cache per-unit sites/coverage parquet so a later crash can resume maps.
+
+---
+
+## 2026-08-18 — Ingredient-cook county API + Docker for Mike's host
+
+### Why
+
+Ship a cook, not thousands of pre-plated `details/*.json` files. Overnight
+still infers towers and writes parquet; a click is `GET /api/county` that
+slices one county from coverage parquet + TIGER GeoPackage. Mike already
+runs apps in Docker (Node-RED is a separate container). Apache stays the
+TLS front door on `127.0.0.1:8000`.
+
+### What changed
+
+- `src/fcc_audit/serve.py`: cook HTTP server (`/api/county`, `/api/health`).
+- `python -m fcc_audit.cli serve` and `python -m fcc_audit.serve`.
+- `web/js/app.js`: try `/api/county`, fall back to static details JSON.
+- `build-web --no-details`: map shell only (records/meta/towers/counties).
+- `Dockerfile`, `docker-compose.yml`, `requirements-serve.txt`,
+  `deploy/sync-ingredients.sh`.
+- Docs: README + `docs/server_hosting.md`.
+
+### Verify
+
+```bash
+PYTHONPATH=src pytest tests/test_serve.py tests/test_web_bundle.py -q
+python -m fcc_audit.cli serve   # click a county; Network tab shows /api/county
+# on Mike's box, after rsync:
+docker compose up -d --build
+curl -s http://127.0.0.1:8000/api/health
+```
+
+---
+
 ## 2026-08-12 — Redshift mrgd + real minsignal (292/291)
 
 ### Why

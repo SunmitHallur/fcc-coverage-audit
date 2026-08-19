@@ -406,9 +406,11 @@ def _analyze_unit(
             "prior_towers", "current_towers",
             "prior_towers_in_county", "current_towers_in_county",
             "prior_towers_cross_border", "current_towers_cross_border",
+            "new_towers", "new_towers_in_county", "new_towers_cross_border",
         ]:
-            if col in feats:
-                feats[col] = feats[col].fillna(0).astype(int)
+            if col not in feats.columns:
+                feats[col] = 0
+            feats[col] = pd.to_numeric(feats[col], errors="coerce").fillna(0).astype(int)
         for k, v in tag.items():
             feats[k] = v
 
@@ -480,18 +482,21 @@ def process_unit(
         _unit_marker_path(unit_marker_dir, int(provider.id), str(label))
         if unit_marker_dir is not None else None
     )
-    feats_path = None
+    feats_path = sites_path = cov_path = None
     if unit_feats_dir is not None:
         safe = re.sub(r"[^\w.\-]+", "_", str(label)).strip("_") or "svc"
-        feats_path = unit_feats_dir / f"{int(provider.id)}_{safe}.parquet"
+        stem = f"{int(provider.id)}_{safe}"
+        feats_path = unit_feats_dir / f"{stem}.parquet"
+        sites_path = unit_feats_dir / f"{stem}_sites.parquet"
+        cov_path = unit_feats_dir / f"{stem}_coverage.parquet"
 
     if marker is not None and marker.exists() and not force_rerun:
         log.info("  resume: skipping cached unit %s %s", provider.name, label)
         completed_units.add((int(provider.id), str(label)))
-        cached = pd.DataFrame()
-        if feats_path is not None and feats_path.exists():
-            cached = pd.read_parquet(feats_path)
-        return cached, pd.DataFrame(), pd.DataFrame(), completed_units, skipped_units
+        cached = pd.read_parquet(feats_path) if feats_path is not None and feats_path.exists() else pd.DataFrame()
+        cached_sites = pd.read_parquet(sites_path) if sites_path is not None and sites_path.exists() else pd.DataFrame()
+        cached_cov = pd.read_parquet(cov_path) if cov_path is not None and cov_path.exists() else pd.DataFrame()
+        return cached, cached_sites, cached_cov, completed_units, skipped_units
 
     try:
         cur_file = source.fetch(provider.id, desc, current)
@@ -514,6 +519,10 @@ def process_unit(
             pd.DataFrame().to_parquet(feats_path, index=False)
         else:
             feats.to_parquet(feats_path, index=False)
+    if sites_path is not None:
+        sites.to_parquet(sites_path, index=False)
+    if cov_path is not None:
+        coverage.to_parquet(cov_path, index=False)
 
     if cleanup_raw:
         import os
@@ -1016,9 +1025,23 @@ def cmd_run(cfg: Config, args) -> int:
         return 0
 
     features = pd.concat(all_feats, ignore_index=True)
+    # Provider×service units with no inferred sites omit tower columns; concat
+    # then fills those rows with NaN. Coerce before scoring/explanations.
+    for col in [
+        "prior_towers", "current_towers",
+        "prior_towers_in_county", "current_towers_in_county",
+        "prior_towers_cross_border", "current_towers_cross_border",
+        "new_towers", "new_towers_in_county", "new_towers_cross_border",
+    ]:
+        if col not in features.columns:
+            features[col] = 0
+        features[col] = pd.to_numeric(features[col], errors="coerce").fillna(0).astype(int)
     features, sites = _enrich_with_asr(cfg, features, sites, current, prior)
     scored = score.score(features, cfg)
-    scored = explain.add_explanations(scored)
+    try:
+        scored = explain.add_explanations(scored)
+    except Exception as exc:  # noqa: BLE001 — do not throw away a finished batch
+        log.warning("explanations failed (saving scores anyway): %s", exc)
     # Persist hex coverage only for flagged + top-N counties (big disk/I/O win).
     n_cov_before = len(coverage)
     coverage = _filter_coverage_for_persist(coverage, scored, top_n_persist)
@@ -1212,14 +1235,26 @@ def cmd_build_web(cfg: Config, args) -> int:
         weights=weights,
         render_pngs=render_pngs,
         top_n=top_n,
+        write_details=not getattr(args, "no_details", False),
     )
     flagged = int(scored["flag_for_review"].sum()) if "flag_for_review" in scored.columns else 0
     log.info("web bundle ready: %d records, %d flagged", len(scored), flagged)
     print("\nWeb bundle:")
     for k, v in paths.items():
         print(f"  {k}: {v}")
-    print("\nDeploy: push to git -> Vercel auto-deploys web/")
-    print("Preview locally: cd web && python -m http.server 8000")
+    print("\nDeploy: Docker cook on the Linux box (see docs/server_hosting.md)")
+    print("Preview locally: python -m fcc_audit.cli serve")
+    print("  (static only: cd web && python -m http.server 8000)")
+    return 0
+
+
+def cmd_serve(cfg: Config, args) -> int:
+    """Serve the web UI and on-demand county JSON from processed parquet + TIGER GPKG."""
+    from .serve import serve as serve_app
+
+    host = str(getattr(args, "host", "127.0.0.1") or "127.0.0.1")
+    port = int(getattr(args, "port", 8000) or 8000)
+    serve_app(cfg, host=host, port=port)
     return 0
 
 
@@ -1676,7 +1711,20 @@ def main(argv: list[str] | None = None) -> int:
         "--allow-incomplete", action="store_true",
         help="build a deliberate partial preview without all 51 state batch manifests",
     )
+    p_bw.add_argument(
+        "--no-details", action="store_true",
+        help="skip writing details/*.json; county clicks are cooked by `serve` / Docker",
+    )
     p_bw.set_defaults(func=cmd_build_web)
+
+    p_serve = sub.add_parser(
+        "serve",
+        help="serve web/ plus GET /api/county (extract one county from GPKG + parquet)",
+    )
+    p_serve.add_argument("--host", default="127.0.0.1")
+    p_serve.add_argument("--port", type=int, default=8000)
+    p_serve.set_defaults(func=cmd_serve)
+
     sub.add_parser("make-fixtures", help="generate synthetic offline data").set_defaults(
         func=cmd_make_fixtures
     )

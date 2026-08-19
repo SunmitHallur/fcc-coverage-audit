@@ -114,10 +114,15 @@ def build_features(
     if "new_towers" not in df:
         df["new_towers"] = 0
     df["new_towers"] = df["new_towers"].fillna(0).astype(int)
-    for col in ["new_towers_in_county", "new_towers_cross_border"]:
+    for col in [
+        "new_towers_in_county", "new_towers_cross_border",
+        "prior_towers", "current_towers",
+        "prior_towers_in_county", "current_towers_in_county",
+        "prior_towers_cross_border", "current_towers_cross_border",
+    ]:
         if col not in df:
             df[col] = 0
-        df[col] = df[col].fillna(0).astype(int)
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
 
     # Ground-truth corroboration features (populated when ASR / Ookla data is
     # merged in via groundtruth_asr.merge_asr_into_features and

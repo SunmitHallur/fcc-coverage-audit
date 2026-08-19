@@ -67,6 +67,24 @@ def severity_label(priority: float, score_percentile: float | None = None, flagg
     return "Below threshold"
 
 
+def _int0(value: Any) -> int:
+    """Coerce missing / NaN tower counts to 0. ``int(nan)`` raises; ``nan or 0`` is still nan."""
+    if value is None:
+        return 0
+    try:
+        if pd.isna(value):
+            return 0
+    except (TypeError, ValueError):
+        pass
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0
+    if not math.isfinite(number):
+        return 0
+    return int(number)
+
+
 def explain_row(row: pd.Series | dict[str, Any]) -> dict[str, Any]:
     """Build a structured plain-language explanation for one scored county row."""
     r = row if isinstance(row, dict) else row.to_dict()
@@ -91,12 +109,12 @@ def explain_row(row: pd.Series | dict[str, Any]) -> dict[str, Any]:
     unattributed = float(r.get("unattributed_share") or 0.0)
     boundary = float(r.get("boundary_snap_share") or 0.0)
     blanket = float(r.get("blanket_fillin") or 0.0)
-    new_towers = int(r.get("new_towers") or 0)
-    prior_towers = int(r.get("prior_towers") or 0)
-    current_towers = int(r.get("current_towers") or 0)
-    prior_cross = int(r.get("prior_towers_cross_border") or 0)
-    current_cross = int(r.get("current_towers_cross_border") or 0)
-    new_cross = int(r.get("new_towers_cross_border") or 0)
+    new_towers = _int0(r.get("new_towers"))
+    prior_towers = _int0(r.get("prior_towers"))
+    current_towers = _int0(r.get("current_towers"))
+    prior_cross = _int0(r.get("prior_towers_cross_border"))
+    current_cross = _int0(r.get("current_towers_cross_border"))
+    new_cross = _int0(r.get("new_towers_cross_border"))
 
     # --- headline (one sentence) ---
     if flagged and same_site >= 0.5:

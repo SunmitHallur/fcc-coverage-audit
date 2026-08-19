@@ -158,6 +158,27 @@ def test_plain_language_explanation_distinguishes_coverage_loss():
     assert any("decreased" in bullet for bullet in expl["bullets"])
 
 
+def test_explain_row_treats_nan_tower_counts_as_zero():
+    from fcc_audit.explain import explain_row
+
+    expl = explain_row({
+        "provider_name": "AT&T",
+        "technology": "4G LTE",
+        "county_name": "Maricopa",
+        "added_km2": 12.0,
+        "flag_for_review": False,
+        "priority_score": 0.2,
+        "prior_towers": float("nan"),
+        "current_towers": float("nan"),
+        "new_towers": float("nan"),
+    })
+    assert "headline" in expl
+    assert expl["severity"] in (
+        "Top 1%", "Top 5%", "Top 10%", "Flagged", "Below threshold",
+        "Critical", "High", "Moderate", "Low",
+    )
+
+
 def test_real_bundle_filter_removes_fixture_geographies():
     from fcc_audit.cli import _drop_fixture_geographies
 
