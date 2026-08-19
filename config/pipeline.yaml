@@ -135,11 +135,10 @@ geography:
 # Tower / site inference (H3 connected components over high-signal hexes)
 # ---------------------------------------------------------------------------
 towers:
-  # Only hexes at/above this modeled signal band seed a candidate site.
-  # FCC signal bands are typically -85 / -95 / -105 dBm (higher = stronger).
-  # A site is inferred per CONTIGUOUS blob of such hexes (H3 adjacency /
-  # connected components, with depth peaks for flat binary coverage). One
-  # tower yields one site regardless of footprint size.
+  # Core hexes are the strongest ~35% of *this provider×vintage*, not a global
+  # dBm line. Hotter (T-Mobile-style -50) and colder (AT&T-style -110) filings
+  # of the same footprint therefore seed the same blobs. This value is kept as
+  # documentation of typical FCC bands; inference does not apply it as a cut.
   min_signal_band_dbm: -95
   # Minimum hexes in a site blob. Scale with resolution so the minimum physical
   # area is ~0.35 km^2 regardless of H3 resolution:

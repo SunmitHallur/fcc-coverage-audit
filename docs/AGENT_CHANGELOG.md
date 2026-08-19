@@ -5,6 +5,89 @@ changed, why, and what was verified. Append new dated sections at the top.
 
 ---
 
+## 2026-08-19 — Relative signal core (hot vs cold filings)
+
+### Why
+
+Providers do not share a dBm scale. T-Mobile often files -50/-60 cores;
+AT&T files the same geometry at -90/-110. A global -95 cut made T-Mobile
+cores huge and AT&T cores tiny, which split petals and moved masts.
+
+### What changed
+
+- Core = strongest ~35% of *this* provider×vintage (clamped 18–60%).
+- Fallback centroid weights are rank-within-lobe, not `dBm + 130`.
+- Tests: identical footprints shifted 25 dB keep the same core hexes and
+  the same two-tower sites.
+
+### Verify
+
+```bash
+PYTHONPATH=src pytest tests/test_towers.py -q
+```
+
+---
+
+
+### Why
+
+Sites are not always tri-sector cloverleafs: some have one lobe, some two.
+Petal depth-maxima still have to collapse to the hub without fusing two nearby
+omnis. Accuracy has to hold across regions and providers (who often colocate).
+
+### What changed
+
+- 2-sector bowtie merge (angular gaps + hub placement on the perpendicular
+  bisector). 1-lobe disks already resolved as a single depth/signal peak.
+- Prominence filter on binary depth peaks so overlap shoulders are not extra
+  towers. Isolated 2-/3-cone synthetics still merge to the hub.
+- Adaptive core *loosens* when the strongest bands are a tiny fraction of the
+  footprint (rural AT&T was keeping ~5% core, disconnecting petals).
+- ASR locations now come from `r_tower.zip` (CO coords ⨝ RA county/status).
+- Eval harness: `scripts/eval_tower_inference.py` downloads are under
+  `data/raw/December 31, 2025/` for DE/NJ/LA/KS/UT × Big-3, 5G-NR 35/3.
+
+### Verify
+
+```bash
+PYTHONPATH=src pytest tests/test_towers.py tests/test_identity.py tests/test_pipeline.py -q
+PYTHONPATH=src python scripts/eval_tower_inference.py
+```
+
+**FCC D25 result (8 counties, >10 ASR structures each):** with real
+`minsignal`, union-of-providers ASR-in-footprint recall is 70–100% (median
+~82%). Binary flatten of the same polygons cannot locate interior sites in a
+county-wide connected blob (Sussex/Riley/Cache). ASR precision is not a census:
+many cell sites are unregistered. Cross-provider clusters sit ~170 m apart.
+
+---
+
+## 2026-08-19 — Cloverleaf tower detection + peak anchoring
+
+### Why
+
+Reviewer maps showed 3-cone (tri-sector) footprints with no marker at the hub,
+petal dots treated as extra/new towers, and hexes left unattributed. Binary
+depth-maxima sit in the *petals* (the hub is a depth saddle). Mass centroids
+then drift into the fattest petal, so the next vintage looks like a different
+site. Overlapping real-signal cores were also kept as one blob.
+
+### What changed
+
+- Merge 3-peak cloverleafs (equilateral + 3-sector angular gaps) to the hub.
+- Place each site on the peak/junction cell, not a weighted centroid.
+- Split non-flat cores on local signal maxima (one inflated lobe stays one site).
+- Tests: cloverleaf → 1 hub site; petal growth ≠ new; 3 real towers stay 3;
+  hexes attributed; two signal peaks split; fixture pipeline unchanged.
+
+### Verify
+
+```bash
+PYTHONPATH=src pytest tests/test_towers.py tests/test_identity.py tests/test_pipeline.py -q
+```
+
+---
+
 ## 2026-08-19 — Normalize county-tag was the overnight bottleneck
 
 ### Why

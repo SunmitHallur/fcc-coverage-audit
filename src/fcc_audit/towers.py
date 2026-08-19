@@ -11,19 +11,26 @@ the site. We therefore:
 
 Provider heterogeneity: providers report signal in different band schemes
 (some file fine-grained RSRP bands down to -120 dBm, others a single coarse
-band), and the Redshift hex snapshots carry only a BINARY 0/1 coverage flag
-with no signal at all. Two adaptations handle this:
+band, and some systematically file 15–30 dB hotter or colder than peers).
+The Redshift hex snapshots can also carry only a BINARY 0/1 coverage flag.
+Adaptations:
 
-* **Adaptive core threshold** — if the configured dBm cutoff keeps most of a
-  provider's footprint (their reported bands are all "strong"), the cutoff is
-  tightened to that provider's own strongest-signal quantile so the "core"
-  stays a meaningful fraction of the lobe.
+* **Relative core (per provider×vintage)** — the "strong" hexes that seed a
+  site are the top ~35% of *that layer's own* signal distribution, not hexes
+  above a global dBm cutoff. A provider that files -50 dBm cores and one that
+  files -90 dBm cores of the same shape therefore produce the same blobs.
 * **Boundary-depth splitting** — when signal is flat (binary sources), lobe
   structure is recovered from coverage *shape*: each blob's cells are scored
-  by grid distance to the blob edge (a discrete distance transform), local
-  depth maxima are treated as probable tower positions, and multi-lobe blobs
-  are split by nearest-peak assignment. Centroids are depth-weighted so a
-  site lands at its lobe's interior core, not the footprint's geometric mean.
+  by grid distance to the blob edge (a discrete distance transform) and local
+  depth maxima are candidate towers. A 1-lobe disk has one maximum. 2-sector
+  bowties and 3-sector cloverleafs produce *petal* maxima, not a hub maximum —
+  those pairs/triples are merged back to the junction when the angular gaps
+  say they are cones of one site (not two nearby omnis).
+  Sites are placed on the peak/junction cell, not a mass centroid.
+* **Signal-peak splitting** — when real ``minsignal`` is present, overlapping
+  towers are separated at local signal maxima. A single inflated lobe still has
+  one maximum, so same-site growth is not fragmented. Peak *locations* use
+  rank within the layer, so a hotter filing does not move the mast.
 
 Connected components (rather than density clustering) make this robust to lobe
 size: a single tower with a huge footprint still yields a single site, which is
@@ -56,16 +63,20 @@ _LOBE_REACH_PERCENTILE = 95.0
 _LOBE_REACH_MIN_HEXES = 3
 # Fallback multiplier on core reach_m when no full-coverage hex data is available.
 _LOBE_REACH_FALLBACK_MARGIN = 2.5
-# Adaptive threshold: if the configured dBm cutoff keeps more than this share of
-# a provider's hexes, tighten to the provider's own strong-signal quantile.
-_MAX_CORE_FRACTION = 0.60
-# ... and in that case keep the top-N fraction strongest hexes as the core.
+# Relative core: strongest-first share of *this* provider's hexes.
 _ADAPTIVE_CORE_QUANTILE = 0.35
+_MAX_CORE_FRACTION = 0.60
+_MIN_CORE_FRACTION = 0.18
 # Depth transform saturation (rings). At res 9 (~0.35 km/ring) this is ~14 km —
 # deeper interiors of huge binary blobs carry no tower information anyway.
 _DEPTH_CAP = 40
 # Minimum depth for a cell to qualify as a peak (avoids splitting thin strips).
 _MIN_PEAK_DEPTH = 2
+# Cloverleaf merge: petal peaks of one 3-sector site sit this far from the hub.
+_CLOVER_MAX_SIDE_FACTOR = 5.0  # * min_peak_separation_m  (~10 km)
+_CLOVER_MIN_SIDE_FACTOR = 0.75
+# Signal field is "discriminative" enough to split on local maxima.
+_SIGNAL_SPLIT_RANGE_DB = 5.0
 # Default minimum separation between accepted peaks (meters). Overridden at
 # call time by ``site_match_radius_m`` so peak spacing and cross-vintage match
 # distance share one scale (avoids peaks kept 3 km apart but matched at 2 km).
@@ -167,42 +178,40 @@ def _boundary_depth(cells: set[str], cap: int = _DEPTH_CAP) -> dict[str, int]:
     return depth
 
 
-def _find_depth_peaks(
+def _find_score_peaks(
     comp: list[str],
-    depth: dict[str, int],
+    score: dict[str, float],
     xy_by_cell: dict[str, tuple[float, float]],
-    min_separation_m: float = _MIN_PEAK_SEPARATION_M,
-) -> list[str]:
-    """Locate probable tower positions as local maxima of the boundary depth.
+    min_separation_m: float,
+    min_score: float,
+) -> tuple[list[str], float]:
+    """Local maxima of *score*, plateau-merged, greedily separated.
 
-    A tower sits deep inside its own lobe, so depth local-maxima are the best
-    binary-data estimate of tower positions. Adjacent equal-depth candidates
-    (plateaus) are merged into one representative so a flat interior doesn't
-    spawn a grid of fake towers, then peaks are accepted greedily (deepest
-    first) with a minimum separation.
+    Returns ``(peaks, largest_plateau_fraction)`` so callers can detect a
+    non-discriminative field (one giant plateau) and fall back to shape.
     """
     comp_set = set(comp)
     candidates: set[str] = set()
     for c in comp:
-        dc = depth[c]
-        if dc < _MIN_PEAK_DEPTH:
+        sc = score[c]
+        if sc < min_score:
             continue
-        if all(depth.get(n, 0) <= dc for n in h3.grid_disk(c, 1) if n != c and n in comp_set):
+        if all(score.get(n, sc - 1) <= sc for n in h3.grid_disk(c, 1) if n != c and n in comp_set):
             candidates.add(c)
     if not candidates:
-        # Thin strip / tiny blob: treat the whole component as one lobe.
-        return [max(comp, key=lambda c: depth[c])]
+        return [max(comp, key=lambda c: score[c])], 0.0
 
-    # Merge adjacent candidates (plateaus) into single representatives.
+    plateaus = _connected_components(candidates)
+    largest_frac = max(len(p) for p in plateaus) / max(len(comp), 1)
     reps: list[str] = []
-    for plateau in _connected_components(candidates):
+    for plateau in plateaus:
         xs = np.array([xy_by_cell[c][0] for c in plateau])
         ys = np.array([xy_by_cell[c][1] for c in plateau])
         cx, cy = xs.mean(), ys.mean()
         rep = plateau[int(np.argmin((xs - cx) ** 2 + (ys - cy) ** 2))]
         reps.append(rep)
 
-    reps.sort(key=lambda c: depth[c], reverse=True)
+    reps.sort(key=lambda c: score[c], reverse=True)
     accepted: list[str] = []
     for c in reps:
         x, y = xy_by_cell[c]
@@ -211,17 +220,281 @@ def _find_depth_peaks(
             for a in accepted
         ):
             accepted.append(c)
-    return accepted
+    return accepted, float(largest_frac)
+
+
+_MIN_PEAK_PROMINENCE = 3
+
+
+def _saddle_score(
+    a: str,
+    b: str,
+    score: dict[str, float],
+    xy_by_cell: dict[str, tuple[float, float]],
+    tree: cKDTree,
+    cells: list[str],
+    n_samples: int = 24,
+) -> float:
+    """Minimum score on the straight line between two cells."""
+    xa, ya = xy_by_cell[a]
+    xb, yb = xy_by_cell[b]
+    ts = np.linspace(0.05, 0.95, n_samples)
+    xs = xa + ts * (xb - xa)
+    ys = ya + ts * (yb - ya)
+    _, idx = tree.query(np.column_stack([xs, ys]))
+    return float(min(score[cells[int(i)]] for i in idx))
+
+
+def _filter_low_prominence_peaks(
+    peaks: list[str],
+    depth: dict[str, int],
+    xy_by_cell: dict[str, tuple[float, float]],
+    min_prominence: int = _MIN_PEAK_PROMINENCE,
+) -> list[str]:
+    """Drop shoulder maxima that sit on the slope of a stronger nearby peak.
+
+    Two overlapping circular towers grow extra depth bumps in the overlap;
+    those have almost no drop toward the true center. Petals of a 2-/3-sector
+    site stay: the path between petals dips at the hub saddle.
+    """
+    if len(peaks) <= 1:
+        return peaks
+    cells = list(xy_by_cell)
+    tree = cKDTree(np.array([xy_by_cell[c] for c in cells], dtype=float))
+    scores = [int(depth[p]) for p in peaks]
+    keep = [True] * len(peaks)
+    for i, peak in enumerate(peaks):
+        higher = [
+            j for j, other in enumerate(peaks)
+            if scores[j] >= scores[i] + min_prominence
+        ]
+        if not higher:
+            continue
+        px, py = xy_by_cell[peak]
+        j = min(
+            higher,
+            key=lambda k: (xy_by_cell[peaks[k]][0] - px) ** 2
+            + (xy_by_cell[peaks[k]][1] - py) ** 2,
+        )
+        saddle = _saddle_score(
+            peak, peaks[j], {c: float(depth[c]) for c in xy_by_cell}, xy_by_cell, tree, cells,
+        )
+        if int(depth[peak]) - saddle < min_prominence:
+            keep[i] = False
+    return [p for p, ok in zip(peaks, keep) if ok]
+
+
+def _find_depth_peaks(
+    comp: list[str],
+    depth: dict[str, int],
+    xy_by_cell: dict[str, tuple[float, float]],
+    min_separation_m: float = _MIN_PEAK_SEPARATION_M,
+) -> list[str]:
+    """Locate probable tower positions as local maxima of the boundary depth."""
+    score = {c: float(depth[c]) for c in comp}
+    peaks, _ = _find_score_peaks(
+        comp, score, xy_by_cell, min_separation_m, float(_MIN_PEAK_DEPTH),
+    )
+    local_xy = {c: xy_by_cell[c] for c in comp}
+    return _filter_low_prominence_peaks(peaks, depth, local_xy)
+
+
+def _n_sector_signature(
+    cx: float,
+    cy: float,
+    xs: np.ndarray,
+    ys: np.ndarray,
+    ring_inner_m: float,
+    ring_outer_m: float,
+    n_sectors: int,
+    n_bins: int = 18,
+) -> bool:
+    """True when a ring around (cx, cy) has ``n_sectors`` coverage lobes with gaps.
+
+    3-sector cloverleafs and 2-sector "bowtie" sites both leave angular notches.
+    Nearby circular footprints look filled from their overlap centroid (no gaps).
+    """
+    dx = xs - cx
+    dy = ys - cy
+    r2 = dx * dx + dy * dy
+    mask = (r2 >= ring_inner_m * ring_inner_m) & (r2 <= ring_outer_m * ring_outer_m)
+    min_pts = 18 if n_sectors == 2 else 24
+    if int(mask.sum()) < min_pts:
+        return False
+    ang = np.arctan2(dy[mask], dx[mask])
+    bins = np.bincount(
+        (((ang + np.pi) / (2 * np.pi) * n_bins).astype(int) % n_bins),
+        minlength=n_bins,
+    )
+    occ = bins >= max(3.0, 0.40 * float(bins.max()))
+    starts_occ = int((occ & ~np.roll(occ, 1)).sum())
+    starts_gap = int((~occ & np.roll(occ, 1)).sum())
+    frac = float(occ.mean())
+    if n_sectors == 2:
+        return starts_occ == 2 and starts_gap == 2 and 0.18 <= frac <= 0.80
+    return starts_occ == 3 and starts_gap == 3 and 0.35 <= frac <= 0.90
+
+
+def _three_sector_signature(
+    cx: float,
+    cy: float,
+    xs: np.ndarray,
+    ys: np.ndarray,
+    ring_inner_m: float,
+    ring_outer_m: float,
+    n_bins: int = 18,
+) -> bool:
+    """True when a ring around (cx, cy) has three coverage sectors with gaps."""
+    return _n_sector_signature(
+        cx, cy, xs, ys, ring_inner_m, ring_outer_m, n_sectors=3, n_bins=n_bins,
+    )
+
+
+def _two_peak_hub_xy(
+    p1: np.ndarray,
+    p2: np.ndarray,
+    xs: np.ndarray,
+    ys: np.ndarray,
+) -> tuple[float, float]:
+    """Hub of a 2-sector site along the perpendicular bisector of the petal peaks.
+
+    Opposed (180°) petals look like two sectors from a wide range of points
+    centered on the chord midpoint; a cloverleaf missing one sector is only
+    two-sectored from points shifted into the remaining wedge. Take the median
+    of the points that still have a 2-sector ring signature.
+    """
+    mx = float(p1[0] + p2[0]) / 2.0
+    my = float(p1[1] + p2[1]) / 2.0
+    vx, vy = float(p2[0] - p1[0]), float(p2[1] - p1[1])
+    dist = float(np.hypot(vx, vy))
+    if dist < 50.0:
+        return mx, my
+    px, py = -vy / dist, vx / dist
+    radius = dist / 2.0
+    good: list[float] = []
+    for t in np.linspace(-0.70 * dist, 0.70 * dist, 29):
+        hx = mx + float(t) * px
+        hy = my + float(t) * py
+        if _n_sector_signature(hx, hy, xs, ys, radius * 0.12, radius * 1.55, 2):
+            good.append(float(t))
+    if not good:
+        return mx, my
+    t = float(np.median(np.array(good)))
+    return mx + t * px, my + t * py
+
+
+def _merge_cloverleaf_peaks(
+    peaks: list[str],
+    xy_by_cell: dict[str, tuple[float, float]],
+    cell_ids: list[str],
+    xs: np.ndarray,
+    ys: np.ndarray,
+    min_separation_m: float,
+) -> list[str]:
+    """Replace petal-peaks of a 2- or 3-sector site with one site at the hub.
+
+    Depth maxima of a multi-cone footprint sit in the petals; the real tower is
+    the junction (a depth *saddle*). Equilateral peak triples with a
+    three-sector angular signature, and opposite pairs with a two-sector
+    signature *and* low far-side mass, collapse to the junction cell.
+    Two nearby circular towers fail the far-side test and stay split.
+    """
+    n = len(peaks)
+    if n < 2:
+        return peaks
+    pxy = np.array([xy_by_cell[p] for p in peaks], dtype=float)
+    tree = cKDTree(pxy)
+    max_side = _CLOVER_MAX_SIDE_FACTOR * min_separation_m
+    min_side = _CLOVER_MIN_SIDE_FACTOR * min_separation_m
+    triples: list[tuple[float, int, int, int, float, float]] = []
+    for i in range(n):
+        near = [j for j in tree.query_ball_point(pxy[i], max_side) if j > i]
+        for a, j in enumerate(near):
+            for k in near[a + 1 :]:
+                sides = sorted([
+                    float(np.hypot(*(pxy[i] - pxy[j]))),
+                    float(np.hypot(*(pxy[i] - pxy[k]))),
+                    float(np.hypot(*(pxy[j] - pxy[k]))),
+                ])
+                if sides[0] < min_side or sides[2] > max_side:
+                    continue
+                if sides[2] / max(sides[0], 1.0) > 1.85:
+                    continue
+                cx, cy = pxy[[i, j, k]].mean(axis=0)
+                angs = np.sort([
+                    np.arctan2(pxy[t][1] - cy, pxy[t][0] - cx) for t in (i, j, k)
+                ])
+                gaps = np.diff(angs, append=angs[0] + 2 * np.pi)
+                if float(gaps.min()) < np.deg2rad(70) or float(gaps.max()) > np.deg2rad(165):
+                    continue
+                radius = float(np.mean([
+                    np.hypot(pxy[t][0] - cx, pxy[t][1] - cy) for t in (i, j, k)
+                ]))
+                if not _n_sector_signature(cx, cy, xs, ys, radius * 0.15, radius * 1.40, 3):
+                    continue
+                triples.append((radius, i, j, k, float(cx), float(cy)))
+    triples.sort(key=lambda t: -t[0])
+    used = np.zeros(n, dtype=bool)
+    out: list[str] = []
+    for radius, i, j, k, cx, cy in triples:
+        if used[i] or used[j] or used[k]:
+            continue
+        dist = np.hypot(pxy[:, 0] - cx, pxy[:, 1] - cy)
+        nearby = np.flatnonzero(dist <= radius * 1.25)
+        used[nearby] = True
+        jidx = int(np.argmin((xs - cx) ** 2 + (ys - cy) ** 2))
+        out.append(cell_ids[jidx])
+
+    # 2-sector bowtie / missing-third-sector: two petal peaks, hub at the saddle.
+    pairs: list[tuple[float, int, int, float, float]] = []
+    unused = [i for i in range(n) if not used[i]]
+    for a, i in enumerate(unused):
+        for j in unused[a + 1 :]:
+            side = float(np.hypot(*(pxy[i] - pxy[j])))
+            if side < min_side or side > max_side:
+                continue
+            cx, cy = pxy[[i, j]].mean(axis=0)
+            radius = side / 2.0
+            if not _n_sector_signature(
+                float(cx), float(cy), xs, ys, radius * 0.12, radius * 1.55, 2,
+            ):
+                continue
+            pairs.append((radius, i, j, float(cx), float(cy)))
+    pairs.sort(key=lambda t: -t[0])
+    for radius, i, j, cx, cy in pairs:
+        if used[i] or used[j]:
+            continue
+        hx, hy = _two_peak_hub_xy(pxy[i], pxy[j], xs, ys)
+        dist = np.hypot(pxy[:, 0] - hx, pxy[:, 1] - hy)
+        nearby = np.flatnonzero(dist <= max(radius * 1.20, min_separation_m))
+        used[nearby] = True
+        jidx = int(np.argmin((xs - hx) ** 2 + (ys - hy) ** 2))
+        out.append(cell_ids[jidx])
+
+    for i, peak in enumerate(peaks):
+        if not used[i]:
+            out.append(peak)
+    dedup: list[str] = []
+    for c in out:
+        x, y = xy_by_cell[c]
+        if all(
+            np.hypot(x - xy_by_cell[a][0], y - xy_by_cell[a][1]) >= min_separation_m
+            for a in dedup
+        ):
+            dedup.append(c)
+    return dedup
 
 
 def _split_component_by_peaks(
     comp: list[str],
     peaks: list[str],
     xy_by_cell: dict[str, tuple[float, float]],
-) -> list[list[str]]:
-    """Partition a blob's cells by nearest depth-peak (Voronoi in meters)."""
-    if len(peaks) <= 1:
-        return [comp]
+) -> list[tuple[str, list[str]]]:
+    """Partition a blob's cells by nearest peak. Returns ``(peak, cells)``."""
+    if not peaks:
+        return [(comp[0], comp)]
+    if len(peaks) == 1:
+        return [(peaks[0], comp)]
     peak_xy = np.array([xy_by_cell[p] for p in peaks])
     tree = cKDTree(peak_xy)
     cell_xy = np.array([xy_by_cell[c] for c in comp])
@@ -229,42 +502,81 @@ def _split_component_by_peaks(
     parts: list[list[str]] = [[] for _ in peaks]
     for cell, i in zip(comp, idx):
         parts[int(i)].append(cell)
-    return [p for p in parts if p]
+    return [(peaks[i], parts[i]) for i in range(len(peaks)) if parts[i]]
+
+
+def _peaks_for_component(
+    comp: list[str],
+    *,
+    signal_flat: bool,
+    signal_by_cell: dict,
+    xy_by_cell: dict[str, tuple[float, float]],
+    peak_sep: float,
+) -> tuple[list[str], dict[str, int] | None]:
+    """Choose tower peaks for one connected blob (signal maxima or cloverleaf)."""
+    cell_ids = list(comp)
+    xs = np.array([xy_by_cell[c][0] for c in cell_ids], dtype=float)
+    ys = np.array([xy_by_cell[c][1] for c in cell_ids], dtype=float)
+    sigs = np.array([float(signal_by_cell[c]) for c in cell_ids], dtype=float)
+    sig_range = float(sigs.max() - sigs.min()) if len(sigs) else 0.0
+    use_depth = signal_flat or sig_range < _SIGNAL_SPLIT_RANGE_DB
+    if not use_depth:
+        score = {c: float(signal_by_cell[c]) for c in comp}
+        peaks, plat_frac = _find_score_peaks(
+            comp, score, xy_by_cell, peak_sep, min_score=float(sigs.min()),
+        )
+        if not (plat_frac >= 0.45 and len(peaks) <= 1):
+            return peaks, None
+    depth = _boundary_depth(set(comp))
+    peaks = _find_depth_peaks(comp, depth, xy_by_cell, min_separation_m=peak_sep)
+    peaks = _merge_cloverleaf_peaks(
+        peaks, xy_by_cell, cell_ids, xs, ys, peak_sep,
+    )
+    return peaks, depth
+
+
+def _relative_core_threshold(sig: pd.Series) -> float:
+    """Strongest-band cutoff that keeps ~35% of this layer, not a global dBm.
+
+    Walks the provider's own bands from hottest to weakest and stops near
+    ``_ADAPTIVE_CORE_QUANTILE``, clamped to ``[_MIN_CORE_FRACTION, _MAX_CORE_FRACTION]``.
+    A T-Mobile filing peaked at -50 dBm and an AT&T filing peaked at -90 dBm
+    with the same spatial ranks therefore share one core geometry.
+    """
+    counts = sig.value_counts().sort_index(ascending=False)
+    total = max(int(len(sig)), 1)
+    target = _ADAPTIVE_CORE_QUANTILE * total
+    lo = _MIN_CORE_FRACTION * total
+    hi = _MAX_CORE_FRACTION * total
+    threshold = float(counts.index[0])
+    cum = 0
+    for value, n in counts.items():
+        nxt = cum + int(n)
+        if cum > 0 and nxt > hi and cum >= lo:
+            break
+        cum = nxt
+        threshold = float(value)
+        if cum >= target:
+            break
+    return threshold
 
 
 def _core_hexes(hex_df: pd.DataFrame, threshold_dbm: float) -> tuple[pd.DataFrame, bool]:
-    """Select the strong-signal "core" hexes, adapting to the provider's bands.
+    """Select the strong-signal core as a *relative* slice of this layer.
 
-    Returns ``(core_df, signal_is_flat)``. Providers report signal in different
-    band schemes; if the configured cutoff keeps most of the footprint (the
-    provider only files strong bands), tighten to that provider's own signal
-    quantile so the core stays discriminative. Binary sources (constant
-    signal, e.g. the Redshift 0/1 hex snapshots) carry no signal information:
-    the full footprint is returned and flagged flat so the caller relies on
-    coverage-shape (boundary depth) instead.
+    ``threshold_dbm`` is accepted for call-site compatibility; membership is
+    decided from this provider×vintage's own band histogram so hotter/colder
+    filings of the same footprint do not change which hexes seed a site.
+    Binary sources (one signal value) return the full footprint and
+    ``signal_is_flat=True``.
     """
     sig = hex_df["signal_dbm"]
     flat = int(sig.nunique()) <= 1
     if flat:
         return hex_df.copy(), True
-    strong = hex_df[sig >= threshold_dbm]
-    if len(strong) > _MAX_CORE_FRACTION * len(hex_df):
-        # Provider files only strong bands, so the configured cutoff keeps
-        # nearly everything. Walk the provider's own signal bands from
-        # strongest down and stop at the weakest band that still keeps the
-        # core under the cap; if even the top band alone exceeds the cap,
-        # use just the top band (best discrimination available).
-        counts = sig.value_counts().sort_index(ascending=False)
-        total = len(hex_df)
-        threshold = float(counts.index[0])
-        cum = 0
-        for value, n in counts.items():
-            cum += int(n)
-            if cum > _MAX_CORE_FRACTION * total:
-                break
-            threshold = float(value)
-        strong = hex_df[sig >= threshold]
-    return strong.copy(), False
+    _ = threshold_dbm
+    cutoff = _relative_core_threshold(sig)
+    return hex_df[sig >= cutoff].copy(), False
 
 
 def infer_sites(
@@ -340,49 +652,42 @@ def infer_sites(
         if len(comp) < min_hexes:
             continue
 
-        # Boundary-depth transform: recovers lobe structure from coverage
-        # SHAPE. Only needed for binary sources (flat signal) — when real
-        # signal is present the strong-signal core already isolates each
-        # tower's lobe, and splitting there would fragment legitimately
-        # inflated single-tower lobes and break same-site attribution.
-        if signal_flat:
-            depth = _boundary_depth(set(comp))
-            peaks = _find_depth_peaks(
-                comp, depth, xy_by_cell, min_separation_m=peak_sep,
-            )
-            lobes = _split_component_by_peaks(comp, peaks, xy_by_cell)
-        else:
-            depth = None
-            lobes = [comp]
+        peaks, depth = _peaks_for_component(
+            comp,
+            signal_flat=signal_flat,
+            signal_by_cell=signal_by_cell,
+            xy_by_cell=xy_by_cell,
+            peak_sep=peak_sep,
+        )
+        lobes = _split_component_by_peaks(comp, peaks, xy_by_cell)
 
-        for lobe in lobes:
+        for peak, lobe in lobes:
             if len(lobe) < max(3, min_hexes // max(1, len(lobes))):
                 continue
             xs = np.array([xy_by_cell[c][0] for c in lobe])
             ys = np.array([xy_by_cell[c][1] for c in lobe])
             sigs = np.array([signal_by_cell[c] for c in lobe])
-            # Centroid weighting: with real signal, weight by signal strength
-            # (strongest bands sit nearest the tower). With flat (binary)
-            # signal, weight by interior depth so the estimate anchors at the
-            # lobe core instead of the footprint's geometric mean.
-            if signal_flat:
-                w = np.array([depth[c] for c in lobe], dtype=float)
+            # Anchor on the peak/junction cell. A depth-weighted centroid of a
+            # 3-sector cloverleaf drifts into the fattest petal and then looks
+            # like a different tower in the next vintage.
+            if peak in xy_by_cell:
+                cx, cy = xy_by_cell[peak]
+                nearest_cell = peak
             else:
-                w = np.clip(sigs + 130.0, 1.0, None)
-            w = np.clip(w, 1e-9, None)
-            cx = float(np.average(xs, weights=w))
-            cy = float(np.average(ys, weights=w))
-            # Effective reach: distance from centroid to the farthest core hex.
-            # The full coverage lobe (incl. weaker bands) extends beyond the
-            # strong core, so attribution scales this up by a margin.
+                # Relative weights: hotter vs colder filings must not pull the
+                # fallback centroid. ``sigs + 130`` treated T-Mobile -50 as 4×
+                # an AT&T -110 hex of the same rank.
+                w = np.clip(sigs - float(np.min(sigs)) + 1.0, 1.0, None)
+                if depth is not None:
+                    w = np.array([depth[c] for c in lobe], dtype=float)
+                w = np.clip(w, 1e-9, None)
+                cx = float(np.average(xs, weights=w))
+                cy = float(np.average(ys, weights=w))
+                nearest_cell = lobe[int(np.argmin(np.hypot(xs - cx, ys - cy)))]
             reach = float(np.max(np.hypot(xs - cx, ys - cy)))
             if parent_steps:
                 reach *= (7 ** 0.5) ** parent_steps
             lng, lat = _INV.transform(cx, cy)
-            # Assign home geography from the cell nearest the inferred tower
-            # centroid. A modal lobe county can put a border tower in the wrong
-            # state merely because most of its propagation footprint crosses it.
-            nearest_cell = lobe[int(np.argmin(np.hypot(xs - cx, ys - cy)))]
             county = county_by_cell.get(nearest_cell)
             sites.append(
                 {

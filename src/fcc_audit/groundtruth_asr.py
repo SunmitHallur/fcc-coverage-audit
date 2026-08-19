@@ -54,29 +54,31 @@ _ASR_CO_FALLBACK_URL = (
     "https://wireless2.fcc.gov/UlsApp/AsrSearch/asrRegistration.jsp"
     "?fileType=CO&downloadFile=yes"
 )
-# The actual bulk download that ships as a ZIP:
-_ASR_BULK_URL = "https://wireless2.fcc.gov/UlsApp/AsrSearch/asrRegistration.zip"
+# Weekly complete ASR registration bundle (CO coordinates + RA metadata).
+# The old wireless2.fcc.gov asrRegistration.zip endpoint 404s.
+_ASR_BULK_URL = "https://data.fcc.gov/download/pub/uls/complete/r_tower.zip"
 
-# Column positions in the FCC ASR CO fixed-width / pipe-delimited format.
-# Format reference: https://www.fcc.gov/wireless/bureau-divisions/technologies-systems-and-innovation-division/tower-construction-notification
-_ASR_COLS = {
-    "registration_number": 0,
-    "unique_system_identifier": 1,
-    "lat_degrees": 4,
-    "lat_minutes": 5,
-    "lat_seconds": 6,
-    "lat_direction": 7,
-    "lon_degrees": 8,
-    "lon_minutes": 9,
-    "lon_seconds": 10,
-    "lon_direction": 11,
-    "height_support": 14,
-    "height_overall": 15,
-    "construction_date": 20,
-    "application_date": 26,
-    "status_code": 3,
-    "state_code": 17,
-    "county_code": 18,
+# CO.dat (coordinates) — pipe-delimited, record type in field 0.
+_CO_COLS = {
+    "unique_system_identifier": 3,
+    "registration_number": 4,
+    "lat_degrees": 6,
+    "lat_minutes": 7,
+    "lat_seconds": 8,
+    "lat_direction": 9,
+    "lon_degrees": 11,
+    "lon_minutes": 12,
+    "lon_seconds": 13,
+    "lon_direction": 14,
+}
+# RA.dat (registration): status, county GEOID, heights, dates.
+_RA_COLS = {
+    "unique_system_identifier": 3,
+    "registration_number": 4,
+    "status_code": 8,
+    "county_geoid": 26,
+    "height_support_m": 28,
+    "height_overall_m": 29,
 }
 # Alternatively use the simpler EN (entity) file which has cleaner columns.
 # The RA (registration) file has the most useful date fields.
@@ -134,83 +136,138 @@ def _to_decimal(degrees: Any, minutes: Any, seconds: Any, direction: Any) -> flo
         return None
 
 
-def _download_asr_co(cache_dir: Path) -> Path:
-    """Download the FCC ASR CO (construction) file and cache locally."""
+def _download_asr_bundle(cache_dir: Path) -> tuple[Path, Path]:
+    """Download the FCC weekly ASR zip and extract CO.dat + RA.dat."""
     cache_dir.mkdir(parents=True, exist_ok=True)
-    raw_zip = cache_dir / "asr_co_raw.zip"
-    raw_txt = cache_dir / "asr_co_raw.dat"
+    raw_zip = cache_dir / "r_tower.zip"
+    co_path = cache_dir / "CO.dat"
+    ra_path = cache_dir / "RA.dat"
+    if co_path.exists() and ra_path.exists():
+        return co_path, ra_path
 
-    if raw_txt.exists():
-        log.info("using cached ASR CO file: %s", raw_txt)
-        return raw_txt
-
-    log.info("downloading FCC ASR CO database (~50-100 MB) ...")
-    headers = {"User-Agent": "fcc-coverage-audit/0.1 (public-records-research)"}
-    resp = requests.get(_ASR_BULK_URL, timeout=_REQUEST_TIMEOUT, headers=headers, stream=True)
-    resp.raise_for_status()
-    raw_zip.write_bytes(resp.content)
-    log.info("download complete, extracting ...")
+    if not raw_zip.exists():
+        log.info("downloading FCC ASR registrations (~36 MB) ...")
+        headers = {"User-Agent": "fcc-coverage-audit/0.1 (public-records-research)"}
+        resp = requests.get(_ASR_BULK_URL, timeout=_REQUEST_TIMEOUT, headers=headers, stream=True)
+        resp.raise_for_status()
+        tmp = raw_zip.with_suffix(".zip.part")
+        with open(tmp, "wb") as fh:
+            for chunk in resp.iter_content(chunk_size=1 << 20):
+                if chunk:
+                    fh.write(chunk)
+        tmp.replace(raw_zip)
+        log.info("download complete, extracting ...")
 
     with zipfile.ZipFile(raw_zip) as zf:
-        # Find the CO.dat or co.dat file inside.
-        names = zf.namelist()
-        co_names = [n for n in names if n.lower().startswith("co") and n.lower().endswith(".dat")]
-        if not co_names:
-            co_names = [n for n in names if n.lower().endswith(".dat")]
-        if not co_names:
-            raise RuntimeError(f"No .dat file found in ASR ZIP. Contents: {names}")
-        log.info("extracting %s from ASR ZIP", co_names[0])
-        with zf.open(co_names[0]) as src, open(raw_txt, "wb") as dst:
-            dst.write(src.read())
-
-    raw_zip.unlink(missing_ok=True)
-    return raw_txt
+        names = {n.lower(): n for n in zf.namelist()}
+        for dest, key in ((co_path, "co.dat"), (ra_path, "ra.dat")):
+            if dest.exists():
+                continue
+            src_name = names.get(key)
+            if src_name is None:
+                raise RuntimeError(f"{key} not in ASR ZIP. Contents: {zf.namelist()}")
+            dest.write_bytes(zf.read(src_name))
+    return co_path, ra_path
 
 
-def _parse_asr_co(raw_path: Path) -> pd.DataFrame:
-    """Parse the ASR CO (construction) pipe-delimited file into a DataFrame."""
-    log.info("parsing ASR CO file: %s", raw_path)
+def _parse_asr_co_coords(co_path: Path) -> pd.DataFrame:
+    """Parse ASR CO.dat coordinates keyed by unique system identifier."""
     rows = []
-    with open(raw_path, "r", encoding="latin-1", errors="replace") as fh:
+    with open(co_path, "r", encoding="latin-1", errors="replace") as fh:
         for line in fh:
             parts = line.rstrip("\n").split("|")
-            if len(parts) < 25:
+            if len(parts) < 15 or parts[0] != "CO":
                 continue
             try:
                 lat = _to_decimal(
-                    parts[_ASR_COLS["lat_degrees"]],
-                    parts[_ASR_COLS["lat_minutes"]],
-                    parts[_ASR_COLS["lat_seconds"]],
-                    parts[_ASR_COLS["lat_direction"]],
+                    parts[_CO_COLS["lat_degrees"]],
+                    parts[_CO_COLS["lat_minutes"]],
+                    parts[_CO_COLS["lat_seconds"]],
+                    parts[_CO_COLS["lat_direction"]],
                 )
                 lng = _to_decimal(
-                    parts[_ASR_COLS["lon_degrees"]],
-                    parts[_ASR_COLS["lon_minutes"]],
-                    parts[_ASR_COLS["lon_seconds"]],
-                    parts[_ASR_COLS["lon_direction"]],
+                    parts[_CO_COLS["lon_degrees"]],
+                    parts[_CO_COLS["lon_minutes"]],
+                    parts[_CO_COLS["lon_seconds"]],
+                    parts[_CO_COLS["lon_direction"]],
                 )
-                if lat is None or lng is None:
-                    continue
-                state = parts[_ASR_COLS["state_code"]].strip()
-                county = parts[_ASR_COLS["county_code"]].strip()
-                construct_dt = _parse_date(parts[_ASR_COLS["construction_date"]])
-                app_dt = _parse_date(parts[_ASR_COLS["application_date"]])
-                status = parts[_ASR_COLS["status_code"]].strip()
-                rows.append({
-                    "lat": lat,
-                    "lng": lng,
-                    "state_code": state,
-                    "county_code": county,
-                    "construction_date": construct_dt,
-                    "application_date": app_dt,
-                    "status_code": status,
-                })
             except (IndexError, ValueError):
                 continue
-
-    df = pd.DataFrame(rows)
-    log.info("parsed %d ASR CO records", len(df))
+            if lat is None or lng is None:
+                continue
+            if not (15.0 <= lat <= 72.0 and -180.0 <= lng <= -60.0):
+                continue
+            rows.append({
+                "unique_id": parts[_CO_COLS["unique_system_identifier"]].strip(),
+                "registration_number": parts[_CO_COLS["registration_number"]].strip(),
+                "lat": lat,
+                "lng": lng,
+            })
+    df = pd.DataFrame(rows).drop_duplicates("unique_id", keep="first")
+    log.info("parsed %d ASR CO coordinates", len(df))
     return df
+
+
+def _parse_asr_ra(ra_path: Path) -> pd.DataFrame:
+    """Parse ASR RA.dat registration metadata."""
+    rows = []
+    with open(ra_path, "r", encoding="latin-1", errors="replace") as fh:
+        for line in fh:
+            parts = line.rstrip("\n").split("|")
+            if len(parts) < 30 or parts[0] != "RA":
+                continue
+            geoid = parts[_RA_COLS["county_geoid"]].strip()
+            if len(geoid) != 5 or not geoid.isdigit():
+                continue
+            height = None
+            for idx in (_RA_COLS["height_overall_m"], _RA_COLS["height_support_m"]):
+                try:
+                    height = float(parts[idx])
+                    break
+                except (TypeError, ValueError, IndexError):
+                    continue
+            event_date = None
+            for idx in (12, 14, 9, 10, 11):
+                if idx < len(parts):
+                    event_date = _parse_date(parts[idx])
+                    if event_date is not None:
+                        break
+            rows.append({
+                "unique_id": parts[_RA_COLS["unique_system_identifier"]].strip(),
+                "status_code": parts[_RA_COLS["status_code"]].strip(),
+                "county_geoid": geoid,
+                "height_m": height,
+                "event_date": event_date,
+            })
+    df = pd.DataFrame(rows).drop_duplicates("unique_id", keep="first")
+    log.info("parsed %d ASR RA registrations", len(df))
+    return df
+
+
+def _parse_asr_joined(co_path: Path, ra_path: Path) -> pd.DataFrame:
+    coords = _parse_asr_co_coords(co_path)
+    meta = _parse_asr_ra(ra_path)
+    df = meta.merge(coords, on="unique_id", how="inner")
+    log.info("joined %d ASR structures with coordinates", len(df))
+    return df
+
+
+def _download_asr_co(cache_dir: Path) -> Path:
+    """Back-compat wrapper: extract CO.dat and return its path."""
+    co_path, _ra_path = _download_asr_bundle(cache_dir)
+    return co_path
+
+
+def _parse_asr_co(raw_path: Path) -> pd.DataFrame:
+    """Back-compat: CO coordinates only (no county). Prefer load_asr_structures."""
+    df = _parse_asr_co_coords(raw_path)
+    df = df.rename(columns={"unique_id": "status_code"})
+    df["state_code"] = ""
+    df["county_code"] = ""
+    df["construction_date"] = pd.NaT
+    df["application_date"] = pd.NaT
+    df["status_code"] = ""
+    return df[["lat", "lng", "state_code", "county_code", "construction_date", "application_date", "status_code"]]
 
 
 def _build_county_geoid(state_code: str, county_code: str) -> str | None:
@@ -223,31 +280,45 @@ def _build_county_geoid(state_code: str, county_code: str) -> str | None:
         return None
 
 
-def _load_or_build_asr_df(cache_dir: Path) -> pd.DataFrame:
-    """Load cached ASR structures parquet, or download and parse from scratch."""
+def load_asr_structures(
+    cache_dir: Path | str = Path("data/groundtruth/asr"),
+    *,
+    status_codes: tuple[str, ...] = ("C",),
+    min_height_m: float | None = 15.0,
+) -> pd.DataFrame:
+    """Return geocoded ASR structures (one row per unique system id).
+
+    Default keeps constructed (``C``) structures at least 15 m tall — a
+    conservative cell-tower-like subset. ASR is incomplete (many rooftop and
+    small sites are unregistered) so this is corroboration, not a full census.
+    """
+    cache_dir = Path(cache_dir)
     parsed_cache = cache_dir / "asr_structures.parquet"
     if parsed_cache.exists():
-        log.info("loading cached ASR structures: %s", parsed_cache)
-        return pd.read_parquet(parsed_cache)
+        df = pd.read_parquet(parsed_cache)
+    else:
+        co_path, ra_path = _download_asr_bundle(cache_dir)
+        df = _parse_asr_joined(co_path, ra_path)
+        keep = ["unique_id", "lat", "lng", "county_geoid", "event_date", "status_code", "height_m"]
+        df = df[keep].copy()
+        df.to_parquet(parsed_cache, index=False)
+        log.info("cached %d ASR structures -> %s", len(df), parsed_cache)
 
-    raw_path = _download_asr_co(cache_dir)
-    df = _parse_asr_co(raw_path)
+    if status_codes:
+        df = df[df["status_code"].isin(status_codes)]
+    if min_height_m is not None and "height_m" in df.columns:
+        df = df[df["height_m"].fillna(min_height_m + 1) >= min_height_m]
+    return df.reset_index(drop=True)
 
-    # Build county_geoid and filter to continental US records with usable dates.
-    df["county_geoid"] = df.apply(
-        lambda r: _build_county_geoid(r["state_code"], r["county_code"]), axis=1
-    )
+
+def _load_or_build_asr_df(cache_dir: Path) -> pd.DataFrame:
+    """Load cached ASR structures parquet, or download and parse from scratch."""
+    df = load_asr_structures(cache_dir, status_codes=(), min_height_m=None)
     df = df.dropna(subset=["county_geoid"])
-
-    # Use construction_date; fall back to application_date.
-    df["event_date"] = df["construction_date"].combine_first(df["application_date"])
-    df = df.dropna(subset=["event_date"])
-
-    keep = ["lat", "lng", "county_geoid", "event_date", "status_code"]
-    df = df[keep].copy()
-    df.to_parquet(parsed_cache, index=False)
-    log.info("cached %d ASR structures -> %s", len(df), parsed_cache)
-    return df
+    if "event_date" in df.columns:
+        df = df.dropna(subset=["event_date"])
+    keep = [c for c in ("lat", "lng", "county_geoid", "event_date", "status_code") if c in df.columns]
+    return df[keep].copy()
 
 
 def fetch_asr_labels(
