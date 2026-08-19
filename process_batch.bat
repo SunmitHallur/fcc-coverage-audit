@@ -27,5 +27,4 @@ echo     .venv\Scripts\python.exe -m fcc_audit.cli build-web
 echo   Preview partial:
 echo     .venv\Scripts\python.exe -m fcc_audit.cli build-web --allow-incomplete
 echo   View locally:
-echo     cd web
-echo     ..\.venv\Scripts\python.exe -m http.server 8000
+echo     .venv\Scripts\python.exe -m fcc_audit.cli serve

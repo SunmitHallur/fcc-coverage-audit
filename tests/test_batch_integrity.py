@@ -475,7 +475,7 @@ def test_windows_launcher_runs_exact_national_batches_and_final_build():
 
     launcher = (root / "run.bat").read_text(encoding="utf-8")
     assert "run_overnight.ps1" in launcher
-    assert "web\\index.html" in launcher or "web\\" in launcher
+    assert "fcc_audit.cli serve" in launcher or "web\\" in launcher
 
 
 def test_unix_launchers_match_national_contract():
@@ -486,7 +486,7 @@ def test_unix_launchers_match_national_contract():
     process_bat = (root / "process_batch.bat").read_text(encoding="utf-8")
 
     assert "run_overnight.sh" in run_sh
-    assert "web/index.html" in run_sh or "http.server 8000" in run_sh
+    assert "fcc_audit.cli serve" in run_sh or "http.server 8000" in run_sh
     assert "dashboard/index.html" not in run_sh
 
     assert "--workers 6" in overnight

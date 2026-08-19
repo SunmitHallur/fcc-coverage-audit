@@ -89,7 +89,7 @@ fi
 echo "=== Overnight run finished $(date) ===" | tee -a "$LOG"
 $PY -m fcc_audit.cli "${BACKEND_ARGS[@]}" build-web 2>&1 | tee -a "$LOG"
 
-echo "Done. Serve with: cd web && python3 -m http.server 8000" | tee -a "$LOG"
+echo "Done. Serve with: python -m fcc_audit.cli serve  (http://127.0.0.1:8000)" | tee -a "$LOG"
 
 if [[ "$PUBLISH" -eq 1 ]]; then
   echo "=== --publish: committing and pushing web bundle ===" | tee -a "$LOG"

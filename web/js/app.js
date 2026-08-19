@@ -454,8 +454,14 @@ const DATA_BASE = 'public/data';
       const geoid = rec.geoid;
       const key = `${pid}/${safeServiceKey(svc)}/${geoid}`;
       if (detailCache[key]) return detailCache[key];
-      const url = `${DATA_BASE}/details/${pid}/${safeServiceKey(svc)}/${geoid}.json`;
-      const res = await fetch(url);
+      const api = `/api/county?geoid=${encodeURIComponent(geoid)}`
+        + `&provider=${encodeURIComponent(pid)}`
+        + `&service=${encodeURIComponent(svc)}`;
+      let res = await fetch(api);
+      if (!res.ok) {
+        const url = `${DATA_BASE}/details/${pid}/${safeServiceKey(svc)}/${geoid}.json`;
+        res = await fetch(url);
+      }
       if (!res.ok) return null;
       const data = await res.json();
       detailCache[key] = data;

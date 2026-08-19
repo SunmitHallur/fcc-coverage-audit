@@ -118,7 +118,7 @@ Then pick the command you actually need:
 | Preflight | `python -m fcc_audit.cli doctor` (add `--backend redshift` on the warehouse) |
 | Smoke one state | `--backend files run --states 20 --workers 2` (cached parquet) or `--backend redshift run --states 20 --workers 2` |
 | Full national | `./run_overnight.sh` (Linux) or `.\run_overnight.ps1` (Windows) |
-| View the map | `cd web && python3 -m http.server 8000` → http://127.0.0.1:8000 |
+| View the map | `python -m fcc_audit.cli serve` → http://127.0.0.1:8000 |
 
 `doctor` checks the interpreter, heavy imports, the **active** backend
 (`files` / `fcc` / `redshift` / `fixture`), CPU count (suggests `--workers`),
@@ -131,8 +131,9 @@ readable. Schema `bdc_dataplatform` lives in **`db_fcc_bdc`**, not
 
 You do **not** need to re-run the national pipeline after every pull. Pull +
 `pip install` is enough if you only want the latest code; `run` / overnight
-only when you want new scores. Viewing the map uses whatever is already in
-`web/public/data/`.
+only when you want new scores. `serve` cooks one county on click from processed
+parquet (see [docs/server_hosting.md](docs/server_hosting.md) for Docker on
+Mike's box).
 
 ### 1. Try it offline first (no FCC / Redshift access needed)
 
@@ -198,6 +199,8 @@ python -m fcc_audit.cli run                      # download + analyze, Big 4 + a
 python -m fcc_audit.cli run --states 01,02       # one state batch (keep Redshift caches)
 python -m fcc_audit.cli run --states 01,02 --cleanup-raw   # FCC only: bound disk
 python -m fcc_audit.cli build-web                # rebuild web bundle from ALL batches
+python -m fcc_audit.cli build-web --no-details   # map shell only; clicks cooked by serve
+python -m fcc_audit.cli serve                    # local map + on-demand county JSON
 python -m fcc_audit.cli run --current "292" --prior "291"   # Redshift build ids (D25/J25)
 ```
 
@@ -302,25 +305,36 @@ If you only care about the FCC's current funding focus, keep it to **5G-NR**
 open data/outputs/priority_ranking_*.csv
 open data/outputs/summary_*.md
 
-# Interactive web app (county choropleth + plain-language explanations)
-cd web && python3 -m http.server 8000
+# Interactive web app — cook one county on click (parquet + GeoPackage)
+python -m fcc_audit.cli serve
 # then open http://127.0.0.1:8000
+# static files only: cd web && python3 -m http.server 8000
 
 # Legacy dashboard (point markers)
 cd dashboard && python3 -m http.server 8000
 ```
 
-### 5. Deploy to Vercel
+### 5. Deploy
 
-The `web/` folder is a static site ready for Vercel:
+**Mike's Linux box (recommended):** ingredient-cook in Docker. Overnight on the
+laptop writes parquet; a container cooks one county on click. Same Apache
+reverse-proxy pattern as his other Docker apps. See
+[docs/server_hosting.md](docs/server_hosting.md).
+
+```bash
+python -m fcc_audit.cli build-web --no-details
+./deploy/sync-ingredients.sh user@host
+# on the server: docker compose up -d --build
+```
+
+**Vercel (static only):** the `web/` folder can still be hosted as files. County
+clicks then need pre-plated `details/*.json` (`build-web` without `--no-details`).
 
 1. Push this repo to GitHub (or your FCC private repo).
 2. Go to [vercel.com](https://vercel.com) → **Add New Project** → import the repo.
 3. Leave **Root Directory** blank (repo root). The root `vercel.json` sets
    `outputDirectory` to `web` automatically. No build command needed.
 4. Every `git push` that updates `web/public/data/` auto-redeploys the site.
-
-Or deploy from CLI:
 
 ```bash
 npx vercel --prod    # from repo root (vercel.json points at web/)
@@ -334,8 +348,10 @@ counties highlighted in red.
 
 ### 6. Work laptop (local website, no Vercel)
 
-On a locked-down work machine, skip Vercel entirely. The website is static files
-under `web/` — no server-side code, no external hosting required.
+On a locked-down work machine, skip Vercel. After overnight, view the map with
+`python -m fcc_audit.cli serve` (a click asks Python to slice one county from
+parquet + the TIGER GeoPackage). Mike's public site uses the same cook inside
+Docker — see [docs/server_hosting.md](docs/server_hosting.md).
 
 #### One-time (first clone only)
 
@@ -393,9 +409,8 @@ Then only the step you need:
 python -m fcc_audit.cli --backend redshift run --build-web
 # or double-click run.bat  (full national overnight)
 
-# View the map (seconds). Needs web/public/data/ from a prior run.
-cd web
-python -m http.server 8000
+# View the map (seconds). Needs processed parquet from a prior run.
+python -m fcc_audit.cli serve
 # open http://127.0.0.1:8000
 ```
 
@@ -403,8 +418,9 @@ VS Code: open the folder, let it pick up `.vscode/settings.json` (sets
 `PYTHONPATH=src`), then **Terminal → Run Task** for *Run pipeline (Redshift)*,
 *Build web bundle*, or *Serve website locally*.
 
-Click any county to see **before/after coverage maps** and **tower counts** (detail
-files are written to `web/public/data/details/` during `build-web`).
+Click any county to see **before/after coverage maps** and **tower counts**.
+`serve` cooks that JSON on click. Static `web/public/data/details/` is only
+needed for Vercel / plain `http.server`.
 
 ---
 

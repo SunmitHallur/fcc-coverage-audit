@@ -130,6 +130,48 @@ def test_write_web_bundle_removes_stale_snapshot_files(tmp_path):
     assert meta["provider_services"] == {"130077": ["5G-NR 7/1"]}
 
 
+def test_write_web_bundle_no_details_skips_preplated_json(tmp_path):
+    import geopandas as gpd
+    import pandas as pd
+    from shapely.geometry import box
+
+    web_dir = tmp_path / "web"
+    data_dir = web_dir / "public" / "data"
+    scored = pd.DataFrame([{
+        "provider_id": 130077,
+        "provider_name": "AT&T",
+        "technology": "5G-NR 7/1",
+        "county_geoid": "20001",
+        "county_name": "Allen",
+        "state_fips": "20",
+        "priority_score": 0.9,
+        "flag_for_review": True,
+        "added_km2": 12.0,
+    }])
+    counties = gpd.GeoDataFrame([{
+        "county_geoid": "20001",
+        "county_name": "Allen",
+        "state_fips": "20",
+        "geometry": box(-96.0, 37.5, -95.5, 38.0),
+    }], crs="EPSG:4326")
+    coverage = pd.DataFrame({
+        "h3": ["8928308280fffff"],
+        "signal_dbm": [-90.0],
+        "county_geoid": ["20001"],
+        "provider_id": [130077],
+        "technology": ["5G-NR 7/1"],
+        "vintage": ["current"],
+    })
+    write_web_bundle(
+        scored, pd.DataFrame(), counties, web_dir,
+        {"current": "292", "prior": "291", "states_processed": "20"},
+        coverage=coverage,
+        write_details=False,
+    )
+    assert (data_dir / "records" / "130077" / "5G-NR7-1.json").exists()
+    assert not (data_dir / "details").exists() or not list((data_dir / "details").rglob("*.json"))
+
+
 def test_build_web_meta_lists_services_by_provider():
     import pandas as pd
 

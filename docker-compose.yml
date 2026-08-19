@@ -1,0 +1,28 @@
+# Ingredient-cook server for Mike's Linux box (same pattern as his other Docker apps).
+#
+# Overnight on the laptop writes ingredients (parquet + GeoPackage).
+# This container is the cook: GET /api/county slices one county to JSON.
+# Apache on the host still terminates TLS and proxies to 127.0.0.1:8000.
+#
+#   docker compose up -d --build
+#   docker compose logs -f
+
+services:
+  cook:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: fcc-coverage-audit:cook
+    container_name: fcc-coverage-cook
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./src:/app/src:ro
+      - ./web:/app/web:ro
+      - ./config:/app/config:ro
+      - ./data/processed:/app/data/processed:ro
+      - ./data/interim:/app/data/interim:ro
+    environment:
+      PYTHONPATH: src
+    command: ["python", "-m", "fcc_audit.serve", "--host", "0.0.0.0", "--port", "8000"]

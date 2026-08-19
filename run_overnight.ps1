@@ -92,7 +92,7 @@ if ($LASTEXITCODE -ne 0) {
   exit $code
 }
 
-Write-Host ("DONE in {0:hh\:mm}. Outputs in data\outputs\ ; serve web with: cd web; python -m http.server 8000" -f `
+Write-Host ("DONE in {0:hh\:mm}. Outputs in data\outputs\ ; serve with: python -m fcc_audit.cli serve" -f `
   ((Get-Date) - $start)) -ForegroundColor Green
 Write-Host "Log: $log" -ForegroundColor Green
 

@@ -38,5 +38,5 @@ fi
 
 echo
 echo "Done. Outputs are in data/outputs/"
-echo "Serve the web app:  cd web && python3 -m http.server 8000"
-echo "then open http://localhost:8000"
+echo "Serve the web app:  python -m fcc_audit.cli serve"
+echo "then open http://127.0.0.1:8000"

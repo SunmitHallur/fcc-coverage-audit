@@ -40,7 +40,7 @@ if errorlevel 1 (
 )
 
 echo.
-echo Done. Outputs are in data\outputs\  Open web\index.html via a local server:
-echo   cd web ^&^& ..\.venv\Scripts\python.exe -m http.server 8000
+echo Done. Outputs are in data\outputs\  Open the map with:
+echo   .venv\Scripts\python.exe -m fcc_audit.cli serve
 pause
 endlocal

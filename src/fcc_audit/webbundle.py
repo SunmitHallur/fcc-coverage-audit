@@ -25,7 +25,6 @@ from shapely.geometry import mapping
 
 from .explain import explain_row, add_explanations
 from . import attribute
-from . import map_render
 
 log = logging.getLogger(__name__)
 
@@ -738,6 +737,8 @@ def write_county_details(
             # By default the cockpit renders hexes client-side via deck.gl H3HexagonLayer,
             # which is ~1.4 MB/county cheaper and works at res 9/10.
             if render_pngs:
+                from . import map_render
+
                 all_sites_list = (detail.get("sites_prior") or []) + (detail.get("sites_current") or [])
                 render_extent = map_render.compute_render_extent(
                     detail.get("county_boundary"), all_sites_list,
@@ -833,6 +834,7 @@ def write_web_bundle(
     weights: dict[str, float] | None = None,
     render_pngs: bool = False,
     top_n: int = 250,
+    write_details: bool = True,
 ) -> dict[str, Path]:
     """Write static web data bundle under ``web/public/data/``."""
     data_dir = web_dir / "public" / "data"
@@ -899,16 +901,17 @@ def write_web_bundle(
         tower_paths[str(pid)] = tp
 
     detail_count = 0
-    if coverage_paths:
-        detail_count = write_county_details_from_parquets(
-            scored, coverage_paths, sites, data_dir, meta, counties=counties,
-            render_pngs=render_pngs,
-        )
-    elif coverage is not None and not coverage.empty:
-        detail_count = write_county_details(
-            scored, coverage, sites, data_dir, meta, counties=counties,
-            render_pngs=render_pngs,
-        )
+    if write_details:
+        if coverage_paths:
+            detail_count = write_county_details_from_parquets(
+                scored, coverage_paths, sites, data_dir, meta, counties=counties,
+                render_pngs=render_pngs,
+            )
+        elif coverage is not None and not coverage.empty:
+            detail_count = write_county_details(
+                scored, coverage, sites, data_dir, meta, counties=counties,
+                render_pngs=render_pngs,
+            )
 
     log.info(
         "wrote web bundle: %d records, %d providers, %d tower files, %d county details",
