@@ -186,13 +186,14 @@ scoring:
   # gate (below) — high same-site share alone is normal 6-month growth.
   suspicious_same_site_growth: 0.50
   # Implausibility gates: at least ONE must fire alongside same_site_growth for
-  # a county to be flagged via the same-site path. This prevents flagging normal
-  # single-tower expansions (antenna/carrier upgrades, modest lobe growth).
-  suspicious_same_site_min_county_frac: 0.05   # added_frac_of_county threshold
+  # a county to be flagged via the same-site path. Calibrated on 382 live
+  # Verizon 7/1 counties (J25 vs D25): 7.5% catches Middlesex-scale urban fill
+  # (7.8%) and misses Sullivan/Lewis-scale modest growth (3–6%).
+  suspicious_same_site_min_county_frac: 0.075  # added_frac_of_county threshold
   suspicious_same_site_min_blanket: 0.20        # blanket_fillin threshold
   # Disabled as a flag gate: inference misses look like 100% unattributed
   # and were minting false "coverage from nowhere" reviews. Unattributed
-  # remains a score feature only.
+  # remains available as a score feature (weight 0 after calibration).
   suspicious_same_site_min_unattributed: 1.01
   # Magnitude gate (learned from FCC examples): a county must add at least this
   # much in-county 5G coverage to be eligible for flagging. Prevents flagging
@@ -201,9 +202,10 @@ scoring:
   # is reliable across resolutions; ~10 km^2 works for pilots and nationwide runs.
   min_added_km2_to_flag: 10.0
   # Calibrated operating ranges: raw feature / range → [0, 1] before weighting.
-  # added_frac_of_county saturates at 5% of county (typical large jump).
+  # added_frac saturates at 15% of county so a 5% jump is not already maxed
+  # (Pearl River ~21% still saturates; a 5% modest expansion does not).
   feature_operating_ranges:
-    added_frac_of_county: 0.05
+    added_frac_of_county: 0.15
   # Maximum influence of any one feature is 0.25. Positive = monotonically
   # raises suspicion; negative = monotonically lowers it. Features not listed
   # are ignored. Weights encode the FCC-verified selection patterns (see
@@ -220,11 +222,11 @@ scoring:
     coverage_increase_magnitude: 0.10   # bounded relative jump, absolute-gated
     # --- SECONDARY: implausibility / gaming signals ---
     blanket_fillin: 0.14                # low baseline -> near-complete fill (P5, rural)
-    same_site_growth_share: 0.16        # growth claimed from EXISTING towers (P6)
-    unattributed_share: 0.10            # coverage far from any inferred tower / flat polygons (P6)
+    same_site_growth_share: 0.22        # growth claimed from EXISTING towers (P6)
+    unattributed_share: 0.0             # off: inference misses look like 100% unattributed
     boundary_snap_share: 0.08           # new coverage hugging the county boundary
     # --- legitimacy (reduces suspicion) ---
-    new_site_share: -0.10               # growth from genuine new towers
+    new_site_share: -0.22               # growth from genuine new towers (Edmunds-style)
     # signal_jump_implausibility: 0.0   # available; off (Menard-type degradation ignored)
     # historical_volatility: 0.10       # enable once >2 vintages are processed
     # --- independent ground-truth corroboration ---
@@ -241,9 +243,10 @@ groundtruth:
     enabled: true
     cache_dir: "data/groundtruth/asr"
     site_match_radius_m: 2000
-    # Move inferred pins onto the mast when uniquely this close. Wider than
-    # this is recorded as asr_matched but not snapped (urban macros ~1 km).
-    site_snap_radius_m: 500
+    # Move inferred pins onto the mast when uniquely this close. 750 m covers
+    # the rural peak-vs-mast offset (~650 m median in Pearl River); 1 km+ is
+    # recorded as asr_matched but not snapped (urban macros / rooftops).
+    site_snap_radius_m: 750
     # Map Redshift process/build ids (and filing labels) to calendar dates for
     # the ASR construction window. Filing labels pass through as-is.
     vintage_dates:

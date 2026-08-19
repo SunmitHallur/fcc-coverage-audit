@@ -95,3 +95,10 @@ pipeline's selected/not-selected decision matches the FCC's. Use it to tune
 > Note: the FCC's full selection methodology may include factors beyond coverage
 > change (e.g. population, prior challenges). If a complete list of selected
 > counties for J25->D25 is available, add them here to tune precision/recall.
+>
+> **Do not freeze these FIPS as must-flag.** Providers can resubmit. On the
+> current public Verizon 7/1 J25 vs D25 filings (2026-08-19): Mills and San Saba
+> *lost* covered area; Lewis is a modest 3% same-site bump; Edmunds and the
+> Colorado trio now show large in-county gains. The scorer is calibrated against
+> that live physics (prefer false negatives over false flags). See
+> `data/eval/labeled_counties_calibrated.json`.

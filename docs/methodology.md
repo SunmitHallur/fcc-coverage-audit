@@ -139,23 +139,25 @@ A high `same_site_growth_share` alone is **not** flagged. Normal 6-month organic
 
 | Gate | Threshold | Meaning |
 |------|-----------|---------|
-| `added_frac_of_county` | ≥ 15% | Growth covers most of the county |
+| `added_frac_of_county` | ≥ 7.5% | Growth is a meaningful share of the county (Middlesex-scale urban fill) |
 | `blanket_fillin` | ≥ 20% | Coverage appeared simultaneously everywhere |
-| `unattributed_share` | ≥ 20% | Hexes not attributable to any real site |
+| `unattributed_share` | disabled (1.01) | Inference misses look like 100% unattributed; not a flag gate |
 
 Configuration in `config/pipeline.yaml`:
 ```yaml
 scoring:
   suspicious_same_site_growth: 0.50
-  suspicious_same_site_min_county_frac: 0.15
+  suspicious_same_site_min_county_frac: 0.075
   suspicious_same_site_min_blanket: 0.20
-  suspicious_same_site_min_unattributed: 0.20
+  suspicious_same_site_min_unattributed: 1.01
 ```
+
+Majority new-site growth (`new_site_share` ≥ 50% with at least one new inferred tower) is treated as legitimate build and is not flagged, even when the area jump is large.
 
 ### 5c. Ground truth amplification
 
 When ASR and/or measured coverage data is available, the anomaly features include:
-- `asr_no_new_structure` (weight 0.0): missing ASR is not a census of rooftops/small cells and does not flag a county by itself. When a registered mast is within 500 m, inferred pins snap onto it.
+- `asr_no_new_structure` (weight 0.0): missing ASR is not a census of rooftops/small cells and does not flag a county by itself. When a registered mast is uniquely within 750 m, inferred pins snap onto it.
 - `measurement_gap` (weight 0.10): coverage claimed but not observed in field data is suspicious.
 
 These do **not** independently flag a county — they amplify the score of an already-anomalous filing.
@@ -169,9 +171,14 @@ These do **not** independently flag a county — they amplify the score of an al
 | `flag_percentile` | 0.95 | Top 5% of anomaly scores; prefer missing some gaming over sending reviewers on false flags |
 | `min_added_km2_to_flag` | 10.0 km² | Ignore trivial / near-empty county changes (FCC-validated) |
 | `suspicious_same_site_growth` | 0.50 | 50% same-site share is not itself suspicious; only the combination matters |
+| `suspicious_same_site_min_county_frac` | 0.075 | Live Verizon 7/1 J25→D25: catches Middlesex 7.8% urban fill; misses 3–6% modest growth |
 | `min_site_hexes` | 35 (at H3 res 9) | ~3.7 km² minimum blob to infer a site at res 9; prevents noise |
 | `peak_separation_m` | 500 | Minimum spacing between accepted *signal* peaks within one footprint (NMS); independent of cross-vintage match. Depth NMS on blobs ≥4000 hexes uses 2 km so county-scale fill does not tile at 500 m |
 | `site_match_radius_m` | 2000 | Cross-vintage site identity match radius |
+| `site_snap_radius_m` | 750 | Unique ASR within 750 m (rural peak-vs-mast offset); ambiguous urban pairs are not snapped |
+| Feature weight: `same_site_growth_share` | 0.22 | Calibrated against 382-county Verizon 7/1 cohort |
+| Feature weight: `new_site_share` | −0.22 | New-tower majority is exculpatory |
+| Feature weight: `unattributed_share` | 0.0 | Off; inference misses were driving false flags |
 | Feature weight: `asr_no_new_structure` | 0.0 | Disabled as a score driver; ASR is used to snap nearby pins, not to flag |
 
 ---

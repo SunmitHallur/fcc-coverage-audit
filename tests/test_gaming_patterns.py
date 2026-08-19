@@ -112,6 +112,38 @@ def test_two_peaks_on_one_mast_collapse():
     assert bool(out.iloc[0]["asr_snapped"])
 
 
+def test_ambiguous_two_masts_does_not_steal_neighbor():
+    """Peak between two macros must not snap onto the slightly closer one."""
+    sites = pd.DataFrame({
+        "site_id": ["A"],
+        "lat": [30.5240],
+        "lng": [-89.6770],
+        "n_hexes": [40],
+        "county_geoid": [GEOID],
+        "site_class": ["stable_site"],
+        "reach_m": [8000.0],
+    })
+    asr = pd.DataFrame({
+        "lat": [30.5255, 30.5228],
+        "lng": [-89.6770, -89.6770],
+    })
+    out = anchor_sites_to_asr(sites, asr, radius_m=2000, snap_radius_m=500)
+    assert bool(out.iloc[0]["asr_matched"])
+    assert not bool(out.iloc[0]["asr_snapped"])
+    assert abs(float(out.iloc[0]["lat"]) - 30.5240) < 1e-9
+
+
+def test_modest_same_site_lobe_growth_does_not_flag(cfg):
+    """Ordinary 6-month antenna/software growth is not a review case."""
+    towers = [(30.52, -89.68), (30.58, -89.62)]
+    prior = _merge_disks([_disk(*t, 10) for t in towers])
+    current = _merge_disks([_disk(*t, 12) for t in towers])
+    row, _, _ = _score_pair(prior, current, cfg, county_km2=2500.0)
+    assert float(row["same_site_growth_share"]) >= 0.50
+    assert float(row["added_frac_of_county"]) < 0.05
+    assert not bool(row["flag_for_review"])
+
+
 def test_far_asr_is_matched_but_not_snapped():
     sites = pd.DataFrame({
         "site_id": ["A"],
@@ -166,6 +198,52 @@ def test_empty_county_below_area_floor_does_not_flag(cfg):
     row, _, _ = _score_pair(prior, current, cfg, county_km2=2800.0)
     assert float(row["added_km2"]) < 10
     assert not bool(row["flag_for_review"])
+
+
+def test_in_county_new_towers_do_not_flag_in_large_cohort(cfg):
+    """Edmunds-style: huge area gain from new macros must not rank as gaming."""
+    rows = []
+    for i in range(60):
+        rows.append({
+            "case": f"c{i}",
+            "provider_id": 131425,
+            "provider_name": "Verizon",
+            "technology": "5G-NR 7/1",
+            "county_geoid": f"{i:05d}",
+            "county_name": "X",
+            "added_km2": 20.0 if i else 1500.0,
+            "added_frac_of_county": 0.02 if i else 0.53,
+            "coverage_increase_magnitude": 0.10 if i else 1.0,
+            "blanket_fillin": 0.02 if i else 0.43,
+            "same_site_growth_share": 0.20 if i else 0.25,
+            "unattributed_share": 0.05,
+            "boundary_snap_share": 0.0,
+            "new_site_share": 0.30 if i else 0.75,
+            "asr_no_new_structure": 0.0,
+            "new_towers": 0 if i else 4,
+            "new_towers_cross_border": 0,
+        })
+    scored = score(pd.DataFrame(rows), cfg)
+    target = scored[scored["county_geoid"] == "00000"].iloc[0]
+    assert not bool(target["flag_for_review"])
+
+
+def test_rural_peak_650m_from_unique_mast_snaps():
+    """Rural macros sit ~650 m from inferred peaks; 750 m snap is still unique."""
+    sites = pd.DataFrame({
+        "site_id": ["A"],
+        "lat": [30.5200],
+        "lng": [-89.6800],
+        "n_hexes": [40],
+        "county_geoid": [GEOID],
+        "site_class": ["stable_site"],
+        "reach_m": [8000.0],
+    })
+    # ~650 m north of the peak (1 deg lat ≈ 111 km).
+    asr = pd.DataFrame({"lat": [30.52585], "lng": [-89.6800]})
+    out = anchor_sites_to_asr(sites, asr, radius_m=2000, snap_radius_m=750)
+    assert bool(out.iloc[0]["asr_snapped"])
+    assert abs(float(out.iloc[0]["lat"]) - 30.52585) < 1e-9
 
 
 def test_missing_asr_alone_does_not_flag(cfg):

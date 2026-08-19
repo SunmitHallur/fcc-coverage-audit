@@ -274,16 +274,16 @@ def anchor_sites_to_asr(
     sites: pd.DataFrame,
     asr_structures: pd.DataFrame,
     radius_m: float = 2000.0,
-    snap_radius_m: float = 500.0,
+    snap_radius_m: float = 750.0,
 ) -> pd.DataFrame:
     """Join inferred sites to ASR structures and snap pins onto nearby masts.
 
     Within ``snap_radius_m``, the site coordinate is replaced by the ASR
-    lat/lng so reviewer pins land on the registered structure. Multiple
-    inferred peaks that snap to the *same* ASR (cloverleaf petals, 500 m
-    NMS splits of one compound) collapse to one site. Matches between
-    snap and ``radius_m`` are recorded but not moved — 2 km is too wide
-    to steal a pin from a neighboring urban macro.
+    lat/lng so reviewer pins land on the registered structure — but only
+    when that mast is unambiguous (no second ASR also inside the snap
+    radius unless it is ≥1.5× farther). Multiple inferred peaks that snap
+    to the *same* ASR (cloverleaf petals) collapse to one site. Matches
+    between snap and ``radius_m`` are recorded but not moved.
 
     Adds ``asr_matched`` / ``asr_distance_m`` / ``asr_snapped``. ASR rows
     need ``lat`` / ``lng``.
@@ -310,13 +310,28 @@ def anchor_sites_to_asr(
         xs, ys = _FWD.transform(out["lng"].to_numpy(dtype=float), out["lat"].to_numpy(dtype=float))
         out["x_m"] = xs
         out["y_m"] = ys
-    dist, idx = tree.query(out[["x_m", "y_m"]].to_numpy(dtype=float), k=1)
-    dist = np.asarray(dist, dtype=float)
-    idx = np.asarray(idx, dtype=int)
     snap_m = float(snap_radius_m)
     match_m = max(float(radius_m), snap_m)
+    k = 2 if len(asr) >= 2 else 1
+    dist_k, idx_k = tree.query(out[["x_m", "y_m"]].to_numpy(dtype=float), k=k)
+    dist_k = np.asarray(dist_k, dtype=float)
+    idx_k = np.asarray(idx_k, dtype=int)
+    if k == 1:
+        dist_k = dist_k.reshape(-1, 1)
+        idx_k = idx_k.reshape(-1, 1)
+    dist = dist_k[:, 0]
+    idx = idx_k[:, 0]
     matched = dist <= match_m
-    snapped = dist <= snap_m
+    # Snap only when the nearest mast is clearly the right one. A peak sitting
+    # between two urban macros (second ASR also inside the snap radius and not
+    # much farther) stays put rather than stealing a neighbor's pin. Cloverleaf
+    # petals of one compound still share a nearest ASR and collapse below.
+    if dist_k.shape[1] > 1:
+        second = dist_k[:, 1]
+        unambiguous = (second > snap_m) | (second >= 1.5 * np.maximum(dist, 1.0))
+        snapped = (dist <= snap_m) & unambiguous
+    else:
+        snapped = dist <= snap_m
     out["asr_matched"] = matched
     out["asr_distance_m"] = np.where(matched, dist, np.nan)
     out["asr_snapped"] = snapped

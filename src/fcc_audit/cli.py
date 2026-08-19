@@ -302,7 +302,7 @@ def _enrich_with_asr(
     try:
         asr_df = _load_or_build_asr_df(cache_dir)
         radius = float(gt.get("site_match_radius_m", cfg.towers.get("site_match_radius_m", 2000)))
-        snap = float(gt.get("site_snap_radius_m", 500))
+        snap = float(gt.get("site_snap_radius_m", 750))
         if not sites.empty:
             sites = attribute.anchor_sites_to_asr(
                 sites, asr_df, radius_m=radius, snap_radius_m=snap,

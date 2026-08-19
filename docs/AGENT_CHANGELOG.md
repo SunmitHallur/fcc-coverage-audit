@@ -5,7 +5,45 @@ changed, why, and what was verified. Append new dated sections at the top.
 
 ---
 
+## 2026-08-19 — Calibrate weights on live Verizon 7/1 (382 counties)
+
+### Why
+
+The first gaming pass locked physics tests but did not spend the time fitting
+weights. Percentile ranking is undefined on a 4-county cohort. Urban ASR snap
+at 500 m was missing rural macros (~650 m peak-to-mast). Majority new-site
+buildout could still flag via percentile.
+
+### What changed
+
+- Fit gates/weights on 382 live Verizon 5G-NR 7/1 counties (MA, MS, SD, ID,
+  CO, KS + labeled TX/NY/OK clips). Prefer 0 labeled false flags; keep
+  Middlesex (7.8% urban same-site fill) and Pearl River.
+- `suspicious_same_site_min_county_frac`: 0.05 → 0.075.
+- `same_site_growth_share` 0.16 → 0.22; `new_site_share` −0.10 → −0.22;
+  `unattributed_share` 0.10 → 0.0; `added_frac` operating range 0.05 → 0.15.
+- Majority new-site growth (`new_site_share` ≥ 0.50 with a new tower) does
+  not flag, in-county or cross-border.
+- ASR snap 500 m → 750 m, and only when the nearest mast is unambiguous
+  (no second ASR inside the snap radius unless ≥1.5× farther).
+
+### Live labeled check (current filings, not frozen slides)
+
+Flags: Middlesex, Pearl River, Oneida, Grant, Yoakum, Palo Pinto, Crowley,
+Rio Grande. Skips: Menard, Mills, San Saba, Lamar, Lewis. Misses (FN):
+Sullivan (~5.8%), Conejos (43% new-site). Eligible flag rate 36% (104/289)
+vs 46% before. KS: 24/80 eligible.
+
+### Verify
+
+```bash
+PYTHONPATH=src pytest tests/test_gaming_patterns.py tests/test_attribute.py tests/test_score.py tests/test_towers.py -q
+```
+
+---
+
 ## 2026-08-19 — Gaming detection: ASR snap, fewer false flags
+
 
 ### Why
 

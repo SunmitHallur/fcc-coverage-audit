@@ -23,10 +23,10 @@ _REL_JUMP_ABS_REF = 0.05
 
 # Per-feature operating ranges: raw feature values are divided by these before
 # clipping to [0, 1]. Without calibration, ``added_frac_of_county`` (typical
-# 0–0.05) contributes almost nothing under a 0.25 weight because the score
+# 0–0.15) contributes almost nothing under a 0.25 weight because the score
 # treats 1.0 as the natural scale — trapping every county in "Low".
 _FEATURE_OPERATING_RANGE: dict[str, float] = {
-    "added_frac_of_county": 0.05,
+    "added_frac_of_county": 0.15,
     "coverage_increase_magnitude": 1.0,  # already bounded in build_features
     "blanket_fillin": 1.0,
     "same_site_growth_share": 1.0,
@@ -262,13 +262,20 @@ def score(features: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     else:
         suspicious = (df["priority_score"] >= threshold) | same_site_implausible
 
-    # Growth explained by new towers outside this county is usually legitimate.
+    # Growth explained by new towers is legitimate build, not same-site gaming.
+    # Cross-border was the original special case; in-county new macros (Edmunds-
+    # style resubmits / real 6-month construction) must also be excluded or the
+    # percentile path flags every large new-site jump.
+    new_site_explained = (
+        (df["new_site_share"].fillna(0.0) >= 0.50)
+        & (df["new_towers"].fillna(0).astype(int) >= 1)
+    )
     cross_border_build = (
         (df["new_site_share"].fillna(0.0) >= 0.35)
         & (df["new_towers"].fillna(0).astype(int) >= 1)
         & (df.get("new_towers_cross_border", 0).fillna(0).astype(int) >= 1)
     )
-    df["flag_for_review"] = eligible & suspicious & ~cross_border_build
+    df["flag_for_review"] = eligible & suspicious & ~cross_border_build & ~new_site_explained
     df["flag_reason"] = df.apply(_reason, axis=1, susp=susp)
 
     # Distribution-aware severity badges (honest for an unsupervised anomaly rank).
