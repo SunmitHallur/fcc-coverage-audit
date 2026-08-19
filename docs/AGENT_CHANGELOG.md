@@ -5,6 +5,46 @@ changed, why, and what was verified. Append new dated sections at the top.
 
 ---
 
+## 2026-08-19 — Tower inference QA fixes
+
+### Why
+
+QA against FCC ASR + public pins (105 KS counties, 8-county/5-state eval,
+petal-peaked synthetics) showed inferred sites are lobe peaks that often miss
+masts: real minsignal cloverleafs split into 3 petal pins, urban macros closer
+than 2 km collapsed, joint union kept prior signal alphabetically, and ASR
+height filtering used ground elevation AMSL instead of overall AGL.
+
+### What changed
+
+- Always merge 2-/3-sector peaks after signal maxima (global merge over the
+  full footprint so relative-core cuts do not disconnect petals). Signal
+  prominence filter + far/hub mass guard so two overlapping omnis stay split.
+- `towers.peak_separation_m: 800` for NMS, independent of
+  `site_match_radius_m: 2000` (cross-vintage match). Cloverleaf side lengths
+  are absolute meters (1.5–10 km), not factors of peak separation.
+- `infer_sites_joint` ranks vintages explicitly (`prior=0`, `current=1`) so
+  current signal wins on overlapping hexes.
+- ASR RA fields: overall AGL @30 (not ground elev @29); registration @3 /
+  unique_id @4; parse `structure_type`; rebuild `asr_structures.parquet`.
+- Deterministic peak NMS sort by `(-score, cell_id)`.
+- Eval reports precision/recall at 250/500/1000/2000 m and a cell-like ASR
+  subset (`TOWER`/`MTOWER`/`LTOWER`/`POLE`/`MAST`/`GTOWER`/`BANT`).
+
+### Verify
+
+```bash
+PYTHONPATH=src pytest tests/test_towers.py tests/test_groundtruth_asr.py tests/test_identity.py tests/test_pipeline.py -q
+PYTHONPATH=src python scripts/eval_tower_inference.py
+```
+
+**8-county signal-mode (D25, after):** median 2 km precision **39%** (was ~23%);
+6/24 county-provider rows under 25% (was 13/24); median footprint recall ~84%.
+Median 250 m precision ~8% — ASR is still not a census; pins remain lobe
+peaks, not mast snaps.
+
+---
+
 ## 2026-08-19 — Relative signal core (hot vs cold filings)
 
 ### Why

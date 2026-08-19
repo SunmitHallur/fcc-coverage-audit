@@ -148,6 +148,10 @@ towers:
   # Reference for site_h3_resolution 9 (~0.105 km^2/hex → ~3.7 km^2 minimum).
   # Auto-scales when the data resolution differs from site_h3_resolution.
   min_site_hexes: 35               # for site_h3_resolution 9
+  # Minimum separation between accepted peaks within one footprint (NMS).
+  # Independent of site_match_radius_m so urban macros ~1 km apart can split
+  # while cross-vintage identity matching stays at 2 km.
+  peak_separation_m: 800
   # Two inferred sites within this distance (meters) across vintages are
   # treated as the same physical site (matched), else "new".
   site_match_radius_m: 2000

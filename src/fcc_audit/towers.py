@@ -72,15 +72,18 @@ _MIN_CORE_FRACTION = 0.18
 _DEPTH_CAP = 40
 # Minimum depth for a cell to qualify as a peak (avoids splitting thin strips).
 _MIN_PEAK_DEPTH = 2
-# Cloverleaf merge: petal peaks of one 3-sector site sit this far from the hub.
-_CLOVER_MAX_SIDE_FACTOR = 5.0  # * min_peak_separation_m  (~10 km)
-_CLOVER_MIN_SIDE_FACTOR = 0.75
+# Cloverleaf merge: absolute petal-to-petal span (not scaled by peak NMS).
+# ~4 km petals at 120° are ~6.9 km apart; keep headroom to ~10 km.
+_CLOVER_MIN_SIDE_M = 1500.0
+_CLOVER_MAX_SIDE_M = 10_000.0
 # Signal field is "discriminative" enough to split on local maxima.
 _SIGNAL_SPLIT_RANGE_DB = 5.0
-# Default minimum separation between accepted peaks (meters). Overridden at
-# call time by ``site_match_radius_m`` so peak spacing and cross-vintage match
-# distance share one scale (avoids peaks kept 3 km apart but matched at 2 km).
-_MIN_PEAK_SEPARATION_M = 2000.0
+# Default minimum separation between accepted peaks (meters). Independent of
+# ``site_match_radius_m`` (cross-vintage identity), so urban macros closer
+# than 2 km can still split.
+_MIN_PEAK_SEPARATION_M = 800.0
+# Signal-field saddle prominence (dB) for dropping overlap shoulders.
+_MIN_SIGNAL_PROMINENCE_DB = 3.0
 # Binary Redshift footprints can be multi-million-hex mega-blobs; full
 # boundary-depth lobe splitting on those dominates overnight runtime. Above this
 # many core cells, infer sites on a coarser parent grid and scale reach back.
@@ -211,7 +214,9 @@ def _find_score_peaks(
         rep = plateau[int(np.argmin((xs - cx) ** 2 + (ys - cy) ** 2))]
         reps.append(rep)
 
-    reps.sort(key=lambda c: score[c], reverse=True)
+    # Deterministic NMS: score descending, then cell id, so tied bands do not
+    # flip which peak survives across runs.
+    reps.sort(key=lambda c: (-score[c], c))
     accepted: list[str] = []
     for c in reps:
         x, y = xy_by_cell[c]
@@ -247,27 +252,29 @@ def _saddle_score(
 
 def _filter_low_prominence_peaks(
     peaks: list[str],
-    depth: dict[str, int],
+    score: dict[str, float],
     xy_by_cell: dict[str, tuple[float, float]],
-    min_prominence: int = _MIN_PEAK_PROMINENCE,
+    min_prominence: float = float(_MIN_PEAK_PROMINENCE),
 ) -> list[str]:
     """Drop shoulder maxima that sit on the slope of a stronger nearby peak.
 
-    Two overlapping circular towers grow extra depth bumps in the overlap;
-    those have almost no drop toward the true center. Petals of a 2-/3-sector
-    site stay: the path between petals dips at the hub saddle.
+    Two overlapping circular towers grow extra depth/signal bumps in the
+    overlap; those have almost no drop toward the true center. Petals of a
+    2-/3-sector site stay: the path between petals dips at the hub saddle.
+    Works for boundary-depth (integer rings) or signal (dBm) scores.
+
+    A peak is dropped when any strictly stronger peak has a path saddle so
+    shallow that ``score[peak] - saddle < min_prominence`` — even if the
+    stronger peak is only 1–2 rings/dB hotter (common for overlap shoulders).
     """
     if len(peaks) <= 1:
         return peaks
     cells = list(xy_by_cell)
     tree = cKDTree(np.array([xy_by_cell[c] for c in cells], dtype=float))
-    scores = [int(depth[p]) for p in peaks]
+    scores = [float(score[p]) for p in peaks]
     keep = [True] * len(peaks)
     for i, peak in enumerate(peaks):
-        higher = [
-            j for j, other in enumerate(peaks)
-            if scores[j] >= scores[i] + min_prominence
-        ]
+        higher = [j for j in range(len(peaks)) if scores[j] > scores[i]]
         if not higher:
             continue
         px, py = xy_by_cell[peak]
@@ -276,10 +283,8 @@ def _filter_low_prominence_peaks(
             key=lambda k: (xy_by_cell[peaks[k]][0] - px) ** 2
             + (xy_by_cell[peaks[k]][1] - py) ** 2,
         )
-        saddle = _saddle_score(
-            peak, peaks[j], {c: float(depth[c]) for c in xy_by_cell}, xy_by_cell, tree, cells,
-        )
-        if int(depth[peak]) - saddle < min_prominence:
+        saddle = _saddle_score(peak, peaks[j], score, xy_by_cell, tree, cells)
+        if scores[i] - saddle < min_prominence:
             keep[i] = False
     return [p for p, ok in zip(peaks, keep) if ok]
 
@@ -296,7 +301,9 @@ def _find_depth_peaks(
         comp, score, xy_by_cell, min_separation_m, float(_MIN_PEAK_DEPTH),
     )
     local_xy = {c: xy_by_cell[c] for c in comp}
-    return _filter_low_prominence_peaks(peaks, depth, local_xy)
+    return _filter_low_prominence_peaks(
+        peaks, score, local_xy, min_prominence=float(_MIN_PEAK_PROMINENCE),
+    )
 
 
 def _n_sector_signature(
@@ -383,6 +390,37 @@ def _two_peak_hub_xy(
     return mx + t * px, my + t * py
 
 
+def _low_far_side_mass(
+    p1: np.ndarray,
+    p2: np.ndarray,
+    xs: np.ndarray,
+    ys: np.ndarray,
+    radius: float,
+) -> bool:
+    """True when little coverage sits beyond each peak away from the hub.
+
+    Petals of a 2-sector bowtie end near the peak (far/hub mass ratio ~0.8);
+    two overlapping circular towers keep nearly symmetric far/hub halves
+    (~0.97). Reject the bowtie merge when either peak looks omni-symmetric.
+    """
+    hx = float(p1[0] + p2[0]) / 2.0
+    hy = float(p1[1] + p2[1]) / 2.0
+    far_limit2 = (radius * 1.25) ** 2
+    for px, py in (p1, p2):
+        vx, vy = float(px - hx), float(py - hy)
+        vlen = float(np.hypot(vx, vy)) or 1.0
+        ux, uy = vx / vlen, vy / vlen
+        dx = xs - px
+        dy = ys - py
+        near = (dx * dx + dy * dy) <= far_limit2
+        proj = dx * ux + dy * uy
+        far_n = int((near & (proj > 0.0)).sum())
+        hub_n = int((near & (proj < 0.0)).sum())
+        if far_n >= 80 and far_n >= 0.90 * max(hub_n, 1):
+            return False
+    return True
+
+
 def _merge_cloverleaf_peaks(
     peaks: list[str],
     xy_by_cell: dict[str, tuple[float, float]],
@@ -393,19 +431,23 @@ def _merge_cloverleaf_peaks(
 ) -> list[str]:
     """Replace petal-peaks of a 2- or 3-sector site with one site at the hub.
 
-    Depth maxima of a multi-cone footprint sit in the petals; the real tower is
-    the junction (a depth *saddle*). Equilateral peak triples with a
+    Depth/signal maxima of a multi-cone footprint sit in the petals; the real
+    tower is the junction (a saddle). Equilateral peak triples with a
     three-sector angular signature, and opposite pairs with a two-sector
-    signature *and* low far-side mass, collapse to the junction cell.
-    Two nearby circular towers fail the far-side test and stay split.
+    signature, collapse to the junction cell. Two nearby circular towers fail
+    the sector test and stay split.
+
+    Cloverleaf side lengths are absolute meters (not scaled by peak NMS) so a
+    tighter urban peak gate does not shrink the merge window below real petal
+    spans (~7 km for 4 km petals at 120°).
     """
     n = len(peaks)
     if n < 2:
         return peaks
     pxy = np.array([xy_by_cell[p] for p in peaks], dtype=float)
     tree = cKDTree(pxy)
-    max_side = _CLOVER_MAX_SIDE_FACTOR * min_separation_m
-    min_side = _CLOVER_MIN_SIDE_FACTOR * min_separation_m
+    max_side = _CLOVER_MAX_SIDE_M
+    min_side = _CLOVER_MIN_SIDE_M
     triples: list[tuple[float, int, int, int, float, float]] = []
     for i in range(n):
         near = [j for j in tree.query_ball_point(pxy[i], max_side) if j > i]
@@ -458,6 +500,8 @@ def _merge_cloverleaf_peaks(
             if not _n_sector_signature(
                 float(cx), float(cy), xs, ys, radius * 0.12, radius * 1.55, 2,
             ):
+                continue
+            if not _low_far_side_mass(pxy[i], pxy[j], xs, ys, radius):
                 continue
             pairs.append((radius, i, j, float(cx), float(cy)))
     pairs.sort(key=lambda t: -t[0])
@@ -513,11 +557,13 @@ def _peaks_for_component(
     xy_by_cell: dict[str, tuple[float, float]],
     peak_sep: float,
 ) -> tuple[list[str], dict[str, int] | None]:
-    """Choose tower peaks for one connected blob (signal maxima or cloverleaf)."""
-    cell_ids = list(comp)
-    xs = np.array([xy_by_cell[c][0] for c in cell_ids], dtype=float)
-    ys = np.array([xy_by_cell[c][1] for c in cell_ids], dtype=float)
-    sigs = np.array([float(signal_by_cell[c]) for c in cell_ids], dtype=float)
+    """Choose tower peaks for one connected blob (signal or depth maxima).
+
+    Cloverleaf merge is applied later over the full footprint so sector
+    signatures see below-core hub cells and do not mistake two overlapping
+    omnis (core-only rings look like a bowtie) for a 2-sector site.
+    """
+    sigs = np.array([float(signal_by_cell[c]) for c in comp], dtype=float)
     sig_range = float(sigs.max() - sigs.min()) if len(sigs) else 0.0
     use_depth = signal_flat or sig_range < _SIGNAL_SPLIT_RANGE_DB
     if not use_depth:
@@ -526,12 +572,13 @@ def _peaks_for_component(
             comp, score, xy_by_cell, peak_sep, min_score=float(sigs.min()),
         )
         if not (plat_frac >= 0.45 and len(peaks) <= 1):
+            local_xy = {c: xy_by_cell[c] for c in comp}
+            peaks = _filter_low_prominence_peaks(
+                peaks, score, local_xy, min_prominence=_MIN_SIGNAL_PROMINENCE_DB,
+            )
             return peaks, None
     depth = _boundary_depth(set(comp))
     peaks = _find_depth_peaks(comp, depth, xy_by_cell, min_separation_m=peak_sep)
-    peaks = _merge_cloverleaf_peaks(
-        peaks, xy_by_cell, cell_ids, xs, ys, peak_sep,
-    )
     return peaks, depth
 
 
@@ -591,7 +638,9 @@ def infer_sites(
 
     ``parent_steps_override`` forces a fixed coarse-grid depth (used by joint
     cross-vintage inference so both vintages share one H3 resolution).
-    ``min_peak_separation_m`` defaults to ``site_match_radius_m`` from config.
+    ``min_peak_separation_m`` defaults to ``peak_separation_m`` from config
+    (fallback ``_MIN_PEAK_SEPARATION_M``), independent of cross-vintage
+    ``site_match_radius_m``.
     """
     tcfg = cfg.towers
     if hex_df.empty:
@@ -633,11 +682,14 @@ def infer_sites(
     peak_sep = float(
         min_peak_separation_m
         if min_peak_separation_m is not None
-        else tcfg.get("site_match_radius_m", _MIN_PEAK_SEPARATION_M)
+        else tcfg.get("peak_separation_m", _MIN_PEAK_SEPARATION_M)
     )
 
     signal_by_cell = dict(zip(infer_df["h3"], infer_df["signal_dbm"]))
     county_by_cell = dict(zip(infer_df["h3"], infer_df["county_geoid"]))
+    # Full footprint counties (for hub snap cells below the relative core cut).
+    for h, g in zip(hex_df["h3"].astype(str), hex_df["county_geoid"]):
+        county_by_cell.setdefault(h, g)
 
     all_cells = set(infer_df["h3"].astype(str))
     # Project every core cell once (used for depth peaks, splitting, centroids).
@@ -648,10 +700,14 @@ def infer_sites(
 
     sites = []
     site_idx = 0
+    # Collect peaks across components first. Relative core can disconnect the
+    # petals of a multi-sector site (hub is a signal saddle below the core cut);
+    # a second, global cloverleaf merge over the full footprint re-joins them.
+    pending: list[tuple[list[str], list[str], dict[str, int] | None]] = []
+    all_peaks: list[str] = []
     for comp in _connected_components(all_cells):
         if len(comp) < min_hexes:
             continue
-
         peaks, depth = _peaks_for_component(
             comp,
             signal_flat=signal_flat,
@@ -659,51 +715,90 @@ def infer_sites(
             xy_by_cell=xy_by_cell,
             peak_sep=peak_sep,
         )
-        lobes = _split_component_by_peaks(comp, peaks, xy_by_cell)
+        pending.append((comp, peaks, depth))
+        all_peaks.extend(peaks)
 
-        for peak, lobe in lobes:
-            if len(lobe) < max(3, min_hexes // max(1, len(lobes))):
-                continue
-            xs = np.array([xy_by_cell[c][0] for c in lobe])
-            ys = np.array([xy_by_cell[c][1] for c in lobe])
-            sigs = np.array([signal_by_cell[c] for c in lobe])
-            # Anchor on the peak/junction cell. A depth-weighted centroid of a
-            # 3-sector cloverleaf drifts into the fattest petal and then looks
-            # like a different tower in the next vintage.
-            if peak in xy_by_cell:
-                cx, cy = xy_by_cell[peak]
-                nearest_cell = peak
-            else:
-                # Relative weights: hotter vs colder filings must not pull the
-                # fallback centroid. ``sigs + 130`` treated T-Mobile -50 as 4×
-                # an AT&T -110 hex of the same rank.
-                w = np.clip(sigs - float(np.min(sigs)) + 1.0, 1.0, None)
-                if depth is not None:
-                    w = np.array([depth[c] for c in lobe], dtype=float)
-                w = np.clip(w, 1e-9, None)
-                cx = float(np.average(xs, weights=w))
-                cy = float(np.average(ys, weights=w))
-                nearest_cell = lobe[int(np.argmin(np.hypot(xs - cx, ys - cy)))]
-            reach = float(np.max(np.hypot(xs - cx, ys - cy)))
-            if parent_steps:
-                reach *= (7 ** 0.5) ** parent_steps
-            lng, lat = _INV.transform(cx, cy)
-            county = county_by_cell.get(nearest_cell)
-            sites.append(
-                {
-                    "site_id": f"{label_prefix}{site_idx}",
-                    "lat": float(lat),
-                    "lng": float(lng),
-                    "x_m": cx,
-                    "y_m": cy,
-                    "reach_m": reach,
-                    "n_hexes": int(len(lobe) * (7 ** parent_steps if parent_steps else 1)),
-                    "max_signal_dbm": float(sigs.max()),
-                    "mean_signal_dbm": float(sigs.mean()),
-                    "county_geoid": county,
-                }
-            )
-            site_idx += 1
+    # Full-footprint coordinates for sector signature + hub snap (includes
+    # below-core hub cells that relative core dropped).
+    full_cells = list(dict.fromkeys(
+        str(c) for c in hex_df["h3"].astype(str).tolist()
+    ))
+    if parent_steps > 0:
+        # Inference ran on rolled-up parents; snap within that grid.
+        full_cells = cell_list
+    full_missing = [c for c in full_cells if c not in xy_by_cell]
+    if full_missing:
+        centers_f = np.array([h3.cell_to_latlng(c) for c in full_missing])
+        xs_f, ys_f = _FWD.transform(centers_f[:, 1], centers_f[:, 0])
+        for c, x, y in zip(full_missing, xs_f, ys_f):
+            xy_by_cell[c] = (float(x), float(y))
+    full_xs = np.array([xy_by_cell[c][0] for c in full_cells], dtype=float)
+    full_ys = np.array([xy_by_cell[c][1] for c in full_cells], dtype=float)
+
+    if len(all_peaks) >= 2:
+        merged_peaks = _merge_cloverleaf_peaks(
+            list(dict.fromkeys(all_peaks)),
+            xy_by_cell,
+            full_cells,
+            full_xs,
+            full_ys,
+            peak_sep,
+        )
+    else:
+        merged_peaks = list(dict.fromkeys(all_peaks))
+
+    # Partition every core cell by nearest merged peak (cross-component).
+    core_cells = [c for comp, _, _ in pending for c in comp]
+    # Prefer depth from the component that owned each cell when present.
+    depth_by_cell: dict[str, int] = {}
+    for comp, _, depth in pending:
+        if depth is not None:
+            depth_by_cell.update(depth)
+
+    if not merged_peaks:
+        return pd.DataFrame(columns=SITE_COLUMNS)
+
+    lobes = _split_component_by_peaks(core_cells, merged_peaks, xy_by_cell)
+    for peak, lobe in lobes:
+        if len(lobe) < max(3, min_hexes // max(1, len(lobes))):
+            continue
+        xs = np.array([xy_by_cell[c][0] for c in lobe])
+        ys = np.array([xy_by_cell[c][1] for c in lobe])
+        sigs = np.array([signal_by_cell[c] for c in lobe])
+        # Anchor on the peak/junction cell. A depth-weighted centroid of a
+        # 3-sector cloverleaf drifts into the fattest petal and then looks
+        # like a different tower in the next vintage.
+        if peak in xy_by_cell:
+            cx, cy = xy_by_cell[peak]
+            nearest_cell = peak
+        else:
+            w = np.clip(sigs - float(np.min(sigs)) + 1.0, 1.0, None)
+            if depth_by_cell:
+                w = np.array([float(depth_by_cell.get(c, 1)) for c in lobe], dtype=float)
+            w = np.clip(w, 1e-9, None)
+            cx = float(np.average(xs, weights=w))
+            cy = float(np.average(ys, weights=w))
+            nearest_cell = lobe[int(np.argmin(np.hypot(xs - cx, ys - cy)))]
+        reach = float(np.max(np.hypot(xs - cx, ys - cy)))
+        if parent_steps:
+            reach *= (7 ** 0.5) ** parent_steps
+        lng, lat = _INV.transform(cx, cy)
+        county = county_by_cell.get(nearest_cell)
+        sites.append(
+            {
+                "site_id": f"{label_prefix}{site_idx}",
+                "lat": float(lat),
+                "lng": float(lng),
+                "x_m": cx,
+                "y_m": cy,
+                "reach_m": reach,
+                "n_hexes": int(len(lobe) * (7 ** parent_steps if parent_steps else 1)),
+                "max_signal_dbm": float(sigs.max()),
+                "mean_signal_dbm": float(sigs.mean()),
+                "county_geoid": county,
+            }
+        )
+        site_idx += 1
     return pd.DataFrame(sites, columns=SITE_COLUMNS)
 
 
@@ -764,8 +859,13 @@ def infer_sites_joint(
         parts.append(c)
     combined = pd.concat(parts, ignore_index=True)
     # Prefer current row for county/signal when a hex appears in both.
-    combined = combined.sort_values("_v", ascending=True)  # current last
-    union = combined.drop_duplicates(subset=["h3"], keep="last").drop(columns=["_v"])
+    # Explicit vintage rank — do NOT sort by the string label ("current" <
+    # "prior" alphabetically, which used to keep prior when keep="last").
+    combined["_rank"] = combined["_v"].map({"prior": 0, "current": 1}).fillna(0)
+    combined = combined.sort_values("_rank", ascending=True)
+    union = combined.drop_duplicates(subset=["h3"], keep="last").drop(
+        columns=["_v", "_rank"]
+    )
 
     # Deterministic coarse grid from the UNION size so vintages never straddle
     # the 25k threshold independently.
@@ -777,7 +877,9 @@ def infer_sites_joint(
     sites = infer_sites(
         union, cfg, label_prefix="J",
         parent_steps_override=parent_steps,
-        min_peak_separation_m=float(cfg.towers.get("site_match_radius_m", _MIN_PEAK_SEPARATION_M)),
+        min_peak_separation_m=float(
+            cfg.towers.get("peak_separation_m", _MIN_PEAK_SEPARATION_M)
+        ),
     )
     if sites.empty:
         return empty.copy(), empty.copy()

@@ -170,6 +170,8 @@ These do **not** independently flag a county — they amplify the score of an al
 | `min_added_km2_to_flag` | 10.0 km² | Ignore trivial / near-empty county changes (FCC-validated) |
 | `suspicious_same_site_growth` | 0.50 | 50% same-site share is not itself suspicious; only the combination matters |
 | `min_site_hexes` | 35 (at H3 res 9) | ~3.7 km² minimum blob to infer a site at res 9; prevents noise |
+| `peak_separation_m` | 800 | Minimum spacing between accepted peaks within one footprint (NMS); independent of cross-vintage match |
+| `site_match_radius_m` | 2000 | Cross-vintage site identity match radius |
 | Feature weight: `asr_no_new_structure` | 0.12 | Active when ASR labels merge successfully; soft-disabled if ASR fetch fails |
 
 ---

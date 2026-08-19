@@ -344,3 +344,80 @@ def test_lobe_reach_skips_projection_for_flat_signal():
     }])
     out = compute_lobe_reach(hex_df, sites)
     assert float(out.iloc[0]["lobe_reach_m"]) >= 4000.0 * 2.5
+
+def test_signal_petal_peaked_cloverleaf_is_one_site(cfg):
+    """Directional minsignal peaks in petals must still merge to the hub."""
+    lat, lng = 38.50, -98.50
+    hub = h3.latlng_to_cell(lat, lng, 9)
+    cells = set(h3.grid_disk(hub, 4))
+    petal_origins = []
+    for ang in (0.0, 120.0, 240.0):
+        dlat = (4.0 / 110.57) * np.cos(np.radians(ang))
+        dlng = (4.0 / (111.32 * np.cos(np.radians(lat)))) * np.sin(np.radians(ang))
+        origin = h3.latlng_to_cell(lat + dlat, lng + dlng, 9)
+        petal_origins.append(origin)
+        cells |= set(h3.grid_disk(origin, 10))
+    rows = []
+    for c in cells:
+        d_pet = min(h3.grid_distance(o, c) for o in petal_origins)
+        rows.append({"h3": c, "signal_dbm": -78.0 - 2.5 * d_pet, "county_geoid": "20001"})
+    sites = infer_sites(pd.DataFrame(rows), cfg, "T")
+    assert len(sites) == 1, f"petal-peaked cloverleaf split into {len(sites)} sites"
+    assert _km_to(sites.iloc[0]["lat"], sites.iloc[0]["lng"], (lat, lng)) < 2.0
+
+
+def test_two_towers_at_0p8_and_1p6_km_stay_split(cfg):
+    """Peak NMS (~800 m) must not collapse macros closer than the 2 km match radius."""
+    for sep_km in (0.8, 1.6):
+        t1 = (38.50, -98.50)
+        t2 = (38.50, -98.50 + sep_km / (111.32 * np.cos(np.radians(38.50))))
+        cells = set()
+        for lat, lng in (t1, t2):
+            cells |= set(h3.grid_disk(h3.latlng_to_cell(lat, lng, 9), 16))
+        df = pd.DataFrame({"h3": sorted(cells), "signal_dbm": 0.0, "county_geoid": "20001"})
+        sites = infer_sites(df, cfg, "T")
+        assert len(sites) == 2, f"{sep_km} km pair collapsed to {len(sites)} site(s)"
+        for s in sites.to_dict("records"):
+            nearest = min(_km_to(s["lat"], s["lng"], t) for t in (t1, t2))
+            assert nearest < 2.0
+
+
+def test_joint_union_prefers_current_signal(cfg):
+    """Overlapping hexes: current signal must win (not alphabetical prior)."""
+    from fcc_audit.towers import infer_sites_joint
+
+    cells = list(h3.grid_disk(h3.latlng_to_cell(38.5, -98.5, 9), 10))
+    prior = pd.DataFrame({"h3": cells, "signal_dbm": -50.0, "county_geoid": "20001"})
+    current = pd.DataFrame({"h3": cells, "signal_dbm": -110.0, "county_geoid": "20001"})
+    p = prior.assign(_v="prior")
+    c = current.assign(_v="current")
+    combined = pd.concat([p, c], ignore_index=True)
+    combined["_rank"] = combined["_v"].map({"prior": 0, "current": 1})
+    union = (
+        combined.sort_values("_rank", ascending=True)
+        .drop_duplicates(subset=["h3"], keep="last")
+    )
+    assert float(union["signal_dbm"].iloc[0]) == -110.0
+
+    prior_sites, current_sites = infer_sites_joint(prior, current, cfg)
+    assert len(current_sites) >= 1
+    assert float(current_sites["max_signal_dbm"].max()) <= -100.0
+
+
+def test_peak_nms_is_deterministic(cfg):
+    """Tied signal-band peaks must not flip which site survives across runs."""
+    t1, t2 = (38.50, -98.50), (38.50, -98.42)
+    rows = []
+    for lat, lng in (t1, t2):
+        origin = h3.latlng_to_cell(lat, lng, 9)
+        for c in h3.grid_disk(origin, 14):
+            d = h3.grid_distance(origin, c)
+            band = -80.0 - 5.0 * (d // 3)
+            rows.append({"h3": c, "signal_dbm": band, "county_geoid": "20001"})
+    df = pd.DataFrame(rows).sort_values("signal_dbm", ascending=False).drop_duplicates("h3")
+    a = infer_sites(df, cfg, "A")
+    b = infer_sites(df.sample(frac=1.0, random_state=1).reset_index(drop=True), cfg, "B")
+    assert len(a) == len(b)
+    a_xy = sorted(zip(a["lat"].round(5), a["lng"].round(5)))
+    b_xy = sorted(zip(b["lat"].round(5), b["lng"].round(5)))
+    assert a_xy == b_xy

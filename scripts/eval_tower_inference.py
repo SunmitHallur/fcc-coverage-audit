@@ -43,6 +43,8 @@ COUNTIES = [
     ("49005", "Cache, UT"),
 ]
 ASR_MATCH_M = 2000.0
+ASR_RADII_M = (250.0, 500.0, 1000.0, 2000.0)
+CELLISH_TYPES = {"TOWER", "MTOWER", "LTOWER", "POLE", "MAST", "GTOWER", "BANT"}
 SHARED_MATCH_M = 400.0
 FOOTPRINT_M = 2500.0
 CLIP_BUFFER_DEG = 0.08  # ~8 km, so border towers still appear
@@ -63,6 +65,35 @@ def _match(src: np.ndarray, dst: np.ndarray, radius_m: float) -> tuple[np.ndarra
     dist, _ = tree.query(src, k=1)
     dist = np.asarray(dist, dtype=float)
     return dist, dist <= radius_m
+
+
+def _match_at_radii(
+    src: np.ndarray, dst: np.ndarray, radii: tuple[float, ...] = ASR_RADII_M
+) -> dict:
+    """Precision-style hit rates for each radius (fraction of src within radius of dst)."""
+    if len(src) == 0:
+        return {
+            str(int(r)): {"n": 0, "hit": 0, "rate": None, "median_hit_m": None}
+            for r in radii
+        }
+    if len(dst) == 0:
+        return {
+            str(int(r)): {"n": int(len(src)), "hit": 0, "rate": 0.0, "median_hit_m": None}
+            for r in radii
+        }
+    tree = cKDTree(dst)
+    dist, _ = tree.query(src, k=1)
+    dist = np.asarray(dist, dtype=float)
+    out = {}
+    for r in radii:
+        hit = dist <= r
+        out[str(int(r))] = {
+            "n": int(len(src)),
+            "hit": int(hit.sum()),
+            "rate": float(hit.mean()),
+            "median_hit_m": float(np.median(dist[hit])) if hit.any() else None,
+        }
+    return out
 
 
 def _hex_county(
@@ -164,6 +195,7 @@ def evaluate_county(
     name: str,
     county_geom,
     asr_xy: np.ndarray,
+    asr_cell_xy: np.ndarray,
     asr_in_county: pd.DataFrame,
     cfg,
     zip_by_pid: dict[int, Path],
@@ -191,7 +223,6 @@ def evaluate_county(
         sites = infer_sites(work, cfg, label_prefix=pname[:1]) if not work.empty else work
         # Keep sites inside the county (plus 2 km) so border-buffer extras drop out.
         if not sites.empty:
-            sxy = _xy(sites["lat"], sites["lng"])
             keep = []
             for lat, lng in zip(sites["lat"], sites["lng"]):
                 keep.append(county_geom.buffer(SITE_IN_COUNTY_DEG).contains(shapely.Point(lng, lat)))
@@ -201,6 +232,7 @@ def evaluate_county(
             sxy = np.empty((0, 2))
         sites_by_pid[pid] = sites
 
+        # Backward-compatible 2 km metrics against all constructed ASR.
         if len(asr_xy) and len(sxy):
             dist, hit = _match(sxy, asr_xy, ASR_MATCH_M)
             prec = float(hit.mean()) if len(hit) else None
@@ -210,6 +242,12 @@ def evaluate_county(
         else:
             prec = rec_v = med = None
             hit = np.array([], dtype=bool)
+
+        prec_all = _match_at_radii(sxy, asr_xy)
+        rec_all = _match_at_radii(asr_xy, sxy)
+        prec_cell = _match_at_radii(sxy, asr_cell_xy)
+        rec_cell = _match_at_radii(asr_cell_xy, sxy)
+
         lobes = _lobe_counts(sites, work)
         provider_rows.append({
             "provider": pname,
@@ -220,6 +258,10 @@ def evaluate_county(
             "asr_recall": rec_v,
             "median_match_m": med,
             "n_matched": int(hit.sum()) if len(hit) else 0,
+            "precision_by_radius_m": {k: v["rate"] for k, v in prec_all.items()},
+            "recall_by_radius_m": {k: v["rate"] for k, v in rec_all.items()},
+            "cellish_precision_by_radius_m": {k: v["rate"] for k, v in prec_cell.items()},
+            "cellish_recall_by_radius_m": {k: v["rate"] for k, v in rec_cell.items()},
             "lobes": lobes,
         })
 
@@ -243,6 +285,19 @@ def evaluate_county(
         footprint_recall = None
         n_asr_fp = int(in_fp.sum())
 
+    if len(asr_cell_xy) and len(hex_pts):
+        _, cell_in_fp = _match(asr_cell_xy, hex_pts, FOOTPRINT_M)
+    else:
+        cell_in_fp = np.zeros(len(asr_cell_xy), dtype=bool)
+    if not all_sites.empty and cell_in_fp.any():
+        sxy = _xy(all_sites["lat"], all_sites["lng"])
+        _, rec_cell_fp = _match(asr_cell_xy[cell_in_fp], sxy, ASR_MATCH_M)
+        cellish_footprint_recall = float(rec_cell_fp.mean())
+        n_asr_cell_fp = int(cell_in_fp.sum())
+    else:
+        cellish_footprint_recall = None
+        n_asr_cell_fp = int(cell_in_fp.sum())
+
     shared = _shared_clusters(sites_by_pid)
     n_sites_total = int(sum(r["n_sites"] for r in provider_rows))
     return {
@@ -250,9 +305,12 @@ def evaluate_county(
         "county": name,
         "flatten_signal": flatten,
         "n_asr_county": int(len(asr_in_county)),
+        "n_asr_cellish": int(len(asr_cell_xy)),
         "n_asr_in_footprint": n_asr_fp,
+        "n_asr_cellish_in_footprint": n_asr_cell_fp,
         "n_sites_all_providers": n_sites_total,
         "asr_recall_in_footprint": footprint_recall,
+        "cellish_recall_in_footprint": cellish_footprint_recall,
         "shared": shared,
         "providers": provider_rows,
     }
@@ -294,13 +352,21 @@ def main() -> int:
             geom = row.iloc[0].geometry
             asr_c = asr[asr["county_geoid"].astype(str) == geoid]
             asr_xy = _xy(asr_c["lat"], asr_c["lng"]) if not asr_c.empty else np.empty((0, 2))
+            if not asr_c.empty and "structure_type" in asr_c.columns:
+                asr_cell = asr_c[asr_c["structure_type"].isin(CELLISH_TYPES)]
+            else:
+                asr_cell = asr_c
+            asr_cell_xy = (
+                _xy(asr_cell["lat"], asr_cell["lng"]) if not asr_cell.empty else np.empty((0, 2))
+            )
             zips = {pid: zip_by_pid[pid][geoid[:2]] for pid, _ in PROVIDERS}
-            log.info("eval %s %s (%s ASR)", geoid, name, len(asr_c))
+            log.info("eval %s %s (%s ASR, %s cellish)", geoid, name, len(asr_c), len(asr_cell))
             rec = evaluate_county(
                 geoid=geoid,
                 name=name,
                 county_geom=geom,
                 asr_xy=asr_xy,
+                asr_cell_xy=asr_cell_xy,
                 asr_in_county=asr_c,
                 cfg=cfg,
                 zip_by_pid=zips,

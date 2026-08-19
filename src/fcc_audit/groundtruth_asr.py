@@ -59,9 +59,10 @@ _ASR_CO_FALLBACK_URL = (
 _ASR_BULK_URL = "https://data.fcc.gov/download/pub/uls/complete/r_tower.zip"
 
 # CO.dat (coordinates) — pipe-delimited, record type in field 0.
+# FCC TOWER_PUBACC_CO: registration_number @3, unique_system_identifier @4.
 _CO_COLS = {
-    "unique_system_identifier": 3,
-    "registration_number": 4,
+    "registration_number": 3,
+    "unique_system_identifier": 4,
     "lat_degrees": 6,
     "lat_minutes": 7,
     "lat_seconds": 8,
@@ -72,16 +73,18 @@ _CO_COLS = {
     "lon_direction": 14,
 }
 # RA.dat (registration): status, county GEOID, heights, dates.
+# FCC TOWER_PUBACC_RA: registration @3, unique_id @4, height_of_structure @28,
+# ground_elevation @29, overall_height_agl @30, overall_amsl @31, structure_type @32.
 _RA_COLS = {
-    "unique_system_identifier": 3,
-    "registration_number": 4,
+    "registration_number": 3,
+    "unique_system_identifier": 4,
     "status_code": 8,
     "county_geoid": 26,
     "height_support_m": 28,
-    "height_overall_m": 29,
+    "ground_elevation_m": 29,
+    "height_overall_m": 30,
+    "structure_type": 32,
 }
-# Alternatively use the simpler EN (entity) file which has cleaner columns.
-# The RA (registration) file has the most useful date fields.
 
 _DATE_FMTS = ["%m/%d/%Y", "%Y-%m-%d", "%m-%d-%Y"]
 
@@ -197,13 +200,21 @@ def _parse_asr_co_coords(co_path: Path) -> pd.DataFrame:
                 continue
             if not (15.0 <= lat <= 72.0 and -180.0 <= lng <= -60.0):
                 continue
+            uid = parts[_CO_COLS["unique_system_identifier"]].strip()
+            reg = parts[_CO_COLS["registration_number"]].strip()
+            if not uid and not reg:
+                continue
             rows.append({
-                "unique_id": parts[_CO_COLS["unique_system_identifier"]].strip(),
-                "registration_number": parts[_CO_COLS["registration_number"]].strip(),
+                "unique_id": uid or f"reg:{reg}",
+                "registration_number": reg,
                 "lat": lat,
                 "lng": lng,
             })
-    df = pd.DataFrame(rows).drop_duplicates("unique_id", keep="first")
+    df = pd.DataFrame(rows)
+    # Prefer unique_id; fall back to registration when unique_id is empty.
+    if not df.empty:
+        df = df.sort_values("unique_id", kind="mergesort")
+        df = df.drop_duplicates("unique_id", keep="first")
     log.info("parsed %d ASR CO coordinates", len(df))
     return df
 
@@ -214,18 +225,27 @@ def _parse_asr_ra(ra_path: Path) -> pd.DataFrame:
     with open(ra_path, "r", encoding="latin-1", errors="replace") as fh:
         for line in fh:
             parts = line.rstrip("\n").split("|")
-            if len(parts) < 30 or parts[0] != "RA":
+            if len(parts) < 33 or parts[0] != "RA":
                 continue
             geoid = parts[_RA_COLS["county_geoid"]].strip()
             if len(geoid) != 5 or not geoid.isdigit():
                 continue
+            # Prefer overall AGL (appurtenances included); fall back to support AGL.
+            # Do NOT use ground elevation (field 29) — that is AMSL site elev.
             height = None
             for idx in (_RA_COLS["height_overall_m"], _RA_COLS["height_support_m"]):
                 try:
-                    height = float(parts[idx])
-                    break
+                    raw = parts[idx].strip()
+                    if raw:
+                        height = float(raw)
+                        break
                 except (TypeError, ValueError, IndexError):
                     continue
+            stype = ""
+            try:
+                stype = parts[_RA_COLS["structure_type"]].strip()
+            except IndexError:
+                stype = ""
             event_date = None
             for idx in (12, 14, 9, 10, 11):
                 if idx < len(parts):
@@ -233,21 +253,51 @@ def _parse_asr_ra(ra_path: Path) -> pd.DataFrame:
                     if event_date is not None:
                         break
             rows.append({
-                "unique_id": parts[_RA_COLS["unique_system_identifier"]].strip(),
+                "unique_id": (
+                    parts[_RA_COLS["unique_system_identifier"]].strip()
+                    or f"reg:{parts[_RA_COLS['registration_number']].strip()}"
+                ),
+                "registration_number": parts[_RA_COLS["registration_number"]].strip(),
                 "status_code": parts[_RA_COLS["status_code"]].strip(),
                 "county_geoid": geoid,
                 "height_m": height,
+                "structure_type": stype,
                 "event_date": event_date,
             })
-    df = pd.DataFrame(rows).drop_duplicates("unique_id", keep="first")
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values("unique_id", kind="mergesort")
+        df = df.drop_duplicates("unique_id", keep="first")
     log.info("parsed %d ASR RA registrations", len(df))
     return df
 
 
 def _parse_asr_joined(co_path: Path, ra_path: Path) -> pd.DataFrame:
+    """Join RA metadata to CO coordinates (unique_id, then registration fallback)."""
     coords = _parse_asr_co_coords(co_path)
     meta = _parse_asr_ra(ra_path)
-    df = meta.merge(coords, on="unique_id", how="inner")
+    if coords.empty or meta.empty:
+        return pd.DataFrame()
+
+    by_uid = meta.merge(coords, on="unique_id", how="inner", suffixes=("", "_co"))
+    if "registration_number_co" in by_uid.columns:
+        by_uid = by_uid.drop(columns=["registration_number_co"])
+
+    # Structures whose unique_id did not match: try registration_number.
+    matched_uids = set(by_uid["unique_id"]) if not by_uid.empty else set()
+    meta_miss = meta[~meta["unique_id"].isin(matched_uids)]
+    coords_miss = coords[~coords["unique_id"].isin(matched_uids)]
+    if not meta_miss.empty and not coords_miss.empty:
+        by_reg = meta_miss.merge(
+            coords_miss.drop(columns=["unique_id"]).drop_duplicates(
+                "registration_number", keep="first"
+            ),
+            on="registration_number",
+            how="inner",
+        )
+        df = pd.concat([by_uid, by_reg], ignore_index=True) if not by_uid.empty else by_reg
+    else:
+        df = by_uid
     log.info("joined %d ASR structures with coordinates", len(df))
     return df
 
@@ -299,7 +349,11 @@ def load_asr_structures(
     else:
         co_path, ra_path = _download_asr_bundle(cache_dir)
         df = _parse_asr_joined(co_path, ra_path)
-        keep = ["unique_id", "lat", "lng", "county_geoid", "event_date", "status_code", "height_m"]
+        keep = [
+            "unique_id", "lat", "lng", "county_geoid", "event_date",
+            "status_code", "height_m", "structure_type", "registration_number",
+        ]
+        keep = [c for c in keep if c in df.columns]
         df = df[keep].copy()
         df.to_parquet(parsed_cache, index=False)
         log.info("cached %d ASR structures -> %s", len(df), parsed_cache)
