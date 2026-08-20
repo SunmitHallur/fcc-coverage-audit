@@ -25,7 +25,7 @@ import pandas as pd
 
 from .config import Config, load_config
 from .normalize import load_counties
-from .webbundle import build_county_detail
+from .webbundle import build_county_detail, apply_scored_tower_counts
 
 log = logging.getLogger(__name__)
 
@@ -182,17 +182,7 @@ def county_slice(
     }
     detail = build_county_detail(geoid, coverage, sites, meta, counties=one)
     row = load_scored_row(run_dir, geoid, provider_id, service)
-    if row is not None:
-        detail["towers_prior"] = int(row.get("prior_towers", len(detail["sites_prior"])))
-        detail["towers_current"] = int(row.get("current_towers", len(detail["sites_current"])))
-        detail["new_towers"] = int(row.get("new_towers", 0))
-        detail["prior_towers_cross_border"] = int(row.get("prior_towers_cross_border", 0))
-        detail["current_towers_cross_border"] = int(row.get("current_towers_cross_border", 0))
-        detail["new_towers_cross_border"] = int(row.get("new_towers_cross_border", 0))
-    else:
-        detail["towers_prior"] = len(detail["sites_prior"])
-        detail["towers_current"] = len(detail["sites_current"])
-        detail["new_towers"] = max(0, detail["towers_current"] - detail["towers_prior"])
+    apply_scored_tower_counts(detail, row)
     detail["source"] = "api"
     return detail
 

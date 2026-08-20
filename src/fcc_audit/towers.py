@@ -90,9 +90,11 @@ _LARGE_BLOB_DEPTH_SEP_M = 2000.0
 _LARGE_BLOB_HEXES = 4000
 # Signal-field saddle prominence (dB) for dropping overlap shoulders.
 _MIN_SIGNAL_PROMINENCE_DB = 3.0
-# Large cores (binary *or* real minsignal) dominate overnight if we stay on
-# res 9: connected components + cloverleaf signature scan every hex. Above this
-# many core cells, infer on a coarser parent grid and scale reach back.
+# Binary Redshift footprints can be multi-million-hex mega-blobs; full
+# boundary-depth lobe splitting on those dominates overnight runtime. Above this
+# many *flat* core cells, infer sites on a coarser parent grid and scale reach
+# back. Real minsignal layers stay on res 9 — parent centroids were landing
+# on county lines and 1-cell parent lobes were dropped as "too small".
 _FLAT_COARSE_HEX_THRESHOLD = 25_000
 _FLAT_INFER_PARENT_STEPS = 2  # res 9 -> res 7 (~49x fewer cells)
 # Joint-inference: a site with prior hexes below this fraction of current (or
@@ -109,15 +111,17 @@ SITE_COLUMNS = [
 def _rollup_flat_for_inference(hex_df: pd.DataFrame, parent_steps: int) -> pd.DataFrame:
     """Collapse hexes to coarser parents for tower inference only.
 
-    Keeps the strongest ``signal_dbm`` child in each parent so minsignal
-    peaks survive the rollup (``keep=first`` without a sort would be arbitrary).
+    Keeps the strongest ``signal_dbm`` child in each parent and remembers that
+    child as ``_seed_h3`` so the pin can snap back to res-9 instead of the
+    parent centroid (which is often in the next county).
     """
     if parent_steps <= 0 or hex_df.empty:
         return hex_df
     src_res = h3.get_resolution(str(hex_df["h3"].iloc[0]))
     parent_res = max(0, src_res - parent_steps)
-    parents = [h3.cell_to_parent(str(c), parent_res) for c in hex_df["h3"].tolist()]
-    out = hex_df.assign(_parent=parents)
+    orig = hex_df["h3"].astype(str).tolist()
+    parents = [h3.cell_to_parent(c, parent_res) for c in orig]
+    out = hex_df.assign(_parent=parents, _seed_h3=orig)
     if "signal_dbm" in out.columns:
         out = out.sort_values("signal_dbm", ascending=False)
     out = out.drop_duplicates(subset=["_parent"], keep="first").copy()
@@ -717,13 +721,14 @@ def infer_sites(
     # Auto-scale min_site_hexes to keep the minimum physical blob area consistent
     # across H3 resolutions. Config value is authoritative for the configured
     # site_h3_resolution; infer actual resolution from the data and scale.
-    base_hexes = int(tcfg["min_site_hexes"])
+    base_hexes_orig = int(tcfg["min_site_hexes"])
+    base_hexes = base_hexes_orig
     infer_df = strong
     if parent_steps_override is not None:
         parent_steps = int(parent_steps_override)
     else:
         parent_steps = 0
-        if len(strong) >= _FLAT_COARSE_HEX_THRESHOLD:
+        if signal_flat and len(strong) >= _FLAT_COARSE_HEX_THRESHOLD:
             parent_steps = _flat_parent_steps(len(strong))
     if parent_steps > 0:
         infer_df = _rollup_flat_for_inference(strong, parent_steps)
@@ -743,7 +748,9 @@ def infer_sites(
         except Exception:
             pass
     min_hexes = base_hexes
-    if len(infer_df) < min_hexes:
+    child_per = (7 ** parent_steps) if parent_steps else 1
+    min_total_hexes = min_hexes if parent_steps == 0 else base_hexes_orig
+    if len(infer_df) * child_per < min_total_hexes:
         return pd.DataFrame(columns=SITE_COLUMNS)
 
     peak_sep = float(
@@ -754,6 +761,13 @@ def infer_sites(
 
     signal_by_cell = dict(zip(infer_df["h3"], infer_df["signal_dbm"]))
     county_by_cell = dict(zip(infer_df["h3"], infer_df["county_geoid"]))
+    # Hottest res-9 child inside each rolled-up parent (pin snap, not centroid).
+    seed_by_parent: dict[str, str] = {}
+    if "_seed_h3" in infer_df.columns:
+        seed_by_parent = {
+            str(p): str(s)
+            for p, s in zip(infer_df["h3"].astype(str), infer_df["_seed_h3"].astype(str))
+        }
     # Full footprint counties (for hub snap cells below the relative core cut).
     for h, g in zip(hex_df["h3"].astype(str), hex_df["county_geoid"]):
         county_by_cell.setdefault(h, g)
@@ -772,8 +786,12 @@ def infer_sites(
     # a second, global cloverleaf merge over the full footprint re-joins them.
     pending: list[tuple[list[str], list[str], dict[str, int] | None]] = []
     all_peaks: list[str] = []
+    # After rollup, one parent cell is ~49 res-9 hexes. Compare *child-hex*
+    # area to the configured minimum so a rural macro that collapsed to 1–2
+    # parents is not discarded as "too small".
+    min_comp_hexes = min_hexes if parent_steps == 0 else base_hexes_orig
     for comp in _connected_components(all_cells):
-        if len(comp) < min_hexes:
+        if len(comp) * child_per < min_comp_hexes:
             continue
         peaks, depth = _peaks_for_component(
             comp,
@@ -830,8 +848,9 @@ def infer_sites(
         return pd.DataFrame(columns=SITE_COLUMNS)
 
     lobes = _split_component_by_peaks(core_cells, merged_peaks, xy_by_cell)
+    min_lobe_hexes = min_hexes if parent_steps == 0 else base_hexes_orig
     for peak, lobe in lobes:
-        if len(lobe) < max(3, min_hexes // max(1, len(lobes))):
+        if len(lobe) * child_per < max(3, min_lobe_hexes // max(1, len(lobes))):
             continue
         xs = np.array([xy_by_cell[c][0] for c in lobe])
         ys = np.array([xy_by_cell[c][1] for c in lobe])
@@ -850,9 +869,19 @@ def infer_sites(
             cx = float(np.average(xs, weights=w))
             cy = float(np.average(ys, weights=w))
             nearest_cell = lobe[int(np.argmin(np.hypot(xs - cx, ys - cy)))]
+        seed = seed_by_parent.get(str(nearest_cell))
+        if seed:
+            if seed not in xy_by_cell:
+                lat_s, lng_s = h3.cell_to_latlng(seed)
+                xs_s, ys_s = _FWD.transform(lng_s, lat_s)
+                xy_by_cell[seed] = (float(xs_s), float(ys_s))
+            cx, cy = xy_by_cell[seed]
+            nearest_cell = seed
         reach = float(np.max(np.hypot(xs - cx, ys - cy)))
         if parent_steps:
             reach *= (7 ** 0.5) ** parent_steps
+        # A one-cell lobe has reach 0; attribution then counts 0 serving towers.
+        reach = max(reach, _MIN_REACH_M)
         lng, lat = _INV.transform(cx, cy)
         county = county_by_cell.get(nearest_cell)
         sites.append(
@@ -940,9 +969,9 @@ def infer_sites_joint(
 
     # Deterministic coarse grid from the UNION size so vintages never straddle
     # the 25k threshold independently.
-    strong, _signal_flat = _core_hexes(union, float(cfg.towers["min_signal_band_dbm"]))
+    strong, signal_flat = _core_hexes(union, float(cfg.towers["min_signal_band_dbm"]))
     parent_steps = 0
-    if len(strong) >= _FLAT_COARSE_HEX_THRESHOLD:
+    if signal_flat and len(strong) >= _FLAT_COARSE_HEX_THRESHOLD:
         parent_steps = _flat_parent_steps(len(strong))
 
     sites = infer_sites(

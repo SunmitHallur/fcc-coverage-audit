@@ -179,7 +179,53 @@ def test_flat_coarse_rollup_still_finds_site(cfg, monkeypatch):
     df = pd.DataFrame({"h3": cells, "signal_dbm": 0.0, "county_geoid": "20001"})
     sites = infer_sites(df, cfg, "T")
     assert len(sites) == 1
-    assert _km_to(sites.iloc[0]["lat"], sites.iloc[0]["lng"], center) < 3.0
+    # Pin snaps to the hottest child, not the parent centroid (~1–2 km error).
+    assert _km_to(sites.iloc[0]["lat"], sites.iloc[0]["lng"], center) < 1.5
+    assert float(sites.iloc[0]["reach_m"]) >= 3000.0
+
+
+def test_flat_rollup_keeps_single_parent_lobes(cfg, monkeypatch):
+    """Two small rural disks must survive rollup even if each is 1–2 parent cells."""
+    import fcc_audit.towers as towers_mod
+
+    monkeypatch.setattr(towers_mod, "_FLAT_COARSE_HEX_THRESHOLD", 40)
+    t1, t2 = (38.50, -98.50), (38.80, -98.50)  # ~33 km
+    cells = []
+    for lat, lng in (t1, t2):
+        cells.extend(h3.grid_disk(h3.latlng_to_cell(lat, lng, 9), 4))
+    df = pd.DataFrame({"h3": cells, "signal_dbm": 0.0, "county_geoid": "20001"})
+    assert len(df) >= 40
+    sites = infer_sites(df, cfg, "T")
+    assert len(sites) == 2, f"rolled-up rural disks collapsed to {len(sites)} site(s)"
+    for s in sites.to_dict("records"):
+        nearest = min(_km_to(s["lat"], s["lng"], t) for t in (t1, t2))
+        assert nearest < 1.5, f"site is {nearest:.2f} km from any true tower"
+        assert float(s["reach_m"]) >= 3000.0
+
+
+def test_minsignal_large_core_does_not_rollup(cfg, monkeypatch):
+    """Real minsignal stays on res 9 — 0.8 km peaks must not collapse into one parent."""
+    import fcc_audit.towers as towers_mod
+
+    monkeypatch.setattr(towers_mod, "_FLAT_COARSE_HEX_THRESHOLD", 50)
+    t1, t2 = (38.50, -98.50), (38.5072, -98.50)  # ~0.8 km
+    rows = []
+    for lat, lng in (t1, t2):
+        origin = h3.latlng_to_cell(lat, lng, 9)
+        for c in h3.grid_disk(origin, 10):
+            d = h3.grid_distance(origin, c)
+            rows.append({
+                "h3": c,
+                "signal_dbm": -80.0 - 2.0 * d,
+                "county_geoid": "20001",
+            })
+    df = pd.DataFrame(rows).sort_values("signal_dbm", ascending=False).drop_duplicates("h3")
+    assert len(df) >= 50
+    sites = infer_sites(df, cfg, "T")
+    assert len(sites) == 2, f"minsignal pair collapsed to {len(sites)} site(s) (rollup?)"
+    for s in sites.to_dict("records"):
+        nearest = min(_km_to(s["lat"], s["lng"], t) for t in (t1, t2))
+        assert nearest < 0.6, f"site is {nearest:.2f} km from true peak"
 
 
 def _cloverleaf_cells(

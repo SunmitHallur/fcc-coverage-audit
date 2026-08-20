@@ -12,6 +12,7 @@ sys.path.insert(0, str(SRC))
 
 from fcc_audit.report import build_county_detail, write_county_details  # noqa: E402
 from fcc_audit.webbundle import (  # noqa: E402
+    apply_scored_tower_counts,
     assign_record_tiers,
     build_web_meta,
     build_web_records,
@@ -307,6 +308,20 @@ def test_write_county_details_creates_files(tmp_path):
     assert blob["towers_current"] == 2
     # PNG rendering is opt-in (render_pngs=False by default); prior_map key should be absent.
     assert blob.get("prior_map") is None
+
+
+def test_scored_zero_towers_falls_back_to_detail_sites():
+    """Header must not stay 0→0 when the county detail still has pins."""
+    detail = {
+        "sites_prior": [{"lat": 1.0}, {"lat": 2.0}],
+        "sites_current": [{"lat": 1.0}, {"lat": 2.0}, {"lat": 3.0}],
+    }
+    apply_scored_tower_counts(detail, {
+        "prior_towers": 0, "current_towers": 0, "new_towers": 0,
+    })
+    assert detail["towers_prior"] == 2
+    assert detail["towers_current"] == 3
+    assert detail["new_towers"] == 1
 
 
 def test_build_web_meta_marks_incomplete_and_flag_threshold():

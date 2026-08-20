@@ -321,12 +321,24 @@ const DATA_BASE = 'public/data';
       const d = detail || {};
       document.getElementById('stat-added-km2').textContent = formatStatKm2(m.added_km2);
       document.getElementById('stat-pct').textContent = formatStatPct(m.pct_increase);
-      const priorT = d.towers_prior ?? m.prior_towers;
-      const currentT = d.towers_current ?? m.current_towers;
+      const towerCount = (scored, sites, metric) => {
+        const nSites = Array.isArray(sites) ? sites.length : 0;
+        if (scored != null && Number(scored) > 0) return scored;
+        if (nSites > 0) return nSites;
+        if (scored != null) return scored;
+        return metric;
+      };
+      const priorT = towerCount(d.towers_prior, d.sites_prior, m.prior_towers);
+      const currentT = towerCount(d.towers_current, d.sites_current, m.current_towers);
       document.getElementById('stat-towers').textContent =
         priorT != null && currentT != null ? `${priorT} → ${currentT}` : '—';
-      document.getElementById('stat-new-towers').textContent =
-        d.new_towers ?? m.new_towers ?? '—';
+      const scoredZero = !(Number(d.towers_prior ?? m.prior_towers) > 0)
+        && !(Number(d.towers_current ?? m.current_towers) > 0);
+      let newT = d.new_towers ?? m.new_towers;
+      if (newT == null || (scoredZero && (Number(currentT) || Number(priorT)))) {
+        newT = Math.max(0, (Number(currentT) || 0) - (Number(priorT) || 0));
+      }
+      document.getElementById('stat-new-towers').textContent = newT ?? '—';
     }
 
     function renderCompareMap(containerId, geo, countyFeature, emptyNoteId, sharedBounds) {

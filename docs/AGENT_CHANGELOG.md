@@ -5,6 +5,40 @@ changed, why, and what was verified. Append new dated sections at the top.
 
 ---
 
+## 2026-08-20 — Do not coarse-rollup real minsignal (0 inferred sites)
+
+### Why
+
+National overnight (`e229f0c`) rolled *every* core ≥25k hexes to parent H3,
+including Redshift layers with real `minsignal`. After two parent steps a
+rural lobe is 1–2 parent cells. `infer_sites` then required `len(lobe) >= 3`
+(scaled `min_site_hexes`), dropped every lobe, and wrote `prior_towers=0`.
+Surviving pins sat on parent centroids (~1–2 km, often on the county line).
+Madison / Boone NE T-Mobile 5G-NR 35/3 showed `INFERRED SITES 0→0` while the
+heatmap still filled in.
+
+### What changed
+
+- Coarse H3 rollup is **binary/flat layers only**. KDTree cloverleaf
+  neighborhood scan stays (that was the real minsignal speedup).
+- Rolled-up lobes are sized in child-hex equivalents so a 1-parent rural
+  macro is kept. Pins snap to the hottest child (`_seed_h3`), not the parent
+  centroid. One-cell `reach_m` is floored at 3 km so serving counts are not 0.
+- Detail header falls back to `sites_prior`/`sites_current` length when scored
+  serving counts are 0.
+
+### Verify
+
+```bash
+PYTHONPATH=src python -m pytest tests/test_towers.py tests/test_web_bundle.py tests/test_identity.py -q
+PYTHONPATH=src python scripts/eval_tower_inference.py --synthetics-only --gate
+```
+
+Re-run site inference on the laptop (wipe `data/processed`, keep `data/raw`).
+Existing parquet sites are wrong; `build-web` alone will not move the pins.
+
+---
+
 ## 2026-08-19 — Speed site inference for national minsignal layers
 
 ### Why

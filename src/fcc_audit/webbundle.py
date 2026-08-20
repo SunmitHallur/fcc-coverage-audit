@@ -580,6 +580,61 @@ def _estimate_signal_from_sites(
     return out, True
 
 
+def apply_scored_tower_counts(detail: dict[str, Any], row: Any | None) -> None:
+    """Copy scored serving counts onto a county detail payload.
+
+    When inference dropped every lobe, scored ``prior_towers``/``current_towers``
+    are 0 even if the map still lists home-county pins. Prefer those list
+    lengths so the header is not stuck at ``0 → 0``.
+    """
+    n_prior = len(detail.get("sites_prior") or [])
+    n_cur = len(detail.get("sites_current") or [])
+
+    def _as_int(val: Any, default: int = 0) -> int:
+        if val is None:
+            return default
+        try:
+            if pd.isna(val):
+                return default
+        except (TypeError, ValueError):
+            pass
+        try:
+            n = int(val)
+        except (TypeError, ValueError):
+            return default
+        return n
+
+    if row is None:
+        detail["towers_prior"] = n_prior
+        detail["towers_current"] = n_cur
+        detail["new_towers"] = max(0, n_cur - n_prior)
+        return
+
+    getter = row.get if hasattr(row, "get") else lambda k, d=None: row[k] if k in row else d
+    scored_prior = _as_int(getter("prior_towers"))
+    scored_cur = _as_int(getter("current_towers"))
+    used_fallback = False
+    if scored_prior <= 0 and n_prior > 0:
+        prior = n_prior
+        used_fallback = True
+    else:
+        prior = scored_prior
+    if scored_cur <= 0 and n_cur > 0:
+        current = n_cur
+        used_fallback = True
+    else:
+        current = scored_cur
+    detail["towers_prior"] = prior
+    detail["towers_current"] = current
+    if used_fallback:
+        detail["new_towers"] = max(0, current - prior)
+    else:
+        detail["new_towers"] = _as_int(getter("new_towers"), max(0, current - prior))
+    detail["prior_towers_cross_border"] = _as_int(getter("prior_towers_cross_border"))
+    detail["current_towers_cross_border"] = _as_int(getter("current_towers_cross_border"))
+    detail["new_towers_cross_border"] = _as_int(getter("new_towers_cross_border"))
+
+
 def build_county_detail(
     geoid: str,
     coverage: pd.DataFrame,
@@ -722,17 +777,7 @@ def write_county_details(
             cty = counties_by_geoid.get(geoid)
             detail = build_county_detail(geoid, cov, st, meta, counties=cty)
             row = scored_by_key.get((pid, svc, geoid))
-            if row is not None:
-                detail["towers_prior"] = int(row.get("prior_towers", len(detail["sites_prior"])))
-                detail["towers_current"] = int(row.get("current_towers", len(detail["sites_current"])))
-                detail["new_towers"] = int(row.get("new_towers", 0))
-                detail["prior_towers_cross_border"] = int(row.get("prior_towers_cross_border", 0))
-                detail["current_towers_cross_border"] = int(row.get("current_towers_cross_border", 0))
-                detail["new_towers_cross_border"] = int(row.get("new_towers_cross_border", 0))
-            else:
-                detail["towers_prior"] = len(detail["sites_prior"])
-                detail["towers_current"] = len(detail["sites_current"])
-                detail["new_towers"] = max(0, detail["towers_current"] - detail["towers_prior"])
+            apply_scored_tower_counts(detail, row)
 
             # Render server-side PNGs only when explicitly requested (--render-pngs).
             # By default the cockpit renders hexes client-side via deck.gl H3HexagonLayer,
