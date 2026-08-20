@@ -90,9 +90,9 @@ _LARGE_BLOB_DEPTH_SEP_M = 2000.0
 _LARGE_BLOB_HEXES = 4000
 # Signal-field saddle prominence (dB) for dropping overlap shoulders.
 _MIN_SIGNAL_PROMINENCE_DB = 3.0
-# Binary Redshift footprints can be multi-million-hex mega-blobs; full
-# boundary-depth lobe splitting on those dominates overnight runtime. Above this
-# many core cells, infer sites on a coarser parent grid and scale reach back.
+# Large cores (binary *or* real minsignal) dominate overnight if we stay on
+# res 9: connected components + cloverleaf signature scan every hex. Above this
+# many core cells, infer on a coarser parent grid and scale reach back.
 _FLAT_COARSE_HEX_THRESHOLD = 25_000
 _FLAT_INFER_PARENT_STEPS = 2  # res 9 -> res 7 (~49x fewer cells)
 # Joint-inference: a site with prior hexes below this fraction of current (or
@@ -107,17 +107,20 @@ SITE_COLUMNS = [
 
 
 def _rollup_flat_for_inference(hex_df: pd.DataFrame, parent_steps: int) -> pd.DataFrame:
-    """Collapse flat-signal hexes to coarser parents for tower inference only."""
+    """Collapse hexes to coarser parents for tower inference only.
+
+    Keeps the strongest ``signal_dbm`` child in each parent so minsignal
+    peaks survive the rollup (``keep=first`` without a sort would be arbitrary).
+    """
     if parent_steps <= 0 or hex_df.empty:
         return hex_df
     src_res = h3.get_resolution(str(hex_df["h3"].iloc[0]))
     parent_res = max(0, src_res - parent_steps)
     parents = [h3.cell_to_parent(str(c), parent_res) for c in hex_df["h3"].tolist()]
-    out = (
-        hex_df.assign(_parent=parents)
-        .drop_duplicates(subset=["_parent"], keep="first")
-        .copy()
-    )
+    out = hex_df.assign(_parent=parents)
+    if "signal_dbm" in out.columns:
+        out = out.sort_values("signal_dbm", ascending=False)
+    out = out.drop_duplicates(subset=["_parent"], keep="first").copy()
     out["h3"] = out["_parent"].astype(str)
     return out.drop(columns=["_parent"])
 
@@ -365,11 +368,33 @@ def _three_sector_signature(
     )
 
 
+def _xy_near(
+    cx: float,
+    cy: float,
+    xs: np.ndarray,
+    ys: np.ndarray,
+    radius: float,
+    tree: cKDTree | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Coordinates inside ``radius`` of (cx, cy). KDTree when the field is large."""
+    if len(xs) == 0 or radius <= 0:
+        return xs[:0], ys[:0]
+    if tree is not None and len(xs) > 4_000:
+        idx = tree.query_ball_point([cx, cy], float(radius))
+        if not idx:
+            return xs[:0], ys[:0]
+        return xs[idx], ys[idx]
+    r2 = float(radius) * float(radius)
+    mask = (xs - cx) ** 2 + (ys - cy) ** 2 <= r2
+    return xs[mask], ys[mask]
+
+
 def _two_peak_hub_xy(
     p1: np.ndarray,
     p2: np.ndarray,
     xs: np.ndarray,
     ys: np.ndarray,
+    tree: cKDTree | None = None,
 ) -> tuple[float, float]:
     """Hub of a 2-sector site along the perpendicular bisector of the petal peaks.
 
@@ -384,13 +409,16 @@ def _two_peak_hub_xy(
     dist = float(np.hypot(vx, vy))
     if dist < 50.0:
         return mx, my
+    loc_x, loc_y = _xy_near(mx, my, xs, ys, dist * 1.70, tree)
+    if len(loc_x) == 0:
+        loc_x, loc_y = xs, ys
     px, py = -vy / dist, vx / dist
     radius = dist / 2.0
     good: list[float] = []
     for t in np.linspace(-0.70 * dist, 0.70 * dist, 29):
         hx = mx + float(t) * px
         hy = my + float(t) * py
-        if _n_sector_signature(hx, hy, xs, ys, radius * 0.12, radius * 1.55, 2):
+        if _n_sector_signature(hx, hy, loc_x, loc_y, radius * 0.12, radius * 1.55, 2):
             good.append(float(t))
     if not good:
         return mx, my
@@ -404,6 +432,7 @@ def _low_far_side_mass(
     xs: np.ndarray,
     ys: np.ndarray,
     radius: float,
+    tree: cKDTree | None = None,
 ) -> bool:
     """True when little coverage sits beyond each peak away from the hub.
 
@@ -413,13 +442,16 @@ def _low_far_side_mass(
     """
     hx = float(p1[0] + p2[0]) / 2.0
     hy = float(p1[1] + p2[1]) / 2.0
+    loc_x, loc_y = _xy_near(hx, hy, xs, ys, radius * 3.5, tree)
+    if len(loc_x) == 0:
+        loc_x, loc_y = xs, ys
     far_limit2 = (radius * 1.25) ** 2
     for px, py in (p1, p2):
         vx, vy = float(px - hx), float(py - hy)
         vlen = float(np.hypot(vx, vy)) or 1.0
         ux, uy = vx / vlen, vy / vlen
-        dx = xs - px
-        dy = ys - py
+        dx = loc_x - px
+        dy = loc_y - py
         near = (dx * dx + dy * dy) <= far_limit2
         proj = dx * ux + dy * uy
         far_n = int((near & (proj > 0.0)).sum())
@@ -465,6 +497,8 @@ def _merge_cloverleaf_peaks(
     min_side = _CLOVER_MIN_SIDE_M
     tri_xs = core_xs if core_xs is not None else xs
     tri_ys = core_ys if core_ys is not None else ys
+    tri_tree = cKDTree(np.column_stack([tri_xs, tri_ys])) if len(tri_xs) else None
+    full_tree = cKDTree(np.column_stack([xs, ys])) if len(xs) else None
     triples: list[tuple[float, int, int, int, float, float]] = []
     for i in range(n):
         near = [j for j in tree.query_ball_point(pxy[i], max_side) if j > i]
@@ -489,8 +523,11 @@ def _merge_cloverleaf_peaks(
                 radius = float(np.mean([
                     np.hypot(pxy[t][0] - cx, pxy[t][1] - cy) for t in (i, j, k)
                 ]))
+                loc_x, loc_y = _xy_near(
+                    float(cx), float(cy), tri_xs, tri_ys, radius * 1.40, tri_tree,
+                )
                 if not _n_sector_signature(
-                    cx, cy, tri_xs, tri_ys, radius * 0.15, radius * 1.40, 3,
+                    float(cx), float(cy), loc_x, loc_y, radius * 0.15, radius * 1.40, 3,
                 ):
                     continue
                 triples.append((radius, i, j, k, float(cx), float(cy)))
@@ -516,18 +553,21 @@ def _merge_cloverleaf_peaks(
                 continue
             cx, cy = pxy[[i, j]].mean(axis=0)
             radius = side / 2.0
+            loc_x, loc_y = _xy_near(
+                float(cx), float(cy), xs, ys, radius * 1.55, full_tree,
+            )
             if not _n_sector_signature(
-                float(cx), float(cy), xs, ys, radius * 0.12, radius * 1.55, 2,
+                float(cx), float(cy), loc_x, loc_y, radius * 0.12, radius * 1.55, 2,
             ):
                 continue
-            if not _low_far_side_mass(pxy[i], pxy[j], xs, ys, radius):
+            if not _low_far_side_mass(pxy[i], pxy[j], xs, ys, radius, full_tree):
                 continue
             pairs.append((radius, i, j, float(cx), float(cy)))
     pairs.sort(key=lambda t: -t[0])
     for radius, i, j, cx, cy in pairs:
         if used[i] or used[j]:
             continue
-        hx, hy = _two_peak_hub_xy(pxy[i], pxy[j], xs, ys)
+        hx, hy = _two_peak_hub_xy(pxy[i], pxy[j], xs, ys, full_tree)
         dist = np.hypot(pxy[:, 0] - hx, pxy[:, 1] - hy)
         nearby = np.flatnonzero(dist <= max(radius * 1.20, min_separation_m))
         used[nearby] = True
@@ -683,7 +723,7 @@ def infer_sites(
         parent_steps = int(parent_steps_override)
     else:
         parent_steps = 0
-        if signal_flat and len(strong) >= _FLAT_COARSE_HEX_THRESHOLD:
+        if len(strong) >= _FLAT_COARSE_HEX_THRESHOLD:
             parent_steps = _flat_parent_steps(len(strong))
     if parent_steps > 0:
         infer_df = _rollup_flat_for_inference(strong, parent_steps)
@@ -900,9 +940,9 @@ def infer_sites_joint(
 
     # Deterministic coarse grid from the UNION size so vintages never straddle
     # the 25k threshold independently.
-    strong, signal_flat = _core_hexes(union, float(cfg.towers["min_signal_band_dbm"]))
+    strong, _signal_flat = _core_hexes(union, float(cfg.towers["min_signal_band_dbm"]))
     parent_steps = 0
-    if signal_flat and len(strong) >= _FLAT_COARSE_HEX_THRESHOLD:
+    if len(strong) >= _FLAT_COARSE_HEX_THRESHOLD:
         parent_steps = _flat_parent_steps(len(strong))
 
     sites = infer_sites(

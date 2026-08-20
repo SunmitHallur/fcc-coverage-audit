@@ -5,6 +5,30 @@ changed, why, and what was verified. Append new dated sections at the top.
 
 ---
 
+## 2026-08-19 — Speed site inference for national minsignal layers
+
+### Why
+
+Overnight batch 1 (AZ/CA/HI/NV) spent 10–28 min per 5G unit in `towers=`.
+Cloverleaf merge scanned the entire core (~10^5–10^6 hexes) for every
+candidate triple. Coarse H3 rollup only ran on *binary* layers, so Redshift
+minsignal never got it.
+
+### What changed
+
+- 2-/3-sector signature and far-side tests use a KDTree neighborhood, not
+  the full coordinate array.
+- Cores ≥25k hexes roll up to parent H3 even when `minsignal` is present
+  (keep the hottest child per parent).
+
+### Verify
+
+```bash
+PYTHONPATH=src pytest tests/test_towers.py tests/test_identity.py -q
+```
+
+---
+
 ## 2026-08-19 — Extensive physics catalog (not screenshot FIPS)
 
 ### Why
